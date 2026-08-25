@@ -3,12 +3,10 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <stdarg.h>
-#import <stdlib.h>
 #import <substrate.h>
 
 static NSString *const MRLogPath = @"/var/mobile/Library/Preferences/com.local.myrtleswitcherfix.log";
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
-static __strong id MRObservedSwitcherModel = nil;
 
 static void MRLog(NSString *format, ...)
 {
@@ -34,6 +32,28 @@ static id MRSafeValue(id object, NSString *key)
     @catch (__unused NSException *exception) { return nil; }
 }
 
+static id MRSendClassNoArgs(NSString *className, NSString *selectorName)
+{
+    Class cls = NSClassFromString(className);
+    SEL selector = NSSelectorFromString(selectorName);
+    if (cls == Nil || ![cls respondsToSelector:selector]) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(cls, selector);
+}
+
+static id MRMainSwitcher(void)
+{
+    // iOS 15.5/15.6 owns both the recents UI and its model from this singleton.
+    return MRSendClassNoArgs(@"SBMainSwitcherViewController", @"sharedInstance");
+}
+
+static NSArray *MRRecentAppLayouts(id switcher)
+{
+    SEL selector = NSSelectorFromString(@"recentAppLayouts");
+    if (switcher == nil || ![switcher respondsToSelector:selector]) return nil;
+    id result = ((id (*)(id, SEL))objc_msgSend)(switcher, selector);
+    return [result isKindOfClass:NSArray.class] ? result : nil;
+}
+
 static NSString *MRDirectBundleIdentifier(id object)
 {
     if ([object isKindOfClass:NSString.class]) {
@@ -42,7 +62,7 @@ static NSString *MRDirectBundleIdentifier(id object)
     }
     for (NSString *key in @[@"bundleIdentifier", @"displayIdentifier",
                              @"applicationBundleIdentifier", @"applicationBundleID",
-                             @"bundleID", @"continuousExposeIdentifier"]) {
+                             @"bundleID"]) {
         id value = MRSafeValue(object, key);
         if ([value isKindOfClass:NSString.class] && [value containsString:@"."]) return value;
     }
@@ -67,186 +87,111 @@ static NSString *MRBundleIdentifierFromLayout(id layout)
     return nil;
 }
 
-static id MRSendClassNoArgs(NSString *className, NSString *selectorName)
+static BOOL MRLayoutContainsBundleIdentifier(id layout, NSString *bundleID)
 {
-    Class cls = NSClassFromString(className);
-    SEL selector = NSSelectorFromString(selectorName);
-    if (cls == Nil || ![cls respondsToSelector:selector]) return nil;
-    return ((id (*)(id, SEL))objc_msgSend)(cls, selector);
+    SEL selector = NSSelectorFromString(@"containsItemWithBundleIdentifier:");
+    if (layout != nil && [layout respondsToSelector:selector])
+        return ((BOOL (*)(id, SEL, id))objc_msgSend)(layout, selector, bundleID);
+    return [[MRBundleIdentifierFromLayout(layout) lowercaseString]
+            isEqualToString:bundleID.lowercaseString];
 }
 
-static id MRSendObject(id target, NSString *selectorName, id argument)
+static id MRLayoutForBundleIdentifier(NSArray *layouts, NSString *bundleID,
+                                      NSUInteger *indexOut)
 {
-    SEL selector = NSSelectorFromString(selectorName);
-    if (target == nil || ![target respondsToSelector:selector]) return nil;
-    return ((id (*)(id, SEL, id))objc_msgSend)(target, selector, argument);
-}
-
-static id MRMainSwitcherCoordinator(void)
-{
-    return MRSendClassNoArgs(@"SBMainSwitcherControllerCoordinator", @"sharedInstance");
-}
-
-static id MRContainedObjectOfClass(id owner, Class wantedClass)
-{
-    if (owner == nil || wantedClass == Nil) return nil;
-    for (NSString *key in @[@"appSwitcherModel", @"_appSwitcherModel",
-                             @"switcherModel", @"_switcherModel", @"model", @"_model"]) {
-        id value = MRSafeValue(owner, key);
-        if ([value isKindOfClass:wantedClass]) return value;
-    }
-    for (Class cls = [owner class]; cls != Nil; cls = class_getSuperclass(cls)) {
-        unsigned int count = 0;
-        Ivar *ivars = class_copyIvarList(cls, &count);
-        for (unsigned int index = 0; index < count; index++) {
-            const char *type = ivar_getTypeEncoding(ivars[index]);
-            if (type == NULL || type[0] != '@') continue;
-            id value = object_getIvar(owner, ivars[index]);
-            if ([value isKindOfClass:wantedClass]) {
-                free(ivars);
-                return value;
-            }
-        }
-        free(ivars);
-    }
-    return nil;
-}
-
-static void MRLogRelevantMethods(id object, NSString *label);
-
-static id MRAppSwitcherModel(void)
-{
-    if (MRObservedSwitcherModel != nil) return MRObservedSwitcherModel;
-    // iOS 15 owns this model from the main switcher coordinator; the model
-    // itself deliberately has no +sharedInstance.
-    return MRContainedObjectOfClass(MRMainSwitcherCoordinator(),
-                                    NSClassFromString(@"SBAppSwitcherModel"));
-}
-
-typedef id (*MRSwitcherModelInitIMP)(id, SEL);
-static MRSwitcherModelInitIMP MROriginalSwitcherModelInit = NULL;
-
-static id MRHookSwitcherModelInit(id self, SEL selector)
-{
-    id result = MROriginalSwitcherModelInit(self, selector);
-    MRObservedSwitcherModel = result;
-    MRLog(@"captured real SBAppSwitcherModel instance=%@", result);
-    MRLogRelevantMethods(result, @"captured switcher model");
-    return result;
-}
-
-static BOOL MRInstallSwitcherModelCapture(void)
-{
-    Class cls = NSClassFromString(@"SBAppSwitcherModel");
-    SEL selector = @selector(init);
-    Method method = class_getInstanceMethod(cls, selector);
-    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 2) {
-        MRLog(@"SBAppSwitcherModel init unavailable");
-        return NO;
-    }
-    MSHookMessageEx(cls, selector, (IMP)MRHookSwitcherModelInit,
-                    (IMP *)&MROriginalSwitcherModelInit);
-    MRLog(@"installed SBAppSwitcherModel init capture");
-    return MROriginalSwitcherModelInit != NULL;
-}
-
-static void MRLogRelevantMethods(id object, NSString *label)
-{
-    if (object == nil) {
-        MRLog(@"%@ unavailable", label);
-        return;
-    }
-    NSMutableArray *result = [NSMutableArray array];
-    unsigned int count = 0;
-    Method *methods = class_copyMethodList([object class], &count);
-    for (unsigned int index = 0; index < count; index++) {
-        NSString *name = NSStringFromSelector(method_getName(methods[index]));
-        NSString *lower = name.lowercaseString;
-        if ([lower containsString:@"layout"] || [lower containsString:@"front"] ||
-            [lower containsString:@"recent"] || [lower containsString:@"add"])
-            [result addObject:name];
-    }
-    free(methods);
-    MRLog(@"%@ class=%@ relevantMethods=%@", label,
-          NSStringFromClass([object class]), result);
-}
-
-static id MRExistingAppLayout(NSString *bundleID)
-{
-    id model = MRAppSwitcherModel();
-    id layouts = MRSafeValue(model, @"recentAppLayouts");
-    if (![layouts isKindOfClass:NSArray.class]) {
-        for (NSString *key in @[@"layouts", @"appLayouts", @"allLayouts", @"snapshot"]) {
-            id candidate = MRSafeValue(layouts, key);
-            if ([candidate isKindOfClass:NSArray.class]) {
-                layouts = candidate;
-                break;
-            }
-        }
-    }
-    if (![layouts isKindOfClass:NSArray.class]) return nil;
+    NSUInteger index = 0;
     for (id layout in layouts) {
-        NSString *candidate = MRBundleIdentifierFromLayout(layout);
-        if ([candidate caseInsensitiveCompare:bundleID] == NSOrderedSame) return layout;
+        if (MRLayoutContainsBundleIdentifier(layout, bundleID)) {
+            if (indexOut != NULL) *indexOut = index;
+            return layout;
+        }
+        index++;
     }
+    if (indexOut != NULL) *indexOut = NSNotFound;
     return nil;
 }
 
-static id MRCompatibilityDisplayLayout(id application)
+static BOOL MRHasInstanceMethod(Class cls, NSString *name, unsigned int argumentCount)
 {
-    Class cls = NSClassFromString(@"SBDisplayLayout");
-    SEL selector = NSSelectorFromString(@"fullScreenDisplayLayoutForApplication:");
-    if (cls != Nil && [cls respondsToSelector:selector])
-        return ((id (*)(id, SEL, id))objc_msgSend)(cls, selector, application);
-    return nil;
+    Method method = class_getInstanceMethod(cls, NSSelectorFromString(name));
+    return method != NULL && method_getNumberOfArguments(method) == argumentCount;
 }
 
-static BOOL MRAddLayoutToFront(id model, id layout, NSArray<NSString *> *selectorNames)
+static void MRLogSwitcherCapabilities(id switcher)
 {
-    for (NSString *name in selectorNames) {
-        SEL selector = NSSelectorFromString(name);
-        Method method = class_getInstanceMethod([model class], selector);
-        if (model == nil || ![model respondsToSelector:selector] ||
-            method == NULL || method_getNumberOfArguments(method) != 3) continue;
-        ((void (*)(id, SEL, id))objc_msgSend)(model, selector, layout);
-        MRLog(@"sent %@ with %@", name, NSStringFromClass([layout class]));
-        return YES;
-    }
-    return NO;
+    Class cls = [switcher class];
+    NSArray *layouts = MRRecentAppLayouts(switcher);
+    MRLog(@"switcher=%@ class=%@ layouts=%lu recent=%d promote=%d insert=%d remove=%d",
+          switcher, NSStringFromClass(cls), (unsigned long)layouts.count,
+          MRHasInstanceMethod(cls, @"recentAppLayouts", 2),
+          MRHasInstanceMethod(cls, @"_addAppLayoutToFront:", 3),
+          MRHasInstanceMethod(cls, @"_insertCardForDisplayIdentifier:atIndex:", 4),
+          MRHasInstanceMethod(cls, @"_removeAppLayout:forReason:", 4));
 }
 
-static void MRAddApplicationToSwitcher(NSString *bundleID)
+static void MRVerifySwitcherResult(NSString *bundleID, NSString *action)
+{
+    id switcher = MRMainSwitcher();
+    NSArray *layouts = MRRecentAppLayouts(switcher);
+    NSUInteger index = NSNotFound;
+    id layout = MRLayoutForBundleIdentifier(layouts, bundleID, &index);
+    MRLog(@"verify %@ action=%@ found=%d index=%@ count=%lu layoutClass=%@",
+          bundleID, action, layout != nil,
+          index == NSNotFound ? @"NSNotFound" : [NSString stringWithFormat:@"%lu", (unsigned long)index],
+          (unsigned long)layouts.count,
+          layout == nil ? @"(null)" : NSStringFromClass([layout class]));
+}
+
+static void MRPromoteOrInsertSwitcherCard(NSString *bundleID)
 {
     if (bundleID.length == 0 || ![bundleID containsString:@"."]) return;
-    id coordinator = MRMainSwitcherCoordinator();
-    id model = MRAppSwitcherModel();
+
+    id switcher = MRMainSwitcher();
     id appController = MRSendClassNoArgs(@"SBApplicationController", @"sharedInstance");
-    id application = MRSendObject(appController, @"applicationWithBundleIdentifier:", bundleID);
-    if (model == nil || application == nil) {
-        MRLog(@"cannot add %@: coordinator=%@ model=%@ application=%@",
-              bundleID, coordinator, model, application);
-        static dispatch_once_t diagnosticOnce;
-        dispatch_once(&diagnosticOnce, ^{
-            MRLogRelevantMethods(coordinator, @"coordinator");
-            MRLogRelevantMethods(model, @"switcher model");
-        });
+    SEL appSelector = NSSelectorFromString(@"applicationWithBundleIdentifier:");
+    id application = nil;
+    if (appController != nil && [appController respondsToSelector:appSelector])
+        application = ((id (*)(id, SEL, id))objc_msgSend)(appController, appSelector, bundleID);
+
+    if (switcher == nil || application == nil) {
+        MRLog(@"cannot handle %@: switcher=%@ application=%@", bundleID, switcher, application);
         return;
     }
 
-    // Never pass an SBAppLayout to the legacy addToFront: API. On iOS 15 the
-    // two layout classes coexist, and mixing them is a SpringBoard crash risk.
-    id existing = MRExistingAppLayout(bundleID);
-    BOOL sent = existing != nil && MRAddLayoutToFront(model, existing,
-        @[@"addToFront:", @"addAppLayoutToFront:", @"_addAppLayoutToFront:"]);
-    NSString *source = @"recentAppLayouts";
-    if (!sent) {
-        id compatibilityLayout = MRCompatibilityDisplayLayout(application);
-        source = @"SBDisplayLayout compatibility factory";
-        sent = compatibilityLayout != nil &&
-               MRAddLayoutToFront(model, compatibilityLayout, @[@"addToFront:"]);
-        if (compatibilityLayout == nil) MRLog(@"no compatible layout for %@", bundleID);
+    static dispatch_once_t capabilityOnce;
+    dispatch_once(&capabilityOnce, ^{ MRLogSwitcherCapabilities(switcher); });
+
+    NSArray *layouts = MRRecentAppLayouts(switcher);
+    NSUInteger oldIndex = NSNotFound;
+    id existing = MRLayoutForBundleIdentifier(layouts, bundleID, &oldIndex);
+    NSString *action = nil;
+
+    if (existing != nil) {
+        SEL promoteSelector = NSSelectorFromString(@"_addAppLayoutToFront:");
+        if (![switcher respondsToSelector:promoteSelector] ||
+            !MRHasInstanceMethod([switcher class], @"_addAppLayoutToFront:", 3)) {
+            MRLog(@"cannot promote %@: _addAppLayoutToFront: unavailable", bundleID);
+            return;
+        }
+        ((void (*)(id, SEL, id))objc_msgSend)(switcher, promoteSelector, existing);
+        action = @"promote-existing";
+        MRLog(@"sent promote %@ oldIndex=%lu layoutClass=%@", bundleID,
+              (unsigned long)oldIndex, NSStringFromClass([existing class]));
+    } else {
+        SEL insertSelector = NSSelectorFromString(@"_insertCardForDisplayIdentifier:atIndex:");
+        if (![switcher respondsToSelector:insertSelector] ||
+            !MRHasInstanceMethod([switcher class], @"_insertCardForDisplayIdentifier:atIndex:", 4)) {
+            MRLog(@"cannot insert %@: _insertCardForDisplayIdentifier:atIndex: unavailable", bundleID);
+            return;
+        }
+        ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(switcher, insertSelector, bundleID, 0);
+        action = @"insert-absent";
+        MRLog(@"sent insert %@ atIndex=0", bundleID);
     }
-    MRLog(@"add %@ source=%@ sent=%d", bundleID, source, sent);
+
+    NSString *stableAction = [action copy];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ MRVerifySwitcherResult(bundleID, stableAction); });
 }
 
 typedef void (*MRSetCurrentBundleIMP)(id, SEL, NSString *);
@@ -258,15 +203,16 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
     NSString *stableBundleID = [bundleID copy];
     MRLog(@"Myrtle committed currentBundleID=%@", stableBundleID);
     if (stableBundleID.length == 0) return;
-    for (NSNumber *delay in @[@0.0, @0.35, @1.0]) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                     (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
-            NSString *current = MRSafeValue(manager, @"currentBundleID");
-            if ([current isEqualToString:stableBundleID]) MRAddApplicationToSwitcher(stableBundleID);
-        });
-    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+        NSString *current = MRSafeValue(manager, @"currentBundleID");
+        if ([current isEqualToString:stableBundleID])
+            MRPromoteOrInsertSwitcherCard(stableBundleID);
+        else
+            MRLog(@"skip %@ because Myrtle currentBundleID changed to %@", stableBundleID, current);
+    });
 }
 
 static void MRCloseMyrtleWindowForBundleID(NSString *bundleID)
@@ -278,18 +224,22 @@ static void MRCloseMyrtleWindowForBundleID(NSString *bundleID)
     Method method = class_getInstanceMethod([manager class], selector);
     if (manager != nil && [manager respondsToSelector:selector] &&
         method != NULL && method_getNumberOfArguments(method) == 4) {
-        MRLog(@"closing Myrtle host after switcher deleted %@", bundleID);
+        MRLog(@"closing Myrtle host after switcher removed %@", bundleID);
         ((void (*)(id, SEL, BOOL, id))objc_msgSend)(manager, selector, YES, nil);
-    } else MRLog(@"Myrtle close selector unavailable for %@", bundleID);
+    } else {
+        MRLog(@"Myrtle close selector unavailable for %@", bundleID);
+    }
 }
 
-typedef void (*MRDeleteLayoutIMP)(id, SEL, id, long long);
-static MRDeleteLayoutIMP MROriginalDeleteLayout = NULL;
+typedef void (*MRRemoveLayoutIMP)(id, SEL, id, long long);
+static MRRemoveLayoutIMP MROriginalRemoveLayout = NULL;
 
-static void MRHookDeleteLayout(id self, SEL selector, id layout, long long reason)
+static void MRHookRemoveLayout(id self, SEL selector, id layout, long long reason)
 {
     NSString *bundleID = [MRBundleIdentifierFromLayout(layout) copy];
-    MROriginalDeleteLayout(self, selector, layout, reason);
+    MRLog(@"switcher removing %@ reason=%lld layoutClass=%@", bundleID, reason,
+          layout == nil ? @"(null)" : NSStringFromClass([layout class]));
+    MROriginalRemoveLayout(self, selector, layout, reason);
     MRCloseMyrtleWindowForBundleID(bundleID);
 }
 
@@ -305,19 +255,21 @@ static BOOL MRInstallMyrtleHook(void)
     return MROriginalSetCurrentBundle != NULL;
 }
 
-static void MRInstallSwitcherDeleteHook(void)
+static void MRInstallSwitcherRemoveHook(void)
 {
-    Class cls = NSClassFromString(@"SBMainSwitcherControllerCoordinator");
-    SEL selector = NSSelectorFromString(@"_deleteAppLayout:forReason:");
+    Class cls = NSClassFromString(@"SBMainSwitcherViewController");
+    SEL selector = NSSelectorFromString(@"_removeAppLayout:forReason:");
     Method method = class_getInstanceMethod(cls, selector);
     if (cls != Nil && method != NULL && method_getNumberOfArguments(method) == 4) {
-        MSHookMessageEx(cls, selector, (IMP)MRHookDeleteLayout,
-                        (IMP *)&MROriginalDeleteLayout);
-        MRLog(@"installed switcher deletion hook");
-    } else MRLog(@"switcher deletion method unavailable");
+        MSHookMessageEx(cls, selector, (IMP)MRHookRemoveLayout,
+                        (IMP *)&MROriginalRemoveLayout);
+        MRLog(@"installed SBMainSwitcherViewController removal hook");
+    } else {
+        MRLog(@"SBMainSwitcherViewController removal method unavailable");
+    }
 }
 
-static void MRInstallWhenReady(NSUInteger attempt)
+static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     if (MRInstallMyrtleHook()) return;
     if (attempt >= 60) {
@@ -325,17 +277,18 @@ static void MRInstallWhenReady(NSUInteger attempt)
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
-                   dispatch_get_main_queue(), ^{ MRInstallWhenReady(attempt + 1); });
+                   dispatch_get_main_queue(), ^{ MRInstallMyrtleWhenReady(attempt + 1); });
 }
 
 %ctor
 {
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
-            MRLog(@"MyrtleSwitcherFix 0.3.4 model-init capture loaded");
-            MRInstallSwitcherModelCapture();
-            MRInstallSwitcherDeleteHook();
-            MRInstallWhenReady(0);
+            MRLog(@"MyrtleSwitcherFix 0.3.5 exact iOS 15 switcher path loaded");
+            MRInstallSwitcherRemoveHook();
+            id existingSwitcher = MRSendClassNoArgs(@"SBMainSwitcherViewController", @"sharedInstanceIfExists");
+            if (existingSwitcher != nil) MRLogSwitcherCapabilities(existingSwitcher);
+            MRInstallMyrtleWhenReady(0);
         });
     }
 }

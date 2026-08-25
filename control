@@ -1,8 +1,8 @@
 Package: com.local.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.3.4
+Version: 0.3.5
 Architecture: iphoneos-arm64e
-Description: Captures the real iOS 15 SBAppSwitcherModel instance and synchronizes Myrtle 1.4.1.
+Description: Synchronizes Myrtle 1.4.1 with the exact iOS 15 main switcher card APIs.
 Maintainer: Local
 Author: Local
 Section: Tweaks

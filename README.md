@@ -13,8 +13,8 @@
 对 Myrtle 1.4.1 的 Objective-C 元数据和选择器交叉引用分析确认：真正的分屏入口位于 `MyrtleHostManager`；大型宿主创建方法在窗口和 Host View 建立过程中写入 `currentBundleID`，关闭方法 `MT_IlllIIIlIIIlIlllIIIl::` 会清空该值并移除 Host View。本插件因此直接 Hook Myrtle 自身的提交点，不再猜测通用 FrontBoard Scene 初始化类：
 
 1. Hook `-[MyrtleHostManager setCurrentBundleID:]`，取得 Myrtle 已确认的目标 Bundle ID；
-2. 优先复用 iOS 15 `recentAppLayouts` 中的 `SBAppLayout`，让已有卡片移动到最前；
-3. 没有旧卡片时，通过兼容工厂创建布局并加入 `SBAppSwitcherModel`；
+2. 从 iOS 15 的 `SBMainSwitcherViewController.recentAppLayouts` 查找现有 `SBAppLayout`，并通过 `_addAppLayoutToFront:` 移到最前；
+3. 没有旧卡片时，通过系统自己的 `_insertCardForDisplayIdentifier:atIndex:` 按 Bundle ID 在索引 0 创建卡片；
 4. Hook 后台卡片删除入口，仅当卡片与 Myrtle 当前 Bundle ID 相同时调用 Myrtle 自己的关闭方法。
 
 点击生成的卡片仍由 SpringBoard 按系统方式全屏打开应用。诊断日志会写入 `/var/mobile/Library/Preferences/com.local.myrtleswitcherfix.log`，不依赖系统日志流。
@@ -54,7 +54,8 @@ GitHub Actions 会自动验证：
 
 ## 版本说明
 
-- `0.3.4`：不再猜测 Model 所有者类名；直接 Hook `-[SBAppSwitcherModel init]` 并保存 SpringBoard 创建的真实实例，同时记录真机 Model 方法。
+- `0.3.5`：按 iOS 15.5/15.6 的真实类结构改用 `SBMainSwitcherViewController` 单例；严格分离已有卡片前置与无卡片插入，并在调用后验证真实索引。删除卡片 Hook 也迁移到该类。
+- `0.3.4`：尝试 Hook `-[SBAppSwitcherModel init]`；真机日志证明模型并不经过这个入口，因此未能获得实例。
 - `0.3.3`：根据设备日志改为从 `SBMainSwitcherControllerCoordinator` 取得其持有的 `SBAppSwitcherModel`；iOS 15 的 Model 没有 `sharedInstance`。删除卡片 Hook 同步迁移到 Coordinator。
 - `0.3.2`：改用 macOS/Xcode 工作流生成 Apple 新 arm64e ABI，并增加 CPU subtype 强制检查；不依赖可能造成系统不稳定的 `oldabi`。
 - `0.3.1`：为解决 0.3.0 纯 arm64 不注入而恢复 arm64e，但 Linux 工具链生成的是旧 ABI；虽然 ElleKit 可以映射 dylib，却在首个 Objective-C 常量字符串 `retain` 时崩溃，禁止安装。
