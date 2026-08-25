@@ -7,9 +7,12 @@
 
 static NSString *const MRLogPath = @"/var/mobile/Library/Preferences/com.local.myrtleswitcherfix.log";
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
+static const unsigned long long MRMaximumLogSize = 1024 * 1024;
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
 static __strong NSString *MRUnderlyingMainBundleID = nil;
 static BOOL MRReconcilingFront = NO;
+static NSUInteger MRDesiredFrontGeneration = 0;
+static NSUInteger MRReturnToMainGeneration = 0;
 
 static void MRLog(NSString *format, ...)
 {
@@ -19,6 +22,18 @@ static void MRLog(NSString *format, ...)
     va_end(arguments);
     NSData *data = [[NSString stringWithFormat:@"%@ %@\n", NSDate.date, message]
                     dataUsingEncoding:NSUTF8StringEncoding];
+    unsigned long long size = [[[NSFileManager defaultManager]
+                                attributesOfItemAtPath:MRLogPath error:nil]
+                               fileSize];
+    if (size >= MRMaximumLogSize) {
+        NSData *rotated = [[NSString stringWithFormat:
+                            @"%@ log reset after reaching 1 MiB\n%@",
+                            NSDate.date, [[NSString alloc] initWithData:data
+                                                               encoding:NSUTF8StringEncoding]]
+                           dataUsingEncoding:NSUTF8StringEncoding];
+        [rotated writeToFile:MRLogPath atomically:YES];
+        return;
+    }
     NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:MRLogPath];
     if (handle == nil) [data writeToFile:MRLogPath atomically:YES];
     else {
@@ -133,14 +148,17 @@ static void MRLogSwitcherCapabilities(id switcher)
           MRHasInstanceMethod(cls, @"_switcherModelChanged:", 3));
 }
 
-static void MREnqueueDesiredFront(NSString *bundleID)
+static NSUInteger MREnqueueDesiredFront(NSString *bundleID)
 {
-    if (bundleID.length == 0) return;
+    if (bundleID.length == 0) return MRDesiredFrontGeneration;
     if (MRDesiredFrontOrder == nil) MRDesiredFrontOrder = [NSMutableArray array];
     [MRDesiredFrontOrder removeObject:bundleID];
     [MRDesiredFrontOrder addObject:bundleID];
     while (MRDesiredFrontOrder.count > 32) [MRDesiredFrontOrder removeObjectAtIndex:0];
-    MRLog(@"desired front order oldest-to-newest=%@", MRDesiredFrontOrder);
+    MRDesiredFrontGeneration++;
+    MRLog(@"desired front generation=%lu oldest-to-newest=%@",
+          (unsigned long)MRDesiredFrontGeneration, MRDesiredFrontOrder);
+    return MRDesiredFrontGeneration;
 }
 
 static void MRRemoveDesiredFront(NSString *bundleID)
@@ -163,9 +181,9 @@ static void MRVerifySwitcherResult(NSString *bundleID, NSString *action)
           layout == nil ? @"(null)" : NSStringFromClass([layout class]));
 }
 
-static void MRReconcilePendingFront(NSString *trigger)
+static BOOL MRReconcilePendingFront(NSString *trigger)
 {
-    if (MRReconcilingFront || MRDesiredFrontOrder.count == 0) return;
+    if (MRReconcilingFront || MRDesiredFrontOrder.count == 0) return NO;
     NSArray<NSString *> *desired = [MRDesiredFrontOrder copy];
     id switcher = MRMainSwitcher();
     NSArray *layouts = MRRecentAppLayouts(switcher);
@@ -194,7 +212,7 @@ static void MRReconcilePendingFront(NSString *trigger)
 
     if (!stable && resolvedLayouts.count != 0) {
         SEL selector = NSSelectorFromString(@"_addAppLayoutToFront:");
-        if (![switcher respondsToSelector:selector]) return;
+        if (![switcher respondsToSelector:selector]) return NO;
         MRReconcilingFront = YES;
         for (NSUInteger index = 0; index < resolvedLayouts.count; index++) {
             ((void (*)(id, SEL, id))objc_msgSend)(switcher, selector, resolvedLayouts[index]);
@@ -222,10 +240,33 @@ static void MRReconcilePendingFront(NSString *trigger)
     MRLog(@"reconcile trigger=%@ desired=%@ resolved=%@ expectedFront=%@ actualFront=%@ all=%d verified=%d count=%lu",
           trigger, desired, resolvedIDs, expectedFront, actualFront,
           allMaterialized, verified, (unsigned long)updatedLayouts.count);
-    if (verified && [trigger hasPrefix:@"timer-6"] &&
-        [MRDesiredFrontOrder isEqualToArray:desired]) {
-        [MRDesiredFrontOrder removeAllObjects];
-        MRLog(@"cleared verified desired order");
+    return verified;
+}
+
+static void MRScheduleFrontReconciliation(NSUInteger generation)
+{
+    NSArray<NSNumber *> *delays = @[@0.75, @1.5, @3.0, @6.0, @10.0];
+    for (NSNumber *delay in delays) {
+        BOOL finalAttempt = delay.doubleValue == 10.0;
+        NSString *trigger = [NSString stringWithFormat:@"batch-%lu-%.2fs",
+                             (unsigned long)generation, delay.doubleValue];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (generation != MRDesiredFrontGeneration) {
+                MRLog(@"skip stale reconciliation %@ currentGeneration=%lu",
+                      trigger, (unsigned long)MRDesiredFrontGeneration);
+                return;
+            }
+            BOOL verified = MRReconcilePendingFront(trigger);
+            if (finalAttempt && generation == MRDesiredFrontGeneration) {
+                NSArray *expired = [MRDesiredFrontOrder copy];
+                [MRDesiredFrontOrder removeAllObjects];
+                MRDesiredFrontGeneration++;
+                MRLog(@"finished reconciliation generation=%lu verified=%d cleared=%@",
+                      (unsigned long)generation, verified, expired);
+            }
+        });
     }
 }
 
@@ -280,8 +321,10 @@ static BOOL MRAddProductionDisplayItem(id switcher, id application, NSString *bu
     }
 
     dispatch_block_t completion = ^{
-        MRLog(@"production add completion %@ sceneID=%@", bundleID, sceneIdentifier);
-        dispatch_async(dispatch_get_main_queue(), ^{ MRReconcilePendingFront(@"add-completion"); });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            MRLog(@"production add completion %@ sceneID=%@", bundleID, sceneIdentifier);
+            MRReconcilePendingFront(@"add-completion");
+        });
     };
     ((void (*)(id, SEL, id, id))objc_msgSend)(switcher, addSelector, displayItem, completion);
     MRLog(@"sent production add %@ sceneClass=%@ sceneID=%@ item=%@",
@@ -337,7 +380,7 @@ static BOOL MRPromoteExistingCard(NSString *bundleID, NSString *trigger)
     return updatedLayout != nil && updatedIndex == 0;
 }
 
-static void MRScheduleReturnToMainPromotion(NSString *bundleID)
+static void MRScheduleReturnToMainPromotion(NSString *bundleID, NSUInteger generation)
 {
     if (bundleID.length == 0) return;
     NSArray<NSNumber *> *delays = @[@0.0, @0.15, @0.5];
@@ -345,7 +388,21 @@ static void MRScheduleReturnToMainPromotion(NSString *bundleID)
         NSString *trigger = [NSString stringWithFormat:@"close-%.2fs", delay.doubleValue];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                      (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ MRPromoteExistingCard(bundleID, trigger); });
+                       dispatch_get_main_queue(), ^{
+            if (generation != MRReturnToMainGeneration) {
+                MRLog(@"skip stale return-to-main %@ generation=%lu current=%lu",
+                      trigger, (unsigned long)generation,
+                      (unsigned long)MRReturnToMainGeneration);
+                return;
+            }
+            id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+            NSString *current = MRSafeValue(manager, @"currentBundleID");
+            if (current.length != 0) {
+                MRLog(@"skip return-to-main %@ because Myrtle now hosts %@", trigger, current);
+                return;
+            }
+            MRPromoteExistingCard(bundleID, trigger);
+        });
     }
 }
 
@@ -372,7 +429,8 @@ static void MRPromoteOrInsertSwitcherCard(NSString *bundleID)
     NSUInteger oldIndex = NSNotFound;
     id existing = MRLayoutForBundleIdentifier(layouts, bundleID, &oldIndex);
     NSString *action = nil;
-    MREnqueueDesiredFront(bundleID);
+    NSUInteger generation = MREnqueueDesiredFront(bundleID);
+    MRScheduleFrontReconciliation(generation);
 
     if (existing != nil) {
         SEL promoteSelector = NSSelectorFromString(@"_addAppLayoutToFront:");
@@ -396,14 +454,6 @@ static void MRPromoteOrInsertSwitcherCard(NSString *bundleID)
     if ([action isEqualToString:@"promote-existing"]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ MRVerifySwitcherResult(bundleID, action); });
-    } else {
-        NSArray<NSNumber *> *delays = @[@0.75, @1.5, @3.0, @6.0];
-        for (NSNumber *delay in delays) {
-            NSString *trigger = [NSString stringWithFormat:@"timer-%.2fs", delay.doubleValue];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                         (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ MRReconcilePendingFront(trigger); });
-        }
     }
 }
 
@@ -417,6 +467,9 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
     if (bundleID.length != 0 && previousBundleID.length == 0)
         underlyingBeforeChange = [MRCurrentMainApplicationBundleID() copy];
 
+    BOOL meaningfulTransition = bundleID.length != 0 || previousBundleID.length != 0;
+    NSUInteger transitionGeneration = MRReturnToMainGeneration;
+    if (meaningfulTransition) transitionGeneration = ++MRReturnToMainGeneration;
     MROriginalSetCurrentBundle(self, selector, bundleID);
     NSString *stableBundleID = [bundleID copy];
     if (stableBundleID.length != 0 && underlyingBeforeChange.length != 0 &&
@@ -429,9 +482,10 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
         NSString *returnBundleID = [MRUnderlyingMainBundleID copy];
         MRUnderlyingMainBundleID = nil;
         [MRDesiredFrontOrder removeAllObjects];
+        MRDesiredFrontGeneration++;
         MRLog(@"Myrtle closed %@; returning immediately to main=%@",
               previousBundleID, returnBundleID);
-        MRScheduleReturnToMainPromotion(returnBundleID);
+        MRScheduleReturnToMainPromotion(returnBundleID, transitionGeneration);
         return;
     }
 
@@ -590,7 +644,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
-            MRLog(@"MyrtleSwitcherFix 0.3.8 immediate return-to-main recency loaded");
+            MRLog(@"MyrtleSwitcherFix 0.3.9 bounded reconciliation loaded");
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
             MRInstallUserDeletionHook();
