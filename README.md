@@ -10,14 +10,14 @@
 
 ## 原理
 
-Myrtle 会通过 `initWithScene:debugDescription:` 托管应用 Scene，但没有把目标应用布局加入 `SBAppSwitcherModel`。由于实际 Host 类名会因私有框架版本变化，本插件枚举 SpringBoard 中所有自身实现该选择器的类并逐一 Hook：
+对 Myrtle 1.4.1 的 Objective-C 元数据和选择器交叉引用分析确认：真正的分屏入口位于 `MyrtleHostManager`；大型宿主创建方法在窗口和 Host View 建立过程中写入 `currentBundleID`，关闭方法 `MT_IlllIIIlIIIlIlllIIIl::` 会清空该值并移除 Host View。本插件因此直接 Hook Myrtle 自身的提交点，不再猜测通用 FrontBoard Scene 初始化类：
 
-1. 从 Scene/client process 取得 Bundle ID；
-2. 取得对应 `SBApplication`；
-3. 创建正常的全屏 `SBDisplayLayout`；
-4. 调用 `SBAppSwitcherModel addToFront:`。
+1. Hook `-[MyrtleHostManager setCurrentBundleID:]`，取得 Myrtle 已确认的目标 Bundle ID；
+2. 优先复用 iOS 15 `recentAppLayouts` 中的 `SBAppLayout`，让已有卡片移动到最前；
+3. 没有旧卡片时，通过兼容工厂创建布局并加入 `SBAppSwitcherModel`；
+4. Hook 后台卡片删除入口，仅当卡片与 Myrtle 当前 Bundle ID 相同时调用 Myrtle 自己的关闭方法。
 
-点击生成的卡片仍由 SpringBoard 按系统方式全屏打开应用。上滑卡片时由系统终止对应应用 Scene；Myrtle 自带的 Scene Layer 更新观察器会收到 Scene 失效。
+点击生成的卡片仍由 SpringBoard 按系统方式全屏打开应用。诊断日志会写入 `/var/mobile/Library/Preferences/com.local.myrtleswitcherfix.log`，不依赖系统日志流。
 
 ## 构建
 
@@ -53,6 +53,7 @@ GitHub Actions 会自动验证：
 
 ## 版本说明
 
+- `0.3.0`：直接 Hook Myrtle 1.4.1 的 HostManager 生命周期，并联动后台卡片删除与 Myrtle 关闭入口。
 - `0.2.1`：枚举实际 Scene Host 类，不再依赖写死的类名或调用来源解析。
 - `0.2.0`：首次正式 Hook 版，因 Host 类名未命中而不生效。
 - `0.1.2`：文件日志诊断版，已停止使用。
