@@ -1,6 +1,6 @@
 Package: com.local.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.2.0
+Version: 0.2.1
 Architecture: iphoneos-arm64e
 Description: Adds Myrtle-hosted applications to the iOS 15 App Switcher. RootHide arm64e package with arm64 Mach-O.
 Maintainer: Local

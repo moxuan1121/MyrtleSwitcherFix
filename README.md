@@ -10,7 +10,7 @@
 
 ## 原理
 
-Myrtle 会通过 `FBSceneLayerHostContainerView initWithScene:debugDescription:` 托管应用 Scene，但没有把目标应用布局加入 `SBAppSwitcherModel`。本插件只在该调用的返回地址确认为 `Myrtle.dylib` 时：
+Myrtle 会通过 `initWithScene:debugDescription:` 托管应用 Scene，但没有把目标应用布局加入 `SBAppSwitcherModel`。由于实际 Host 类名会因私有框架版本变化，本插件枚举 SpringBoard 中所有自身实现该选择器的类并逐一 Hook：
 
 1. 从 Scene/client process 取得 Bundle ID；
 2. 取得对应 `SBApplication`；
@@ -53,8 +53,8 @@ GitHub Actions 会自动验证：
 
 ## 版本说明
 
-- `0.2.0`：正式 Hook 版，直接补充 App Switcher 卡片。
+- `0.2.1`：枚举实际 Scene Host 类，不再依赖写死的类名或调用来源解析。
+- `0.2.0`：首次正式 Hook 版，因 Host 类名未命中而不生效。
 - `0.1.2`：文件日志诊断版，已停止使用。
 - `0.1.1`：首次 arm64 诊断版，已停止使用。
 - `0.1.0`：错误的 arm64e Mach-O 构建，会导致 SpringBoard 安全模式；产物已撤回，禁止安装。
-

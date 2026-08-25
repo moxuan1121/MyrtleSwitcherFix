@@ -1,13 +1,9 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <dlfcn.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
-#import <string.h>
+#import <stdlib.h>
 #import <substrate.h>
-#if __has_include(<ptrauth.h>)
-#import <ptrauth.h>
-#endif
 
 static id MRSafeValue(id object, NSString *key)
 {
@@ -43,18 +39,6 @@ static NSString *MRBundleIdentifierForScene(id scene)
     return MRFirstString(identity, @[
         @"embeddedApplicationIdentifier", @"applicationIdentifier", @"bundleIdentifier"
     ]);
-}
-
-static BOOL MRCallerIsMyrtle(void *address)
-{
-#if __has_include(<ptrauth.h>)
-    address = ptrauth_strip(address, ptrauth_key_return_address);
-#endif
-    Dl_info info;
-    memset(&info, 0, sizeof(info));
-    if (address == NULL || dladdr(address, &info) == 0 || info.dli_fname == NULL) return NO;
-    NSString *image = [NSString stringWithUTF8String:info.dli_fname];
-    return [image.lastPathComponent isEqualToString:@"Myrtle.dylib"];
 }
 
 static BOOL MRIsOrdinaryApplicationIdentifier(NSString *bundleID)
@@ -105,13 +89,32 @@ static void MRAddApplicationToSwitcher(NSString *bundleID)
     }
 }
 
-static id (*MROriginalHostInit)(id, SEL, id, id) = NULL;
+typedef id (*MRHostInitIMP)(id, SEL, id, id);
+typedef struct {
+    Class cls;
+    MRHostInitIMP original;
+} MRHostHookRecord;
+
+static MRHostHookRecord MRHostHooks[64];
+static NSUInteger MRHostHookCount = 0;
+
+static MRHostInitIMP MROriginalForObject(id object)
+{
+    Class cls = object_getClass(object);
+    while (cls != Nil) {
+        for (NSUInteger index = 0; index < MRHostHookCount; index++) {
+            if (MRHostHooks[index].cls == cls) return MRHostHooks[index].original;
+        }
+        cls = class_getSuperclass(cls);
+    }
+    return NULL;
+}
 
 static id MRHookHostInit(id self, SEL selector, id scene, id description)
 {
-    void *caller = __builtin_return_address(0);
-    id result = MROriginalHostInit != NULL ? MROriginalHostInit(self, selector, scene, description) : nil;
-    if (result != nil && MRCallerIsMyrtle(caller)) {
+    MRHostInitIMP original = MROriginalForObject(self);
+    id result = original != NULL ? original(self, selector, scene, description) : nil;
+    if (result != nil) {
         NSString *bundleID = MRBundleIdentifierForScene(scene);
         if (MRIsOrdinaryApplicationIdentifier(bundleID)) {
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -125,14 +128,42 @@ static id MRHookHostInit(id self, SEL selector, id scene, id description)
 static BOOL MRInstallHostHook(void)
 {
     SEL selector = NSSelectorFromString(@"initWithScene:debugDescription:");
-    for (NSString *className in @[@"FBSceneLayerHostContainerView", @"FBSceneHostView"]) {
-        Class cls = NSClassFromString(className);
-        if (cls != Nil && class_getInstanceMethod(cls, selector) != NULL) {
-            MSHookMessageEx(cls, selector, (IMP)MRHookHostInit, (IMP *)&MROriginalHostInit);
-            return YES;
+    int classCount = objc_getClassList(NULL, 0);
+    if (classCount <= 0) return NO;
+
+    Class *classes = (__unsafe_unretained Class *)calloc((size_t)classCount, sizeof(Class));
+    classCount = objc_getClassList(classes, classCount);
+    for (int classIndex = 0; classIndex < classCount && MRHostHookCount < 64; classIndex++) {
+        Class cls = classes[classIndex];
+        BOOL alreadyHooked = NO;
+        for (NSUInteger index = 0; index < MRHostHookCount; index++) {
+            if (MRHostHooks[index].cls == cls) {
+                alreadyHooked = YES;
+                break;
+            }
+        }
+        if (alreadyHooked) continue;
+
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(cls, &methodCount);
+        BOOL definesSelector = NO;
+        for (unsigned int methodIndex = 0; methodIndex < methodCount; methodIndex++) {
+            if (method_getName(methods[methodIndex]) == selector) {
+                definesSelector = YES;
+                break;
+            }
+        }
+        free(methods);
+
+        if (definesSelector) {
+            MRHostHooks[MRHostHookCount].cls = cls;
+            MSHookMessageEx(cls, selector, (IMP)MRHookHostInit,
+                            (IMP *)&MRHostHooks[MRHostHookCount].original);
+            MRHostHookCount++;
         }
     }
-    return NO;
+    free(classes);
+    return MRHostHookCount > 0;
 }
 
 static void MRInstallWhenReady(NSUInteger attempt)
@@ -151,4 +182,3 @@ static void MRInstallWhenReady(NSUInteger attempt)
         });
     }
 }
-
