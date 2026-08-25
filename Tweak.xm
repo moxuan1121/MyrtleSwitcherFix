@@ -8,6 +8,7 @@
 static NSString *const MRLogPath = @"/var/mobile/Library/Preferences/com.local.myrtleswitcherfix.log";
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
+static __strong NSString *MRUnderlyingMainBundleID = nil;
 static BOOL MRReconcilingFront = NO;
 
 static void MRLog(NSString *format, ...)
@@ -289,6 +290,65 @@ static BOOL MRAddProductionDisplayItem(id switcher, id application, NSString *bu
     return YES;
 }
 
+static NSString *MRCurrentMainApplicationBundleID(void)
+{
+    id switcher = MRMainSwitcher();
+    SEL selector = NSSelectorFromString(@"_currentAppLayout");
+    id layout = nil;
+    if (switcher != nil && [switcher respondsToSelector:selector])
+        layout = ((id (*)(id, SEL))objc_msgSend)(switcher, selector);
+    NSString *bundleID = MRBundleIdentifierFromLayout(layout);
+    if (bundleID.length != 0) return bundleID;
+
+    id springBoard = [UIApplication sharedApplication];
+    SEL frontSelector = NSSelectorFromString(@"_accessibilityFrontMostApplication");
+    id application = nil;
+    if ([springBoard respondsToSelector:frontSelector])
+        application = ((id (*)(id, SEL))objc_msgSend)(springBoard, frontSelector);
+    return MRDirectBundleIdentifier(application);
+}
+
+static BOOL MRPromoteExistingCard(NSString *bundleID, NSString *trigger)
+{
+    if (bundleID.length == 0) return NO;
+    id switcher = MRMainSwitcher();
+    NSArray *layouts = MRRecentAppLayouts(switcher);
+    NSUInteger index = NSNotFound;
+    id layout = MRLayoutForBundleIdentifier(layouts, bundleID, &index);
+    if (layout == nil) {
+        MRLog(@"return-to-main %@ trigger=%@ layout-not-found count=%lu",
+              bundleID, trigger, (unsigned long)layouts.count);
+        return NO;
+    }
+    if (index != 0) {
+        SEL selector = NSSelectorFromString(@"_addAppLayoutToFront:");
+        if (![switcher respondsToSelector:selector]) return NO;
+        ((void (*)(id, SEL, id))objc_msgSend)(switcher, selector, layout);
+        MRLog(@"return-to-main promoted %@ trigger=%@ oldIndex=%lu",
+              bundleID, trigger, (unsigned long)index);
+    }
+    NSArray *updated = MRRecentAppLayouts(switcher);
+    NSUInteger updatedIndex = NSNotFound;
+    id updatedLayout = MRLayoutForBundleIdentifier(updated, bundleID, &updatedIndex);
+    MRLog(@"return-to-main verify %@ trigger=%@ found=%d index=%@ count=%lu",
+          bundleID, trigger, updatedLayout != nil,
+          updatedIndex == NSNotFound ? @"NSNotFound" : [NSString stringWithFormat:@"%lu", (unsigned long)updatedIndex],
+          (unsigned long)updated.count);
+    return updatedLayout != nil && updatedIndex == 0;
+}
+
+static void MRScheduleReturnToMainPromotion(NSString *bundleID)
+{
+    if (bundleID.length == 0) return;
+    NSArray<NSNumber *> *delays = @[@0.0, @0.15, @0.5];
+    for (NSNumber *delay in delays) {
+        NSString *trigger = [NSString stringWithFormat:@"close-%.2fs", delay.doubleValue];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ MRPromoteExistingCard(bundleID, trigger); });
+    }
+}
+
 static void MRPromoteOrInsertSwitcherCard(NSString *bundleID)
 {
     if (bundleID.length == 0 || ![bundleID containsString:@"."]) return;
@@ -352,10 +412,28 @@ static MRSetCurrentBundleIMP MROriginalSetCurrentBundle = NULL;
 
 static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
 {
+    NSString *previousBundleID = [MRSafeValue(self, @"currentBundleID") copy];
+    NSString *underlyingBeforeChange = nil;
+    if (bundleID.length != 0 && previousBundleID.length == 0)
+        underlyingBeforeChange = [MRCurrentMainApplicationBundleID() copy];
+
     MROriginalSetCurrentBundle(self, selector, bundleID);
     NSString *stableBundleID = [bundleID copy];
-    MRLog(@"Myrtle committed currentBundleID=%@", stableBundleID);
-    if (stableBundleID.length == 0) return;
+    if (stableBundleID.length != 0 && underlyingBeforeChange.length != 0 &&
+        ![underlyingBeforeChange isEqualToString:stableBundleID]) {
+        MRUnderlyingMainBundleID = underlyingBeforeChange;
+    }
+    MRLog(@"Myrtle committed currentBundleID=%@ previous=%@ underlyingMain=%@",
+          stableBundleID, previousBundleID, MRUnderlyingMainBundleID);
+    if (stableBundleID.length == 0) {
+        NSString *returnBundleID = [MRUnderlyingMainBundleID copy];
+        MRUnderlyingMainBundleID = nil;
+        [MRDesiredFrontOrder removeAllObjects];
+        MRLog(@"Myrtle closed %@; returning immediately to main=%@",
+              previousBundleID, returnBundleID);
+        MRScheduleReturnToMainPromotion(returnBundleID);
+        return;
+    }
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -512,7 +590,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
-            MRLog(@"MyrtleSwitcherFix 0.3.7 production display-item path loaded");
+            MRLog(@"MyrtleSwitcherFix 0.3.8 immediate return-to-main recency loaded");
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
             MRInstallUserDeletionHook();

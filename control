@@ -1,8 +1,8 @@
 Package: com.local.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.3.7
+Version: 0.3.8
 Architecture: iphoneos-arm64e
-Description: Adds Myrtle 1.4.1 scenes to the iOS 15 switcher through production display-item APIs.
+Description: Adds Myrtle scenes through production switcher APIs and restores main-app recency immediately on close.
 Maintainer: Local
 Author: Local
 Section: Tweaks

@@ -54,6 +54,7 @@ GitHub Actions 会自动验证：
 
 ## 版本说明
 
+- `0.3.8`：打开分屏应用时记录其下方的主应用；Myrtle 关闭分屏并清空 Bundle ID 时，立即将主应用已有卡片前置，使关闭 B 返回 A 后无需等待系统延迟即可得到 `[A, B, ...]`。
 - `0.3.7`：删除会生成临时、幽灵及重复卡片的 `_insertCardForDisplayIdentifier:` 测试入口；改用 Myrtle 实际 Scene identifier 创建 `SBDisplayItem`，再调用生产接口 `addAppLayoutForDisplayItem:completion:`。待排序状态改为有序队列，并 Hook 用户直接删除卡片的回调。
 - `0.3.6`：确认无卡片插入会异步落入模型后，记录最新 Myrtle Bundle ID，并在模型变化、后台界面出现及定时重试时调用已验证有效的 `_addAppLayoutToFront:`，保证最终索引为 0。
 - `0.3.5`：按 iOS 15.5/15.6 的真实类结构改用 `SBMainSwitcherViewController` 单例；严格分离已有卡片前置与无卡片插入，并在调用后验证真实索引。删除卡片 Hook 也迁移到该类。
