@@ -3,6 +3,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <stdarg.h>
+#import <stdlib.h>
 #import <substrate.h>
 
 static NSString *const MRLogPath = @"/var/mobile/Library/Preferences/com.local.myrtleswitcherfix.log";
@@ -80,9 +81,68 @@ static id MRSendObject(id target, NSString *selectorName, id argument)
     return ((id (*)(id, SEL, id))objc_msgSend)(target, selector, argument);
 }
 
+static id MRMainSwitcherCoordinator(void)
+{
+    return MRSendClassNoArgs(@"SBMainSwitcherControllerCoordinator", @"sharedInstance");
+}
+
+static id MRContainedObjectOfClass(id owner, Class wantedClass)
+{
+    if (owner == nil || wantedClass == Nil) return nil;
+    for (NSString *key in @[@"appSwitcherModel", @"_appSwitcherModel",
+                             @"switcherModel", @"_switcherModel", @"model", @"_model"]) {
+        id value = MRSafeValue(owner, key);
+        if ([value isKindOfClass:wantedClass]) return value;
+    }
+    for (Class cls = [owner class]; cls != Nil; cls = class_getSuperclass(cls)) {
+        unsigned int count = 0;
+        Ivar *ivars = class_copyIvarList(cls, &count);
+        for (unsigned int index = 0; index < count; index++) {
+            const char *type = ivar_getTypeEncoding(ivars[index]);
+            if (type == NULL || type[0] != '@') continue;
+            id value = object_getIvar(owner, ivars[index]);
+            if ([value isKindOfClass:wantedClass]) {
+                free(ivars);
+                return value;
+            }
+        }
+        free(ivars);
+    }
+    return nil;
+}
+
+static id MRAppSwitcherModel(void)
+{
+    // iOS 15 owns this model from the main switcher coordinator; the model
+    // itself deliberately has no +sharedInstance.
+    return MRContainedObjectOfClass(MRMainSwitcherCoordinator(),
+                                    NSClassFromString(@"SBAppSwitcherModel"));
+}
+
+static void MRLogRelevantMethods(id object, NSString *label)
+{
+    if (object == nil) {
+        MRLog(@"%@ unavailable", label);
+        return;
+    }
+    NSMutableArray *result = [NSMutableArray array];
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList([object class], &count);
+    for (unsigned int index = 0; index < count; index++) {
+        NSString *name = NSStringFromSelector(method_getName(methods[index]));
+        NSString *lower = name.lowercaseString;
+        if ([lower containsString:@"layout"] || [lower containsString:@"front"] ||
+            [lower containsString:@"recent"] || [lower containsString:@"add"])
+            [result addObject:name];
+    }
+    free(methods);
+    MRLog(@"%@ class=%@ relevantMethods=%@", label,
+          NSStringFromClass([object class]), result);
+}
+
 static id MRExistingAppLayout(NSString *bundleID)
 {
-    id switcher = MRSendClassNoArgs(@"SBMainSwitcherViewController", @"sharedInstance");
+    id switcher = MRMainSwitcherCoordinator();
     id layouts = MRSafeValue(switcher, @"recentAppLayouts");
     if (![layouts isKindOfClass:NSArray.class]) return nil;
     for (id layout in layouts) {
@@ -118,11 +178,18 @@ static BOOL MRAddLayoutToFront(id model, id layout, NSArray<NSString *> *selecto
 static void MRAddApplicationToSwitcher(NSString *bundleID)
 {
     if (bundleID.length == 0 || ![bundleID containsString:@"."]) return;
-    id model = MRSendClassNoArgs(@"SBAppSwitcherModel", @"sharedInstance");
+    id coordinator = MRMainSwitcherCoordinator();
+    id model = MRAppSwitcherModel();
     id appController = MRSendClassNoArgs(@"SBApplicationController", @"sharedInstance");
     id application = MRSendObject(appController, @"applicationWithBundleIdentifier:", bundleID);
     if (model == nil || application == nil) {
-        MRLog(@"cannot add %@: model=%@ application=%@", bundleID, model, application);
+        MRLog(@"cannot add %@: coordinator=%@ model=%@ application=%@",
+              bundleID, coordinator, model, application);
+        static dispatch_once_t diagnosticOnce;
+        dispatch_once(&diagnosticOnce, ^{
+            MRLogRelevantMethods(coordinator, @"coordinator");
+            MRLogRelevantMethods(model, @"switcher model");
+        });
         return;
     }
 
@@ -130,7 +197,7 @@ static void MRAddApplicationToSwitcher(NSString *bundleID)
     // two layout classes coexist, and mixing them is a SpringBoard crash risk.
     id existing = MRExistingAppLayout(bundleID);
     BOOL sent = existing != nil && MRAddLayoutToFront(model, existing,
-        @[@"addAppLayoutToFront:", @"_addAppLayoutToFront:"]);
+        @[@"addToFront:", @"addAppLayoutToFront:", @"_addAppLayoutToFront:"]);
     NSString *source = @"recentAppLayouts";
     if (!sent) {
         id compatibilityLayout = MRCompatibilityDisplayLayout(application);
@@ -200,7 +267,7 @@ static BOOL MRInstallMyrtleHook(void)
 
 static void MRInstallSwitcherDeleteHook(void)
 {
-    Class cls = NSClassFromString(@"SBMainSwitcherViewController");
+    Class cls = NSClassFromString(@"SBMainSwitcherControllerCoordinator");
     SEL selector = NSSelectorFromString(@"_deleteAppLayout:forReason:");
     Method method = class_getInstanceMethod(cls, selector);
     if (cls != Nil && method != NULL && method_getNumberOfArguments(method) == 4) {
@@ -225,7 +292,7 @@ static void MRInstallWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
-            MRLog(@"MyrtleSwitcherFix 0.3.2 new-ABI arm64e loaded");
+            MRLog(@"MyrtleSwitcherFix 0.3.3 coordinator model loaded");
             MRInstallSwitcherDeleteHook();
             MRInstallWhenReady(0);
         });
