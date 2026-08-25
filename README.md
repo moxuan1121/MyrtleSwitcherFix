@@ -54,6 +54,7 @@ GitHub Actions 会自动验证：
 
 ## 版本说明
 
+- `0.3.6`：确认无卡片插入会异步落入模型后，记录最新 Myrtle Bundle ID，并在模型变化、后台界面出现及定时重试时调用已验证有效的 `_addAppLayoutToFront:`，保证最终索引为 0。
 - `0.3.5`：按 iOS 15.5/15.6 的真实类结构改用 `SBMainSwitcherViewController` 单例；严格分离已有卡片前置与无卡片插入，并在调用后验证真实索引。删除卡片 Hook 也迁移到该类。
 - `0.3.4`：尝试 Hook `-[SBAppSwitcherModel init]`；真机日志证明模型并不经过这个入口，因此未能获得实例。
 - `0.3.3`：根据设备日志改为从 `SBMainSwitcherControllerCoordinator` 取得其持有的 `SBAppSwitcherModel`；iOS 15 的 Model 没有 `sharedInstance`。删除卡片 Hook 同步迁移到 Coordinator。

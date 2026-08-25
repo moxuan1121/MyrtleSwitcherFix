@@ -7,6 +7,8 @@
 
 static NSString *const MRLogPath = @"/var/mobile/Library/Preferences/com.local.myrtleswitcherfix.log";
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
+static __strong NSString *MRPendingFrontBundleID = nil;
+static BOOL MRReconcilingFront = NO;
 
 static void MRLog(NSString *format, ...)
 {
@@ -121,12 +123,13 @@ static void MRLogSwitcherCapabilities(id switcher)
 {
     Class cls = [switcher class];
     NSArray *layouts = MRRecentAppLayouts(switcher);
-    MRLog(@"switcher=%@ class=%@ layouts=%lu recent=%d promote=%d insert=%d remove=%d",
+    MRLog(@"switcher=%@ class=%@ layouts=%lu recent=%d promote=%d insert=%d remove=%d changed=%d",
           switcher, NSStringFromClass(cls), (unsigned long)layouts.count,
           MRHasInstanceMethod(cls, @"recentAppLayouts", 2),
           MRHasInstanceMethod(cls, @"_addAppLayoutToFront:", 3),
           MRHasInstanceMethod(cls, @"_insertCardForDisplayIdentifier:atIndex:", 4),
-          MRHasInstanceMethod(cls, @"_removeAppLayout:forReason:", 4));
+          MRHasInstanceMethod(cls, @"_removeAppLayout:forReason:", 4),
+          MRHasInstanceMethod(cls, @"_switcherModelChanged:", 3));
 }
 
 static void MRVerifySwitcherResult(NSString *bundleID, NSString *action)
@@ -140,6 +143,47 @@ static void MRVerifySwitcherResult(NSString *bundleID, NSString *action)
           index == NSNotFound ? @"NSNotFound" : [NSString stringWithFormat:@"%lu", (unsigned long)index],
           (unsigned long)layouts.count,
           layout == nil ? @"(null)" : NSStringFromClass([layout class]));
+}
+
+static void MRReconcilePendingFront(NSString *trigger)
+{
+    if (MRReconcilingFront || MRPendingFrontBundleID.length == 0) return;
+    NSString *bundleID = [MRPendingFrontBundleID copy];
+    id switcher = MRMainSwitcher();
+    NSArray *layouts = MRRecentAppLayouts(switcher);
+    NSUInteger index = NSNotFound;
+    id layout = MRLayoutForBundleIdentifier(layouts, bundleID, &index);
+    if (layout == nil) {
+        MRLog(@"reconcile %@ trigger=%@ pending-not-materialized count=%lu",
+              bundleID, trigger, (unsigned long)layouts.count);
+        return;
+    }
+
+    if (index != 0) {
+        SEL selector = NSSelectorFromString(@"_addAppLayoutToFront:");
+        if (![switcher respondsToSelector:selector]) {
+            MRLog(@"reconcile %@ trigger=%@ promote-unavailable index=%lu",
+                  bundleID, trigger, (unsigned long)index);
+            return;
+        }
+        MRReconcilingFront = YES;
+        ((void (*)(id, SEL, id))objc_msgSend)(switcher, selector, layout);
+        MRReconcilingFront = NO;
+        MRLog(@"reconcile promoted %@ trigger=%@ oldIndex=%lu",
+              bundleID, trigger, (unsigned long)index);
+    }
+
+    NSArray *updatedLayouts = MRRecentAppLayouts(switcher);
+    NSUInteger updatedIndex = NSNotFound;
+    id updatedLayout = MRLayoutForBundleIdentifier(updatedLayouts, bundleID, &updatedIndex);
+    MRLog(@"reconcile verify %@ trigger=%@ found=%d index=%@ count=%lu",
+          bundleID, trigger, updatedLayout != nil,
+          updatedIndex == NSNotFound ? @"NSNotFound" : [NSString stringWithFormat:@"%lu", (unsigned long)updatedIndex],
+          (unsigned long)updatedLayouts.count);
+    if (updatedLayout != nil && updatedIndex == 0 &&
+        [MRPendingFrontBundleID isEqualToString:bundleID]) {
+        MRPendingFrontBundleID = nil;
+    }
 }
 
 static void MRPromoteOrInsertSwitcherCard(NSString *bundleID)
@@ -167,6 +211,7 @@ static void MRPromoteOrInsertSwitcherCard(NSString *bundleID)
     NSString *action = nil;
 
     if (existing != nil) {
+        MRPendingFrontBundleID = nil;
         SEL promoteSelector = NSSelectorFromString(@"_addAppLayoutToFront:");
         if (![switcher respondsToSelector:promoteSelector] ||
             !MRHasInstanceMethod([switcher class], @"_addAppLayoutToFront:", 3)) {
@@ -184,14 +229,24 @@ static void MRPromoteOrInsertSwitcherCard(NSString *bundleID)
             MRLog(@"cannot insert %@: _insertCardForDisplayIdentifier:atIndex: unavailable", bundleID);
             return;
         }
+        MRPendingFrontBundleID = [bundleID copy];
         ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(switcher, insertSelector, bundleID, 0);
         action = @"insert-absent";
         MRLog(@"sent insert %@ atIndex=0", bundleID);
     }
 
-    NSString *stableAction = [action copy];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ MRVerifySwitcherResult(bundleID, stableAction); });
+    if ([action isEqualToString:@"promote-existing"]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ MRVerifySwitcherResult(bundleID, action); });
+    } else {
+        NSArray<NSNumber *> *delays = @[@0.75, @1.5, @3.0, @6.0];
+        for (NSNumber *delay in delays) {
+            NSString *trigger = [NSString stringWithFormat:@"timer-%.2fs", delay.doubleValue];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ MRReconcilePendingFront(trigger); });
+        }
+    }
 }
 
 typedef void (*MRSetCurrentBundleIMP)(id, SEL, NSString *);
@@ -234,6 +289,12 @@ static void MRCloseMyrtleWindowForBundleID(NSString *bundleID)
 typedef void (*MRRemoveLayoutIMP)(id, SEL, id, long long);
 static MRRemoveLayoutIMP MROriginalRemoveLayout = NULL;
 
+typedef void (*MRModelChangedIMP)(id, SEL, id);
+static MRModelChangedIMP MROriginalModelChanged = NULL;
+
+typedef void (*MRViewWillAppearIMP)(id, SEL, BOOL);
+static MRViewWillAppearIMP MROriginalViewWillAppear = NULL;
+
 static void MRHookRemoveLayout(id self, SEL selector, id layout, long long reason)
 {
     NSString *bundleID = [MRBundleIdentifierFromLayout(layout) copy];
@@ -241,6 +302,20 @@ static void MRHookRemoveLayout(id self, SEL selector, id layout, long long reaso
           layout == nil ? @"(null)" : NSStringFromClass([layout class]));
     MROriginalRemoveLayout(self, selector, layout, reason);
     MRCloseMyrtleWindowForBundleID(bundleID);
+}
+
+static void MRHookModelChanged(id self, SEL selector, id model)
+{
+    MROriginalModelChanged(self, selector, model);
+    if (MRPendingFrontBundleID.length != 0 && !MRReconcilingFront)
+        dispatch_async(dispatch_get_main_queue(), ^{ MRReconcilePendingFront(@"model-changed"); });
+}
+
+static void MRHookViewWillAppear(id self, SEL selector, BOOL animated)
+{
+    MROriginalViewWillAppear(self, selector, animated);
+    if (MRPendingFrontBundleID.length != 0)
+        dispatch_async(dispatch_get_main_queue(), ^{ MRReconcilePendingFront(@"view-will-appear"); });
 }
 
 static BOOL MRInstallMyrtleHook(void)
@@ -269,6 +344,30 @@ static void MRInstallSwitcherRemoveHook(void)
     }
 }
 
+static void MRInstallSwitcherReconciliationHooks(void)
+{
+    Class cls = NSClassFromString(@"SBMainSwitcherViewController");
+    SEL changedSelector = NSSelectorFromString(@"_switcherModelChanged:");
+    Method changedMethod = class_getInstanceMethod(cls, changedSelector);
+    if (cls != Nil && changedMethod != NULL && method_getNumberOfArguments(changedMethod) == 3) {
+        MSHookMessageEx(cls, changedSelector, (IMP)MRHookModelChanged,
+                        (IMP *)&MROriginalModelChanged);
+        MRLog(@"installed switcher model-change reconciliation hook");
+    } else {
+        MRLog(@"switcher model-change reconciliation method unavailable");
+    }
+
+    SEL appearSelector = @selector(viewWillAppear:);
+    Method appearMethod = class_getInstanceMethod(cls, appearSelector);
+    if (cls != Nil && appearMethod != NULL && method_getNumberOfArguments(appearMethod) == 3) {
+        MSHookMessageEx(cls, appearSelector, (IMP)MRHookViewWillAppear,
+                        (IMP *)&MROriginalViewWillAppear);
+        MRLog(@"installed switcher appearance reconciliation hook");
+    } else {
+        MRLog(@"switcher appearance reconciliation method unavailable");
+    }
+}
+
 static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     if (MRInstallMyrtleHook()) return;
@@ -284,8 +383,9 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
-            MRLog(@"MyrtleSwitcherFix 0.3.5 exact iOS 15 switcher path loaded");
+            MRLog(@"MyrtleSwitcherFix 0.3.6 async front reconciliation loaded");
             MRInstallSwitcherRemoveHook();
+            MRInstallSwitcherReconciliationHooks();
             id existingSwitcher = MRSendClassNoArgs(@"SBMainSwitcherViewController", @"sharedInstanceIfExists");
             if (existingSwitcher != nil) MRLogSwitcherCapabilities(existingSwitcher);
             MRInstallMyrtleWhenReady(0);
