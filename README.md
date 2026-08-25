@@ -19,7 +19,7 @@
 
 Myrtle 自带的“全屏打开”会先复用窗口关闭流程，再调用 `launchApplicationWithIdentifier:suspended:`。不同界面存在两条入口：`-[MyrtleViewController MT_llIIIlIIlIlllIlIIIII]` 和实际窗口流程使用的 `+[MyrtleHostCore MT_IllIlllIIllIllIIIIII:]`。插件同时 Hook 两者，并兼容启动调用发生在 `currentBundleID` 清空之前或之后，因此能区分“关闭 B 返回 A”和“全屏进入 B”：前者前置 A，后者保持 B 位于后台第一张。
 
-点击生成的卡片仍由 SpringBoard 按系统方式全屏打开应用。诊断日志会写入 `/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.log`，不依赖系统日志流。
+点击生成的卡片仍由 SpringBoard 按系统方式全屏打开应用。`performance/no-logging` 分支在预处理阶段完全裁掉诊断日志调用及其参数求值，不查询日志文件、不创建字符串、不执行磁盘写入；已经验证的卡片登记、排序、关闭与全屏时序保持不变。
 
 ## 构建
 
@@ -57,6 +57,7 @@ GitHub Actions 会自动验证：
 
 ## 版本说明
 
+- `0.4.4.1`：基于 0.4.4 稳定逻辑制作无日志性能版；编译期裁掉全部诊断日志调用、参数求值和文件 I/O，并删除一次性的能力探测日志，不修改卡片时序、Hook 范围或卸载行为。
 - `0.4.4`：删除打开分屏后固定等待 0.35 秒且要求窗口仍存活的限制；在 0、0.08、0.20、0.35 秒按需尝试真实 Scene 卡片登记，首次成功后停止后续尝试。极快关闭时仍补充 B 卡片，但不加入 B 的前置队列，并再次前置底层 A，保证最终为 `[A, B, ...]`。
 - `0.4.3`：根据 0.4.2 真机日志确认部分全屏动作不调用 Myrtle 的两个显式启动帮助方法，而是在清空 Bundle ID 前由 SpringBoard 连续发布模型变化；在模型回调中比对系统 `_currentAppLayout` 与 Myrtle 当前 Bundle ID，系统已切换到 B 时直接标记全屏转换，消除无旧卡片应用等待系统最终登记后才回到首位的延迟。
 - `0.4.2`：根据 0.4.1 真机日志确认 ViewController 全屏入口虽成功 Hook 但测试按钮未经过它；新增实际命中的 MyrtleHostCore 启动入口，并加入 0.75 秒最近关闭关联和 0.08 秒普通关闭判别窗口，覆盖 Myrtle 在启动调用前后清空 Bundle ID 的两种顺序。
