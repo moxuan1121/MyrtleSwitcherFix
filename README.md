@@ -39,6 +39,7 @@ GitHub Actions 会自动验证：
 
 - 外层包架构必须为 `iphoneos-arm64e`；
 - 包内 Mach-O 必须为原生 `arm64e`，与 A15 SpringBoard 一致；
+- Mach-O 的原始 CPU subtype 必须为 `0x80000002`（Apple 新 arm64e ABI），发现 Linux 旧 ABI `0x00000002` 时立即拒绝产物；
 - 不得存在 `preinst`、`postinst`、`prerm`、`postrm`；
 - 必须保留 `mobilesubstrate`/ElleKit 兼容依赖。
 
@@ -53,7 +54,8 @@ GitHub Actions 会自动验证：
 
 ## 版本说明
 
-- `0.3.1`：修正 0.3.0 内部误编译为纯 arm64、导致 A15 SpringBoard 不选择该 dylib 的问题；恢复原生 arm64e，同时保留安全的延迟 Hook 安装。
+- `0.3.2`：改用 macOS/Xcode 工作流生成 Apple 新 arm64e ABI，并增加 CPU subtype 强制检查；不依赖可能造成系统不稳定的 `oldabi`。
+- `0.3.1`：为解决 0.3.0 纯 arm64 不注入而恢复 arm64e，但 Linux 工具链生成的是旧 ABI；虽然 ElleKit 可以映射 dylib，却在首个 Objective-C 常量字符串 `retain` 时崩溃，禁止安装。
 - `0.3.0`：直接 Hook Myrtle 1.4.1 的 HostManager 生命周期，并联动后台卡片删除与 Myrtle 关闭入口。
 - `0.2.1`：枚举实际 Scene Host 类，不再依赖写死的类名或调用来源解析。
 - `0.2.0`：首次正式 Hook 版，因 Host 类名未命中而不生效。

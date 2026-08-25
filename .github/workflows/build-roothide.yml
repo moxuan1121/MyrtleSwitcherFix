@@ -29,7 +29,10 @@ concurrency:
 jobs:
   build:
     name: iOS 15.6 RootHide arm64e
-    runs-on: ubuntu-24.04
+    # arm64e system processes on iOS 15 require Apple's new arm64e ABI.
+    # Linux linkers emit the legacy ABI (CPU subtype capability 0x00), which
+    # loads but crashes on Objective-C constant objects without oldabi.
+    runs-on: macos-14
     timeout-minutes: 30
 
     steps:
@@ -38,8 +41,7 @@ jobs:
 
       - name: Install packaging tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential curl dpkg-dev fakeroot git perl python3 rsync unzip xz-utils
+          brew install make xz ldid dpkg
 
       - name: Install RootHide Theos
         shell: bash
@@ -53,7 +55,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          make clean package FINALPACKAGE=1
+          gmake clean package FINALPACKAGE=1
 
       - name: Verify architecture and uninstall safety
         shell: bash
@@ -97,6 +99,21 @@ jobs:
             echo "Wrong Mach-O architecture; expected native arm64e for A15 SpringBoard" >&2
             exit 1
           fi
+
+          # New-ABI arm64e uses CPU_SUBTYPE_ARM64E with the capability bit set:
+          # raw little-endian cpusubtype 0x80000002. Legacy Linux arm64e is
+          # 0x00000002 and crashes on iOS 15 unless the system-wide oldabi shim
+          # is installed, which this package deliberately does not require.
+          python3 - "$dylib" <<'PY'
+          import struct
+          import sys
+          with open(sys.argv[1], "rb") as stream:
+              header = stream.read(12)
+          subtype = struct.unpack_from("<I", header, 8)[0]
+          print(f"Mach-O CPU subtype: 0x{subtype:08x}")
+          if subtype != 0x80000002:
+              raise SystemExit("Legacy arm64e ABI detected; refusing unsafe package")
+          PY
 
           if ! dpkg-deb -f "$package" Depends | grep -q 'mobilesubstrate'; then
             echo "Missing MobileSubstrate/ElleKit compatibility dependency" >&2
