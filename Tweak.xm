@@ -11,10 +11,12 @@ static const unsigned long long MRMaximumLogSize = 1024 * 1024;
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
 static __strong NSString *MRUnderlyingMainBundleID = nil;
 static __strong NSString *MRMyrtleFullscreenIntentBundleID = nil;
+static __strong NSString *MRRecentlyClosedMyrtleBundleID = nil;
 static BOOL MRReconcilingFront = NO;
 static NSUInteger MRDesiredFrontGeneration = 0;
 static NSUInteger MRReturnToMainGeneration = 0;
 static NSUInteger MRMyrtleFullscreenIntentGeneration = 0;
+static NSTimeInterval MRRecentlyClosedMyrtleTime = 0;
 
 static void MRLog(NSString *format, ...)
 {
@@ -385,7 +387,11 @@ static BOOL MRPromoteExistingCard(NSString *bundleID, NSString *trigger)
 static void MRScheduleReturnToMainPromotion(NSString *bundleID, NSUInteger generation)
 {
     if (bundleID.length == 0) return;
-    NSArray<NSNumber *> *delays = @[@0.0, @0.15, @0.5];
+    // Myrtle reuses its close path before launching a hosted app fullscreen.
+    // This short first delay lets the launch hook classify that transition
+    // without bringing A forward for one frame. A normal close still settles
+    // far faster than the system's native recency update.
+    NSArray<NSNumber *> *delays = @[@0.08, @0.2, @0.5];
     for (NSNumber *delay in delays) {
         NSString *trigger = [NSString stringWithFormat:@"close-%.2fs", delay.doubleValue];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
@@ -507,6 +513,10 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
         ![underlyingBeforeChange isEqualToString:stableBundleID]) {
         MRUnderlyingMainBundleID = underlyingBeforeChange;
     }
+    if (stableBundleID.length != 0) {
+        MRRecentlyClosedMyrtleBundleID = nil;
+        MRRecentlyClosedMyrtleTime = 0;
+    }
     MRLog(@"Myrtle committed currentBundleID=%@ previous=%@ underlyingMain=%@",
           stableBundleID, previousBundleID, MRUnderlyingMainBundleID);
     if (stableBundleID.length == 0) {
@@ -523,6 +533,8 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
             return;
         }
         NSString *returnBundleID = [MRUnderlyingMainBundleID copy];
+        MRRecentlyClosedMyrtleBundleID = [previousBundleID copy];
+        MRRecentlyClosedMyrtleTime = [NSDate timeIntervalSinceReferenceDate];
         MRUnderlyingMainBundleID = nil;
         [MRDesiredFrontOrder removeAllObjects];
         MRDesiredFrontGeneration++;
@@ -546,6 +558,29 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
 typedef void (*MRMyrtleFullscreenIMP)(id, SEL);
 static MRMyrtleFullscreenIMP MROriginalMyrtleFullscreen = NULL;
 
+typedef void (*MRMyrtleHostCoreLaunchIMP)(id, SEL, NSString *);
+static MRMyrtleHostCoreLaunchIMP MROriginalMyrtleHostCoreLaunch = NULL;
+
+static void MRRecordMyrtleFullscreenIntent(NSString *bundleID, NSString *source)
+{
+    if (bundleID.length == 0) return;
+    NSUInteger intentGeneration = ++MRMyrtleFullscreenIntentGeneration;
+    MRMyrtleFullscreenIntentBundleID = [bundleID copy];
+    MRLog(@"Myrtle fullscreen intent bundle=%@ generation=%lu source=%@",
+          bundleID, (unsigned long)intentGeneration, source);
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (intentGeneration == MRMyrtleFullscreenIntentGeneration &&
+            [MRMyrtleFullscreenIntentBundleID isEqualToString:bundleID]) {
+            MRMyrtleFullscreenIntentBundleID = nil;
+            MRMyrtleFullscreenIntentGeneration++;
+            MRLog(@"expired unconsumed Myrtle fullscreen intent bundle=%@ source=%@",
+                  bundleID, source);
+        }
+    });
+}
+
 static void MRHookMyrtleFullscreen(id self, SEL selector)
 {
     NSString *bundleID = [MRSafeValue(self, @"currentWindowBundleID") copy];
@@ -556,21 +591,41 @@ static void MRHookMyrtleFullscreen(id self, SEL selector)
         bundleID = [MRSafeValue(manager, @"currentBundleID") copy];
     }
 
-    NSUInteger intentGeneration = ++MRMyrtleFullscreenIntentGeneration;
-    MRMyrtleFullscreenIntentBundleID = bundleID;
-    MRLog(@"Myrtle fullscreen intent bundle=%@ generation=%lu",
-          bundleID, (unsigned long)intentGeneration);
+    MRRecordMyrtleFullscreenIntent(bundleID, @"view-controller");
     MROriginalMyrtleFullscreen(self, selector);
+}
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (intentGeneration == MRMyrtleFullscreenIntentGeneration &&
-            [MRMyrtleFullscreenIntentBundleID isEqualToString:bundleID]) {
-            MRMyrtleFullscreenIntentBundleID = nil;
-            MRMyrtleFullscreenIntentGeneration++;
-            MRLog(@"expired unconsumed Myrtle fullscreen intent bundle=%@", bundleID);
-        }
-    });
+static void MRHookMyrtleHostCoreLaunch(id self, SEL selector, NSString *bundleID)
+{
+    NSString *stableBundleID = [bundleID copy];
+    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+    NSString *currentBundleID = [MRSafeValue(manager, @"currentBundleID") copy];
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    NSTimeInterval sinceClose = now - MRRecentlyClosedMyrtleTime;
+
+    if (stableBundleID.length != 0 &&
+        [currentBundleID isEqualToString:stableBundleID]) {
+        MRRecordMyrtleFullscreenIntent(stableBundleID, @"host-core-current");
+    } else if (stableBundleID.length != 0 &&
+               [MRRecentlyClosedMyrtleBundleID isEqualToString:stableBundleID] &&
+               MRRecentlyClosedMyrtleTime > 0 && sinceClose >= 0 && sinceClose <= 0.75) {
+        // Some Myrtle paths clear currentBundleID immediately before calling
+        // the launch helper. Cancel the just-scheduled return-to-A promotion
+        // and restore B at the front before the switcher can be displayed.
+        NSUInteger generation = ++MRReturnToMainGeneration;
+        MRRecentlyClosedMyrtleBundleID = nil;
+        MRRecentlyClosedMyrtleTime = 0;
+        MRMyrtleFullscreenIntentBundleID = nil;
+        MRMyrtleFullscreenIntentGeneration++;
+        MRLog(@"Myrtle late fullscreen launch bundle=%@ sinceClose=%.3f; cancelling return-to-main",
+              stableBundleID, sinceClose);
+        MRScheduleFullscreenPromotion(stableBundleID, generation);
+    } else {
+        MRLog(@"Myrtle HostCore launch observed bundle=%@ current=%@ recentClosed=%@ age=%.3f",
+              stableBundleID, currentBundleID, MRRecentlyClosedMyrtleBundleID, sinceClose);
+    }
+
+    MROriginalMyrtleHostCoreLaunch(self, selector, stableBundleID);
 }
 
 static void MRCloseMyrtleWindowForBundleID(NSString *bundleID)
@@ -664,6 +719,19 @@ static BOOL MRInstallMyrtleFullscreenHook(void)
     return MROriginalMyrtleFullscreen != NULL;
 }
 
+static BOOL MRInstallMyrtleHostCoreLaunchHook(void)
+{
+    if (MROriginalMyrtleHostCoreLaunch != NULL) return YES;
+    Class cls = NSClassFromString(@"MyrtleHostCore");
+    SEL selector = NSSelectorFromString(@"MT_IllIlllIIllIllIIIIII:");
+    Method method = class_getClassMethod(cls, selector);
+    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+    MSHookMessageEx(object_getClass(cls), selector, (IMP)MRHookMyrtleHostCoreLaunch,
+                    (IMP *)&MROriginalMyrtleHostCoreLaunch);
+    MRLog(@"installed direct Myrtle HostCore launch hook");
+    return MROriginalMyrtleHostCoreLaunch != NULL;
+}
+
 static void MRInstallSwitcherRemoveHook(void)
 {
     Class cls = NSClassFromString(@"SBMainSwitcherViewController");
@@ -720,10 +788,11 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     BOOL managerInstalled = MRInstallMyrtleHook();
     BOOL fullscreenInstalled = MRInstallMyrtleFullscreenHook();
-    if (managerInstalled && fullscreenInstalled) return;
+    BOOL hostCoreLaunchInstalled = MRInstallMyrtleHostCoreLaunchHook();
+    if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled) return;
     if (attempt >= 60) {
-        MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d",
-              managerInstalled, fullscreenInstalled);
+        MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d",
+              managerInstalled, fullscreenInstalled, hostCoreLaunchInstalled);
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
@@ -734,7 +803,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
-            MRLog(@"MyrtleSwitcherFix 0.4.1 fullscreen transition distinction loaded");
+            MRLog(@"MyrtleSwitcherFix 0.4.2 HostCore fullscreen launch loaded");
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
             MRInstallUserDeletionHook();
