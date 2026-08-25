@@ -1,6 +1,6 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.4.3
+Version: 0.4.4
 Architecture: iphoneos-arm64e
 Description: Adds Myrtle scenes through production switcher APIs and restores main-app recency immediately on close.
 Maintainer: Local

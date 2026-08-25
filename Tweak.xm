@@ -391,7 +391,7 @@ static void MRScheduleReturnToMainPromotion(NSString *bundleID, NSUInteger gener
     // This short first delay lets the launch hook classify that transition
     // without bringing A forward for one frame. A normal close still settles
     // far faster than the system's native recency update.
-    NSArray<NSNumber *> *delays = @[@0.08, @0.2, @0.5];
+    NSArray<NSNumber *> *delays = @[@0.08, @0.2, @0.5, @1.0];
     for (NSNumber *delay in delays) {
         NSString *trigger = [NSString stringWithFormat:@"close-%.2fs", delay.doubleValue];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
@@ -441,9 +441,9 @@ static void MRScheduleFullscreenPromotion(NSString *bundleID, NSUInteger generat
     }
 }
 
-static void MRPromoteOrInsertSwitcherCard(NSString *bundleID)
+static BOOL MRPromoteOrInsertSwitcherCard(NSString *bundleID)
 {
-    if (bundleID.length == 0 || ![bundleID containsString:@"."]) return;
+    if (bundleID.length == 0 || ![bundleID containsString:@"."]) return NO;
 
     id switcher = MRMainSwitcher();
     id appController = MRSendClassNoArgs(@"SBApplicationController", @"sharedInstance");
@@ -454,7 +454,7 @@ static void MRPromoteOrInsertSwitcherCard(NSString *bundleID)
 
     if (switcher == nil || application == nil) {
         MRLog(@"cannot handle %@: switcher=%@ application=%@", bundleID, switcher, application);
-        return;
+        return NO;
     }
 
     static dispatch_once_t capabilityOnce;
@@ -472,7 +472,8 @@ static void MRPromoteOrInsertSwitcherCard(NSString *bundleID)
         if (![switcher respondsToSelector:promoteSelector] ||
             !MRHasInstanceMethod([switcher class], @"_addAppLayoutToFront:", 3)) {
             MRLog(@"cannot promote %@: _addAppLayoutToFront: unavailable", bundleID);
-            return;
+            MRRemoveDesiredFront(bundleID);
+            return NO;
         }
         ((void (*)(id, SEL, id))objc_msgSend)(switcher, promoteSelector, existing);
         action = @"promote-existing";
@@ -481,7 +482,7 @@ static void MRPromoteOrInsertSwitcherCard(NSString *bundleID)
     } else {
         if (!MRAddProductionDisplayItem(switcher, application, bundleID)) {
             MRRemoveDesiredFront(bundleID);
-            return;
+            return NO;
         }
         action = @"add-production-display-item";
     }
@@ -490,6 +491,45 @@ static void MRPromoteOrInsertSwitcherCard(NSString *bundleID)
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ MRVerifySwitcherResult(bundleID, action); });
     }
+    return YES;
+}
+
+static BOOL MREnsureSwitcherCardAfterMyrtleClosed(NSString *bundleID,
+                                                   NSString *underlyingBundleID)
+{
+    if (bundleID.length == 0 || ![bundleID containsString:@"."]) return NO;
+    id switcher = MRMainSwitcher();
+    NSArray *layouts = MRRecentAppLayouts(switcher);
+    id existing = MRLayoutForBundleIdentifier(layouts, bundleID, NULL);
+    if (existing != nil) {
+        MRLog(@"quick-close card already materialized %@", bundleID);
+        MRScheduleReturnToMainPromotion(underlyingBundleID,
+                                        MRReturnToMainGeneration);
+        return YES;
+    }
+
+    id appController = MRSendClassNoArgs(@"SBApplicationController", @"sharedInstance");
+    SEL appSelector = NSSelectorFromString(@"applicationWithBundleIdentifier:");
+    id application = nil;
+    if (appController != nil && [appController respondsToSelector:appSelector])
+        application = ((id (*)(id, SEL, id))objc_msgSend)(appController,
+                                                          appSelector, bundleID);
+    if (switcher == nil || application == nil) {
+        MRLog(@"quick-close cannot ensure %@ switcher=%@ application=%@",
+              bundleID, switcher, application);
+        return NO;
+    }
+    if (!MRAddProductionDisplayItem(switcher, application, bundleID)) return NO;
+
+    // addAppLayoutForDisplayItem: may place the newly materialized B at the
+    // front. The window is already closed, so re-promote its underlying A
+    // after the asynchronous model insertion settles. No desired-front entry
+    // is added for B on this path.
+    MRLog(@"quick-close sent card add %@; restoring underlying=%@",
+          bundleID, underlyingBundleID);
+    MRScheduleReturnToMainPromotion(underlyingBundleID,
+                                    MRReturnToMainGeneration);
+    return YES;
 }
 
 typedef void (*MRSetCurrentBundleIMP)(id, SEL, NSString *);
@@ -544,15 +584,28 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
         return;
     }
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
-        NSString *current = MRSafeValue(manager, @"currentBundleID");
-        if ([current isEqualToString:stableBundleID])
-            MRPromoteOrInsertSwitcherCard(stableBundleID);
-        else
-            MRLog(@"skip %@ because Myrtle currentBundleID changed to %@", stableBundleID, current);
-    });
+    NSString *underlyingForOpen = [MRUnderlyingMainBundleID copy];
+    __block BOOL cardHandled = NO;
+    NSArray<NSNumber *> *delays = @[@0.0, @0.08, @0.2, @0.35];
+    for (NSNumber *delay in delays) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (cardHandled) return;
+            id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+            NSString *current = MRSafeValue(manager, @"currentBundleID");
+            if ([current isEqualToString:stableBundleID]) {
+                cardHandled = MRPromoteOrInsertSwitcherCard(stableBundleID);
+                MRLog(@"open card attempt %@ delay=%.2f active=1 handled=%d",
+                      stableBundleID, delay.doubleValue, cardHandled);
+            } else {
+                cardHandled = MREnsureSwitcherCardAfterMyrtleClosed(stableBundleID,
+                                                                    underlyingForOpen);
+                MRLog(@"open card attempt %@ delay=%.2f active=0 current=%@ handled=%d",
+                      stableBundleID, delay.doubleValue, current, cardHandled);
+            }
+        });
+    }
 }
 
 typedef void (*MRMyrtleFullscreenIMP)(id, SEL);
@@ -820,7 +873,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
-            MRLog(@"MyrtleSwitcherFix 0.4.3 switcher-current fullscreen detection loaded");
+            MRLog(@"MyrtleSwitcherFix 0.4.4 immediate quick-close card registration loaded");
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
             MRInstallUserDeletionHook();
