@@ -29,7 +29,7 @@ concurrency:
 jobs:
   build:
     name: iOS 15.6 RootHide arm64e
-    runs-on: macos-14
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
@@ -37,7 +37,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install packaging tools
-        run: brew install dpkg ldid xz
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl dpkg-dev fakeroot git perl python3 rsync unzip xz-utils
 
       - name: Install RootHide Theos
         shell: bash

@@ -13,7 +13,7 @@
 
 仓库包含 `.github/workflows/build-roothide.yml`。每次推送到 `main` 会自动构建，也可以在 GitHub 的 Actions 页面手动运行 `Build RootHide arm64e package`。
 
-工作流使用 RootHide 官方 Theos 安装脚本，并在上传构建产物前强制验证：
+工作流在 GitHub 的 Linux 托管运行器上使用 RootHide 官方 Theos 安装脚本，并在上传构建产物前强制验证：
 
 - Debian 包架构必须是 `iphoneos-arm64e`；
 - 成品必须只有一个 `.deb`；
