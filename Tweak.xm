@@ -8,6 +8,7 @@
 
 static NSString *const MRLogPath = @"/var/mobile/Library/Preferences/com.local.myrtleswitcherfix.log";
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
+static __strong id MRObservedSwitcherModel = nil;
 
 static void MRLog(NSString *format, ...)
 {
@@ -111,12 +112,42 @@ static id MRContainedObjectOfClass(id owner, Class wantedClass)
     return nil;
 }
 
+static void MRLogRelevantMethods(id object, NSString *label);
+
 static id MRAppSwitcherModel(void)
 {
+    if (MRObservedSwitcherModel != nil) return MRObservedSwitcherModel;
     // iOS 15 owns this model from the main switcher coordinator; the model
     // itself deliberately has no +sharedInstance.
     return MRContainedObjectOfClass(MRMainSwitcherCoordinator(),
                                     NSClassFromString(@"SBAppSwitcherModel"));
+}
+
+typedef id (*MRSwitcherModelInitIMP)(id, SEL);
+static MRSwitcherModelInitIMP MROriginalSwitcherModelInit = NULL;
+
+static id MRHookSwitcherModelInit(id self, SEL selector)
+{
+    id result = MROriginalSwitcherModelInit(self, selector);
+    MRObservedSwitcherModel = result;
+    MRLog(@"captured real SBAppSwitcherModel instance=%@", result);
+    MRLogRelevantMethods(result, @"captured switcher model");
+    return result;
+}
+
+static BOOL MRInstallSwitcherModelCapture(void)
+{
+    Class cls = NSClassFromString(@"SBAppSwitcherModel");
+    SEL selector = @selector(init);
+    Method method = class_getInstanceMethod(cls, selector);
+    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 2) {
+        MRLog(@"SBAppSwitcherModel init unavailable");
+        return NO;
+    }
+    MSHookMessageEx(cls, selector, (IMP)MRHookSwitcherModelInit,
+                    (IMP *)&MROriginalSwitcherModelInit);
+    MRLog(@"installed SBAppSwitcherModel init capture");
+    return MROriginalSwitcherModelInit != NULL;
 }
 
 static void MRLogRelevantMethods(id object, NSString *label)
@@ -142,8 +173,17 @@ static void MRLogRelevantMethods(id object, NSString *label)
 
 static id MRExistingAppLayout(NSString *bundleID)
 {
-    id switcher = MRMainSwitcherCoordinator();
-    id layouts = MRSafeValue(switcher, @"recentAppLayouts");
+    id model = MRAppSwitcherModel();
+    id layouts = MRSafeValue(model, @"recentAppLayouts");
+    if (![layouts isKindOfClass:NSArray.class]) {
+        for (NSString *key in @[@"layouts", @"appLayouts", @"allLayouts", @"snapshot"]) {
+            id candidate = MRSafeValue(layouts, key);
+            if ([candidate isKindOfClass:NSArray.class]) {
+                layouts = candidate;
+                break;
+            }
+        }
+    }
     if (![layouts isKindOfClass:NSArray.class]) return nil;
     for (id layout in layouts) {
         NSString *candidate = MRBundleIdentifierFromLayout(layout);
@@ -292,7 +332,8 @@ static void MRInstallWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
-            MRLog(@"MyrtleSwitcherFix 0.3.3 coordinator model loaded");
+            MRLog(@"MyrtleSwitcherFix 0.3.4 model-init capture loaded");
+            MRInstallSwitcherModelCapture();
             MRInstallSwitcherDeleteHook();
             MRInstallWhenReady(0);
         });

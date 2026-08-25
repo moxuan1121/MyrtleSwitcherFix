@@ -54,6 +54,7 @@ GitHub Actions 会自动验证：
 
 ## 版本说明
 
+- `0.3.4`：不再猜测 Model 所有者类名；直接 Hook `-[SBAppSwitcherModel init]` 并保存 SpringBoard 创建的真实实例，同时记录真机 Model 方法。
 - `0.3.3`：根据设备日志改为从 `SBMainSwitcherControllerCoordinator` 取得其持有的 `SBAppSwitcherModel`；iOS 15 的 Model 没有 `sharedInstance`。删除卡片 Hook 同步迁移到 Coordinator。
 - `0.3.2`：改用 macOS/Xcode 工作流生成 Apple 新 arm64e ABI，并增加 CPU subtype 强制检查；不依赖可能造成系统不稳定的 `oldabi`。
 - `0.3.1`：为解决 0.3.0 纯 arm64 不注入而恢复 arm64e，但 Linux 工具链生成的是旧 ABI；虽然 ElleKit 可以映射 dylib，却在首个 Objective-C 常量字符串 `retain` 时崩溃，禁止安装。
