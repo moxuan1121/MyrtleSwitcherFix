@@ -3,13 +3,16 @@
 #import <objc/runtime.h>
 #import <substrate.h>
 #import <dlfcn.h>
+#import <errno.h>
+#import <fcntl.h>
 #import <os/lock.h>
 #import <string.h>
+#import <unistd.h>
 #if __has_include(<ptrauth.h>)
 #import <ptrauth.h>
 #endif
 
-static NSString *const MRLogPath = @"/var/mobile/Library/Logs/MyrtleSwitcherFix.log";
+static const char *MRLogPath = "/var/mobile/Documents/MyrtleSwitcherFix.log";
 static os_unfair_lock MRLogLock = OS_UNFAIR_LOCK_INIT;
 
 static void MRLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
@@ -25,26 +28,26 @@ static void MRLog(NSString *format, ...)
     NSLog(@"[MyrtleSwitcherFix] %@", message);
 
     os_unfair_lock_lock(&MRLogLock);
-    @autoreleasepool {
-        NSFileManager *fm = NSFileManager.defaultManager;
-        NSString *directory = MRLogPath.stringByDeletingLastPathComponent;
-        [fm createDirectoryAtPath:directory
-      withIntermediateDirectories:YES
-                       attributes:nil
-                            error:nil];
-
-        if (![fm fileExistsAtPath:MRLogPath]) {
-            [line writeToFile:MRLogPath
-                   atomically:YES
-                     encoding:NSUTF8StringEncoding
-                        error:nil];
-        } else {
-            NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:MRLogPath];
-            if (handle != nil) {
-                [handle seekToEndOfFile];
-                [handle writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-                [handle closeFile];
+    const char *bytes = line.UTF8String;
+    if (bytes != NULL) {
+        int descriptor = open(MRLogPath, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        if (descriptor >= 0) {
+            size_t remaining = strlen(bytes);
+            const char *cursor = bytes;
+            while (remaining > 0) {
+                ssize_t written = write(descriptor, cursor, remaining);
+                if (written > 0) {
+                    cursor += written;
+                    remaining -= (size_t)written;
+                } else if (written < 0 && errno == EINTR) {
+                    continue;
+                } else {
+                    break;
+                }
             }
+            close(descriptor);
+        } else {
+            NSLog(@"[MyrtleSwitcherFix] file log open failed: errno=%d", errno);
         }
     }
     os_unfair_lock_unlock(&MRLogLock);

@@ -7,9 +7,9 @@
 - Dopamine RootHide
 - Myrtle 1.4.1
 
-当前 `0.1.1` 版本只记录运行时信息，不添加或删除后台卡片，不终止应用，也不修改 Myrtle 状态。
+当前 `0.1.2` 版本只记录运行时信息，不添加或删除后台卡片，不终止应用，也不修改 Myrtle 状态。
 
-> 安全提示：请勿安装已经撤回的 `0.1.0`。该版本误将 tweak Mach-O 编译为 `arm64e`，在目标设备上会使 SpringBoard 在加载阶段崩溃并进入安全模式。其 Actions artifact 已删除。请只使用 `0.1.1` 或更高版本。
+> 安全提示：请勿安装已经撤回的 `0.1.0`。该版本误将 tweak Mach-O 编译为 `arm64e`，在目标设备上会使 SpringBoard 在加载阶段崩溃并进入安全模式。其 Actions artifact 已删除。请只使用 `0.1.2` 或更高版本。
 
 ## GitHub Actions 自动打包
 
@@ -33,8 +33,10 @@
 - 安装和卸载均不会删除、覆盖、停用、重装或重启 ElleKit。
 - 包只依赖 ElleKit 提供兼容实现的 `mobilesubstrate` 接口；卸载本包不会卸载依赖包。
 - 不运行 `apt autoremove`，不修改任何软件源或包管理配置。
-- 日志是本包唯一创建的持久数据，位置为：
-  `/var/mobile/Library/Logs/MyrtleSwitcherFix.log`
+- 日志是本包唯一创建的持久数据，SpringBoard 原生路径为：
+  `/var/mobile/Documents/MyrtleSwitcherFix.log`
+- 在 RootHide Filza/NewTerm 中查看的对应路径为：
+  `/rootfs/var/mobile/Documents/MyrtleSwitcherFix.log`
 - 为避免误删用户数据，卸载时故意不自动删除日志。确认不再需要后可手动删除这一个文件。
 
 ## 使用 RootHide Theos 编译
@@ -65,7 +67,7 @@ DEB_ARCH = iphoneos-arm64e
 4. 打开上滑后台菜单。
 5. 关闭 Myrtle 分屏窗口。
 6. 再选择一个原本已有后台卡片的 App，用 Myrtle 打开一次。
-7. 导出 `/var/mobile/Library/Logs/MyrtleSwitcherFix.log`。
+7. 导出 `/rootfs/var/mobile/Documents/MyrtleSwitcherFix.log`。
 
 日志包含类名、方法签名、Scene Bundle ID 和调用映像，不会主动读取应用内容、账号、剪贴板或网络数据。发送前仍建议自行检查日志内容。
 
