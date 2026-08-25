@@ -47,11 +47,11 @@ make clean package FINALPACKAGE=1
 
 ```make
 ARCHS = arm64e
-TARGET = iphone:clang:15.6:15.0
+TARGET = iphone:clang:latest:15.0
 THEOS_PACKAGE_SCHEME = roothide
 ```
 
-生成的包应为 `iphoneos-arm64e` 架构。安装或卸载后请手动执行一次用户熟悉且确认安全的 Respring；本包不会自行操作 ElleKit 服务。
+这里的 `latest` 只选择构建机已安装的 SDK；最低部署版本仍固定为 iOS 15.0，因此兼容目标设备的 iOS 15.6。生成的包应为 `iphoneos-arm64e` 架构。安装或卸载后请手动执行一次用户熟悉且确认安全的 Respring；本包不会自行操作 ElleKit 服务。
 
 ## 复现步骤
 
