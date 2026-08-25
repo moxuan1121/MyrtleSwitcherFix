@@ -1,57 +1,13 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <objc/runtime.h>
-#import <substrate.h>
 #import <dlfcn.h>
-#import <errno.h>
-#import <fcntl.h>
-#import <os/lock.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
 #import <string.h>
-#import <unistd.h>
+#import <substrate.h>
 #if __has_include(<ptrauth.h>)
 #import <ptrauth.h>
 #endif
-
-static const char *MRLogPath = "/var/mobile/Documents/MyrtleSwitcherFix.log";
-static os_unfair_lock MRLogLock = OS_UNFAIR_LOCK_INIT;
-
-static void MRLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
-
-static void MRLog(NSString *format, ...)
-{
-    va_list args;
-    va_start(args, format);
-    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
-    va_end(args);
-
-    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message];
-    NSLog(@"[MyrtleSwitcherFix] %@", message);
-
-    os_unfair_lock_lock(&MRLogLock);
-    const char *bytes = line.UTF8String;
-    if (bytes != NULL) {
-        int descriptor = open(MRLogPath, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-        if (descriptor >= 0) {
-            size_t remaining = strlen(bytes);
-            const char *cursor = bytes;
-            while (remaining > 0) {
-                ssize_t written = write(descriptor, cursor, remaining);
-                if (written > 0) {
-                    cursor += written;
-                    remaining -= (size_t)written;
-                } else if (written < 0 && errno == EINTR) {
-                    continue;
-                } else {
-                    break;
-                }
-            }
-            close(descriptor);
-        } else {
-            NSLog(@"[MyrtleSwitcherFix] file log open failed: errno=%d", errno);
-        }
-    }
-    os_unfair_lock_unlock(&MRLogLock);
-}
 
 static id MRSafeValue(id object, NSString *key)
 {
@@ -67,154 +23,132 @@ static NSString *MRFirstString(id object, NSArray<NSString *> *keys)
 {
     for (NSString *key in keys) {
         id value = MRSafeValue(object, key);
-        if ([value isKindOfClass:NSString.class] && [value length] != 0) {
-            return value;
-        }
+        if ([value isKindOfClass:NSString.class] && [value length] != 0) return value;
     }
     return nil;
 }
 
 static NSString *MRBundleIdentifierForScene(id scene)
 {
-    NSString *bundleID = MRFirstString(scene, @[
-        @"applicationBundleIdentifier", @"bundleIdentifier", @"identifier"
-    ]);
+    NSString *bundleID = MRFirstString(scene, @[@"applicationBundleIdentifier", @"bundleIdentifier"]);
     if ([bundleID containsString:@"."]) return bundleID;
 
     id process = MRSafeValue(scene, @"clientProcess");
     bundleID = MRFirstString(process, @[
-        @"applicationBundleID", @"applicationBundleIdentifier",
-        @"bundleIdentifier", @"bundleID"
+        @"applicationBundleID", @"applicationBundleIdentifier", @"bundleIdentifier", @"bundleID"
     ]);
     if ([bundleID containsString:@"."]) return bundleID;
 
     id identity = MRSafeValue(process, @"identity");
-    bundleID = MRFirstString(identity, @[
-        @"embeddedApplicationIdentifier", @"applicationIdentifier",
-        @"bundleIdentifier"
+    return MRFirstString(identity, @[
+        @"embeddedApplicationIdentifier", @"applicationIdentifier", @"bundleIdentifier"
     ]);
-    return bundleID;
 }
 
-static NSString *MRCallerImage(void *address)
+static BOOL MRCallerIsMyrtle(void *address)
 {
 #if __has_include(<ptrauth.h>)
     address = ptrauth_strip(address, ptrauth_key_return_address);
 #endif
     Dl_info info;
     memset(&info, 0, sizeof(info));
-    if (address != NULL && dladdr(address, &info) != 0 && info.dli_fname != NULL) {
-        return [NSString stringWithUTF8String:info.dli_fname];
-    }
-    return @"<unknown>";
+    if (address == NULL || dladdr(address, &info) == 0 || info.dli_fname == NULL) return NO;
+    NSString *image = [NSString stringWithUTF8String:info.dli_fname];
+    return [image.lastPathComponent isEqualToString:@"Myrtle.dylib"];
 }
 
-static void MRLogMethodsForClass(Class cls)
+static BOOL MRIsOrdinaryApplicationIdentifier(NSString *bundleID)
 {
-    if (cls == Nil) return;
+    if (bundleID.length == 0 || ![bundleID containsString:@"."]) return NO;
+    static NSSet<NSString *> *excluded;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        excluded = [NSSet setWithArray:@[@"com.apple.springboard", @"com.apple.UIKit"]];
+    });
+    return ![excluded containsObject:bundleID];
+}
 
-    unsigned int count = 0;
-    Method *methods = class_copyMethodList(cls, &count);
-    MRLog(@"class=%s instanceMethodCount=%u", class_getName(cls), count);
-    for (unsigned int i = 0; i < count; i++) {
-        SEL selector = method_getName(methods[i]);
-        const char *types = method_getTypeEncoding(methods[i]);
-        MRLog(@"  -[%s %s] types=%s", class_getName(cls), sel_getName(selector), types ?: "<null>");
-    }
-    free(methods);
+static id MRSendClassNoArgs(Class cls, SEL selector)
+{
+    if (cls == Nil || ![cls respondsToSelector:selector]) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(cls, selector);
+}
 
-    Class meta = object_getClass(cls);
-    methods = class_copyMethodList(meta, &count);
-    MRLog(@"class=%s classMethodCount=%u", class_getName(cls), count);
-    for (unsigned int i = 0; i < count; i++) {
-        SEL selector = method_getName(methods[i]);
-        const char *types = method_getTypeEncoding(methods[i]);
-        MRLog(@"  +[%s %s] types=%s", class_getName(cls), sel_getName(selector), types ?: "<null>");
+static id MRSendObjectArg(id target, SEL selector, id argument)
+{
+    if (target == nil || ![target respondsToSelector:selector]) return nil;
+    return ((id (*)(id, SEL, id))objc_msgSend)(target, selector, argument);
+}
+
+static void MRAddApplicationToSwitcher(NSString *bundleID)
+{
+    if (!MRIsOrdinaryApplicationIdentifier(bundleID)) return;
+
+    id controller = MRSendClassNoArgs(NSClassFromString(@"SBApplicationController"),
+                                      NSSelectorFromString(@"sharedInstance"));
+    id application = MRSendObjectArg(controller,
+                                     NSSelectorFromString(@"applicationWithBundleIdentifier:"),
+                                     bundleID);
+    if (application == nil) return;
+
+    Class layoutClass = NSClassFromString(@"SBDisplayLayout");
+    SEL layoutSelector = NSSelectorFromString(@"fullScreenDisplayLayoutForApplication:");
+    if (layoutClass == Nil || ![layoutClass respondsToSelector:layoutSelector]) return;
+    id layout = ((id (*)(id, SEL, id))objc_msgSend)(layoutClass, layoutSelector, application);
+    if (layout == nil) return;
+
+    id model = MRSendClassNoArgs(NSClassFromString(@"SBAppSwitcherModel"),
+                                 NSSelectorFromString(@"sharedInstance"));
+    SEL addSelector = NSSelectorFromString(@"addToFront:");
+    if (model != nil && [model respondsToSelector:addSelector]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(model, addSelector, layout);
     }
-    free(methods);
 }
 
 static id (*MROriginalHostInit)(id, SEL, id, id) = NULL;
 
-static id MRHookHostInit(id self, SEL _cmd, id scene, id description)
+static id MRHookHostInit(id self, SEL selector, id scene, id description)
 {
     void *caller = __builtin_return_address(0);
-    id result = MROriginalHostInit != NULL
-        ? MROriginalHostInit(self, _cmd, scene, description)
-        : nil;
-
-    NSString *image = MRCallerImage(caller);
-    NSString *bundleID = MRBundleIdentifierForScene(scene) ?: @"<unknown>";
-    MRLog(@"SceneHost init class=%@ selector=%@ caller=%@ sceneClass=%@ bundleID=%@ description=%@",
-          NSStringFromClass([self class]), NSStringFromSelector(_cmd), image,
-          NSStringFromClass([scene class]), bundleID, description);
+    id result = MROriginalHostInit != NULL ? MROriginalHostInit(self, selector, scene, description) : nil;
+    if (result != nil && MRCallerIsMyrtle(caller)) {
+        NSString *bundleID = MRBundleIdentifierForScene(scene);
+        if (MRIsOrdinaryApplicationIdentifier(bundleID)) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                MRAddApplicationToSwitcher(bundleID);
+            });
+        }
+    }
     return result;
 }
 
 static BOOL MRInstallHostHook(void)
 {
-    NSArray<NSString *> *classNames = @[
-        @"FBSceneLayerHostContainerView",
-        @"FBSceneHostView"
-    ];
     SEL selector = NSSelectorFromString(@"initWithScene:debugDescription:");
-
-    for (NSString *className in classNames) {
+    for (NSString *className in @[@"FBSceneLayerHostContainerView", @"FBSceneHostView"]) {
         Class cls = NSClassFromString(className);
-        Method method = cls != Nil ? class_getInstanceMethod(cls, selector) : NULL;
-        if (method != NULL) {
+        if (cls != Nil && class_getInstanceMethod(cls, selector) != NULL) {
             MSHookMessageEx(cls, selector, (IMP)MRHookHostInit, (IMP *)&MROriginalHostInit);
-            MRLog(@"installed host hook on -[%@ %@]", className, NSStringFromSelector(selector));
             return YES;
         }
-        MRLog(@"host candidate unavailable: -[%@ %@]", className, NSStringFromSelector(selector));
     }
     return NO;
 }
 
-static void MRInventoryRuntime(void)
+static void MRInstallWhenReady(NSUInteger attempt)
 {
-    MRLog(@"===== runtime inventory begin =====");
-    MRLog(@"system=%@ process=%@ pid=%d", UIDevice.currentDevice.systemVersion,
-          NSProcessInfo.processInfo.processName, NSProcessInfo.processInfo.processIdentifier);
-
-    NSArray<NSString *> *importantClasses = @[
-        @"MyrtleHostManager", @"MyrtleHostCore", @"MyrtleHostWindowController",
-        @"MyrtleHostWindow", @"FBSceneLayerHostContainerView", @"FBSceneHostView",
-        @"SBAppSwitcherModel", @"SBAppLayout", @"SBDisplayLayout", @"SBDisplayItem",
-        @"SBMainSwitcherViewController", @"SBFluidSwitcherViewController"
-    ];
-    for (NSString *name in importantClasses) {
-        Class cls = NSClassFromString(name);
-        MRLog(@"lookup %@ => %@", name, cls != Nil ? @"present" : @"missing");
-        if (cls != Nil) MRLogMethodsForClass(cls);
-    }
-
-    int classCount = objc_getClassList(NULL, 0);
-    if (classCount > 0) {
-        Class *classes = (__unsafe_unretained Class *)calloc((size_t)classCount, sizeof(Class));
-        classCount = objc_getClassList(classes, classCount);
-        for (int i = 0; i < classCount; i++) {
-            const char *name = class_getName(classes[i]);
-            if (name != NULL && strncmp(name, "Myrtle", 6) == 0) {
-                MRLogMethodsForClass(classes[i]);
-            }
-        }
-        free(classes);
-    }
-    MRLog(@"===== runtime inventory end =====");
+    if (MRInstallHostHook() || attempt >= 30) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        MRInstallWhenReady(attempt + 1);
+    });
 }
 
 %ctor
 {
     @autoreleasepool {
-        MRLog(@"diagnostic tweak loaded; no App Switcher or Myrtle state will be modified");
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC),
-                       dispatch_get_main_queue(), ^{
-            MRInventoryRuntime();
-            if (!MRInstallHostHook()) {
-                MRLog(@"no supported Scene Host initializer was found");
-            }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            MRInstallWhenReady(0);
         });
     }
 }
+

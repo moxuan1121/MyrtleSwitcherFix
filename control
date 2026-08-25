@@ -1,10 +1,9 @@
 Package: com.local.myrtleswitcherfix
-Name: Myrtle Switcher Fix Diagnostics
-Version: 0.1.2
+Name: Myrtle Switcher Fix
+Version: 0.2.0
 Architecture: iphoneos-arm64e
-Description: Read-only diagnostics for Myrtle scene hosting and the iOS 15 App Switcher. RootHide arm64e build.
+Description: Adds Myrtle-hosted applications to the iOS 15 App Switcher. RootHide arm64e package with arm64 Mach-O.
 Maintainer: Local
 Author: Local
 Section: Tweaks
 Depends: mobilesubstrate, firmware (>= 15.0)
-Conflicts: com.local.myrtleswitcherfix.production

@@ -1,54 +1,32 @@
-# Myrtle Switcher Fix Diagnostics
+# Myrtle Switcher Fix
 
-这是针对以下环境的第一阶段只读诊断项目：
+为 Myrtle 1.4.1 补充 iOS 15 App Switcher 登记，目标环境：
 
 - iOS 15.6
-- iPhone 13 Pro Max / arm64e
+- iPhone 13 Pro Max
 - Dopamine RootHide
-- Myrtle 1.4.1
+- `iphoneos-arm64e` Debian 包
+- 包内 `arm64` Mach-O
 
-当前 `0.1.2` 版本只记录运行时信息，不添加或删除后台卡片，不终止应用，也不修改 Myrtle 状态。
+## 原理
 
-> 安全提示：请勿安装已经撤回的 `0.1.0`。该版本误将 tweak Mach-O 编译为 `arm64e`，在目标设备上会使 SpringBoard 在加载阶段崩溃并进入安全模式。其 Actions artifact 已删除。请只使用 `0.1.2` 或更高版本。
+Myrtle 会通过 `FBSceneLayerHostContainerView initWithScene:debugDescription:` 托管应用 Scene，但没有把目标应用布局加入 `SBAppSwitcherModel`。本插件只在该调用的返回地址确认为 `Myrtle.dylib` 时：
 
-## GitHub Actions 自动打包
+1. 从 Scene/client process 取得 Bundle ID；
+2. 取得对应 `SBApplication`；
+3. 创建正常的全屏 `SBDisplayLayout`；
+4. 调用 `SBAppSwitcherModel addToFront:`。
 
-仓库包含 `.github/workflows/build-roothide.yml`。每次推送到 `main` 会自动构建，也可以在 GitHub 的 Actions 页面手动运行 `Build RootHide arm64e package`。
+点击生成的卡片仍由 SpringBoard 按系统方式全屏打开应用。上滑卡片时由系统终止对应应用 Scene；Myrtle 自带的 Scene Layer 更新观察器会收到 Scene 失效。
 
-工作流在 GitHub 的 Linux 托管运行器上使用 RootHide 官方 Theos 安装脚本，并在上传构建产物前强制验证：
-
-- Debian 包架构必须是 `iphoneos-arm64e`；
-- 包内 Mach-O 必须是兼容 A12+ 的 `arm64`，不得误编译为 `arm64e` PAC ABI；
-- 成品必须只有一个 `.deb`；
-- 包内不得包含 `preinst`、`postinst`、`prerm` 或 `postrm`；
-- 必须保留 `mobilesubstrate`（ElleKit 兼容接口）依赖；
-- 同时生成 `SHA256SUMS.txt`。
-
-验证通过的 `.deb` 位于对应工作流运行页面的 Artifacts 区域，产物名称为 `MyrtleSwitcherFix-iOS15.6-RootHide-arm64e`。
-
-## 安全边界
-
-- 只注入 `com.apple.springboard`。
-- 不包含 `preinst`、`postinst`、`prerm` 或 `postrm` 维护脚本。
-- 安装和卸载均不会删除、覆盖、停用、重装或重启 ElleKit。
-- 包只依赖 ElleKit 提供兼容实现的 `mobilesubstrate` 接口；卸载本包不会卸载依赖包。
-- 不运行 `apt autoremove`，不修改任何软件源或包管理配置。
-- 日志是本包唯一创建的持久数据，SpringBoard 原生路径为：
-  `/var/mobile/Documents/MyrtleSwitcherFix.log`
-- 在 RootHide Filza/NewTerm 中查看的对应路径为：
-  `/rootfs/var/mobile/Documents/MyrtleSwitcherFix.log`
-- 为避免误删用户数据，卸载时故意不自动删除日志。确认不再需要后可手动删除这一个文件。
-
-## 使用 RootHide Theos 编译
-
-确保使用支持 RootHide scheme 的 Theos/toolchain，然后在项目目录运行：
+## 构建
 
 ```sh
-export THEOS=/path/to/theos
+export THEOS=/path/to/roothide-theos
 make clean package FINALPACKAGE=1
 ```
 
-项目已设置：
+关键配置：
 
 ```make
 ARCHS = arm64
@@ -57,26 +35,26 @@ THEOS_PACKAGE_SCHEME = roothide
 DEB_ARCH = iphoneos-arm64e
 ```
 
-这里的 `latest` 只选择构建机已安装的 SDK；最低部署版本仍固定为 iOS 15.0，因此兼容目标设备的 iOS 15.6。`iphoneos-arm64e` 是 RootHide Debian 包格式，包内 tweak Mach-O 使用 `arm64`，与 RootHide 官方工程的做法一致。安装或卸载后请手动执行一次用户熟悉且确认安全的 Respring；本包不会自行操作 ElleKit 服务。
+GitHub Actions 会自动验证：
 
-## 复现步骤
+- 外层包架构必须为 `iphoneos-arm64e`；
+- 包内 Mach-O 必须为 `arm64`，不得是 `arm64e`；
+- 不得存在 `preinst`、`postinst`、`prerm`、`postrm`；
+- 必须保留 `mobilesubstrate`/ElleKit 兼容依赖。
 
-1. 安装诊断包并手动 Respring。
-2. 确保待测 App 当前不在上滑后台菜单中。
-3. 使用 Myrtle 分屏打开该 App，操作几秒。
-4. 打开上滑后台菜单。
-5. 关闭 Myrtle 分屏窗口。
-6. 再选择一个原本已有后台卡片的 App，用 Myrtle 打开一次。
-7. 导出 `/rootfs/var/mobile/Documents/MyrtleSwitcherFix.log`。
+## 安装与卸载安全
 
-日志包含类名、方法签名、Scene Bundle ID 和调用映像，不会主动读取应用内容、账号、剪贴板或网络数据。发送前仍建议自行检查日志内容。
+- 只注入 `com.apple.springboard`；
+- 不包含安装或卸载维护脚本；
+- 不删除、覆盖、停止、更新或卸载 ElleKit；
+- 不调用 `apt autoremove`；
+- 安装或卸载后手动 Respring；
+- 卸载时只选择 `com.local.myrtleswitcherfix`，不要自动清理依赖。
 
-## 卸载
+## 版本说明
 
-在包管理器中只卸载：
+- `0.2.0`：正式 Hook 版，直接补充 App Switcher 卡片。
+- `0.1.2`：文件日志诊断版，已停止使用。
+- `0.1.1`：首次 arm64 诊断版，已停止使用。
+- `0.1.0`：错误的 arm64e Mach-O 构建，会导致 SpringBoard 安全模式；产物已撤回，禁止安装。
 
-```text
-Myrtle Switcher Fix Diagnostics
-```
-
-不要选择自动清理未使用依赖，也不需要重新安装或卸载 ElleKit。卸载完成后手动 Respring 即可。
