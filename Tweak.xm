@@ -225,7 +225,7 @@ static void MRInstallWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
-            MRLog(@"MyrtleSwitcherFix 0.3.0 loaded");
+            MRLog(@"MyrtleSwitcherFix 0.3.1 arm64e loaded");
             MRInstallSwitcherDeleteHook();
             MRInstallWhenReady(0);
         });

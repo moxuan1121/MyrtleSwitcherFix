@@ -6,7 +6,7 @@
 - iPhone 13 Pro Max
 - Dopamine RootHide
 - `iphoneos-arm64e` Debian 包
-- 包内 `arm64` Mach-O
+- 包内原生 `arm64e` Mach-O
 
 ## 原理
 
@@ -29,7 +29,7 @@ make clean package FINALPACKAGE=1
 关键配置：
 
 ```make
-ARCHS = arm64
+ARCHS = arm64e
 TARGET = iphone:clang:latest:15.0
 THEOS_PACKAGE_SCHEME = roothide
 DEB_ARCH = iphoneos-arm64e
@@ -38,7 +38,7 @@ DEB_ARCH = iphoneos-arm64e
 GitHub Actions 会自动验证：
 
 - 外层包架构必须为 `iphoneos-arm64e`；
-- 包内 Mach-O 必须为 `arm64`，不得是 `arm64e`；
+- 包内 Mach-O 必须为原生 `arm64e`，与 A15 SpringBoard 一致；
 - 不得存在 `preinst`、`postinst`、`prerm`、`postrm`；
 - 必须保留 `mobilesubstrate`/ElleKit 兼容依赖。
 
@@ -53,9 +53,10 @@ GitHub Actions 会自动验证：
 
 ## 版本说明
 
+- `0.3.1`：修正 0.3.0 内部误编译为纯 arm64、导致 A15 SpringBoard 不选择该 dylib 的问题；恢复原生 arm64e，同时保留安全的延迟 Hook 安装。
 - `0.3.0`：直接 Hook Myrtle 1.4.1 的 HostManager 生命周期，并联动后台卡片删除与 Myrtle 关闭入口。
 - `0.2.1`：枚举实际 Scene Host 类，不再依赖写死的类名或调用来源解析。
 - `0.2.0`：首次正式 Hook 版，因 Host 类名未命中而不生效。
 - `0.1.2`：文件日志诊断版，已停止使用。
 - `0.1.1`：首次 arm64 诊断版，已停止使用。
-- `0.1.0`：错误的 arm64e Mach-O 构建，会导致 SpringBoard 安全模式；产物已撤回，禁止安装。
+- `0.1.0`：旧初始化器传入了无效对象并在 `isEqualToString:` 崩溃；崩溃报告同时证明 arm64e dylib 已被 ElleKit 正常注入。产物已撤回，禁止安装。

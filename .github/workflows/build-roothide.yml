@@ -93,8 +93,8 @@ jobs:
           fi
           macho_info="$(file "$dylib")"
           echo "$macho_info"
-          if [[ "$macho_info" != *"arm64"* || "$macho_info" == *"arm64e"* ]]; then
-            echo "Unsafe Mach-O architecture; expected arm64 inside iphoneos-arm64e package" >&2
+          if [[ "$macho_info" != *"arm64e"* ]]; then
+            echo "Wrong Mach-O architecture; expected native arm64e for A15 SpringBoard" >&2
             exit 1
           fi
 

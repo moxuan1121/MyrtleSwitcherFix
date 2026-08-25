@@ -1,4 +1,4 @@
-ARCHS = arm64
+ARCHS = arm64e
 TARGET = iphone:clang:latest:15.0
 THEOS_PACKAGE_SCHEME = roothide
 DEB_ARCH = iphoneos-arm64e
@@ -14,5 +14,6 @@ MyrtleSwitcherFix_LIBRARIES = substrate
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
+# A15 SpringBoard is arm64e. A plain arm64 dylib is not selected by ElleKit here.
 # Intentionally no install/uninstall command that restarts or modifies ElleKit.
 # Respring manually after installation/removal.
