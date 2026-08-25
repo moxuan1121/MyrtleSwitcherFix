@@ -17,6 +17,8 @@
 3. 没有旧卡片时，从 Myrtle 正在托管的真实 Scene 取得 identifier，创建对应 `SBDisplayItem`，再通过 `addAppLayoutForDisplayItem:completion:` 写入正常最近任务模型；
 4. Hook 后台卡片删除入口，仅当卡片与 Myrtle 当前 Bundle ID 相同时调用 Myrtle 自己的关闭方法。
 
+Myrtle 自带的“全屏打开”会先复用窗口关闭流程，再调用 `launchApplicationWithIdentifier:suspended:`。插件额外 Hook 其明确入口 `-[MyrtleViewController MT_llIIIlIIlIlllIlIIIII]`，因此能区分“关闭 B 返回 A”和“全屏进入 B”：前者立即前置 A，后者保持 B 位于后台第一张。
+
 点击生成的卡片仍由 SpringBoard 按系统方式全屏打开应用。诊断日志会写入 `/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.log`，不依赖系统日志流。
 
 ## 构建
@@ -55,6 +57,7 @@ GitHub Actions 会自动验证：
 
 ## 版本说明
 
+- `0.4.1`：识别 Myrtle 自带的全屏启动入口，避免全屏进入 B 时被普通关闭逻辑误判为返回 A；全屏转换会立即保持 B 的后台最近顺序，并让过期的 A 前置任务失效。
 - `0.4.0`：包标识符改为 `com.moxuan.myrtleswitcherfix`，日志文件同步使用新标识符；声明替换旧包 `com.local.myrtleswitcherfix`，避免迁移时两个插件同时注入 SpringBoard。
 - `0.3.9`：为后台排序重试增加批次代号和 10 秒硬截止，已有卡片与新建卡片统一清理待排序状态；新的 Myrtle 状态变化会取消旧的“返回主应用”延迟任务；诊断日志达到 1 MiB 后自动重置，避免长期无限增长。
 - `0.3.8`：打开分屏应用时记录其下方的主应用；Myrtle 关闭分屏并清空 Bundle ID 时，立即将主应用已有卡片前置，使关闭 B 返回 A 后无需等待系统延迟即可得到 `[A, B, ...]`。
