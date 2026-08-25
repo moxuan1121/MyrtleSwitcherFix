@@ -98,7 +98,8 @@ static NSString *MRCallerImage(void *address)
 #if __has_include(<ptrauth.h>)
     address = ptrauth_strip(address, ptrauth_key_return_address);
 #endif
-    Dl_info info = {0};
+    Dl_info info;
+    memset(&info, 0, sizeof(info));
     if (address != NULL && dladdr(address, &info) != 0 && info.dli_fname != NULL) {
         return [NSString stringWithUTF8String:info.dli_fname];
     }
