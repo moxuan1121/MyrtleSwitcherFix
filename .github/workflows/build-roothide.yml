@@ -43,13 +43,24 @@ jobs:
         run: |
           brew install make xz ldid dpkg
 
-      - name: Install RootHide Theos
+      - name: Checkout RootHide Theos
+        uses: actions/checkout@v4
+        with:
+          repository: roothide/theos
+          ref: master
+          submodules: recursive
+          path: theos
+
+      - name: Checkout iOS SDK
+        uses: actions/checkout@v4
+        with:
+          repository: theos/sdks
+          sparse-checkout: iPhoneOS16.5.sdk
+          path: theos/sdks
+
+      - name: Configure Theos
         shell: bash
-        run: |
-          set -euo pipefail
-          export THEOS="$RUNNER_TEMP/theos"
-          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
-          bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)"
+        run: echo "THEOS=$GITHUB_WORKSPACE/theos" >> "$GITHUB_ENV"
 
       - name: Build diagnostic package
         shell: bash
