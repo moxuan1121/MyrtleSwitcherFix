@@ -80,6 +80,11 @@ jobs:
           fi
 
           package="${packages[0]}"
+          package_id="$(dpkg-deb -f "$package" Package)"
+          if [[ "$package_id" != "com.moxuan.myrtleswitcherfix" ]]; then
+            echo "Unexpected package identifier: $package_id" >&2
+            exit 1
+          fi
           architecture="$(dpkg-deb -f "$package" Architecture)"
           if [[ "$architecture" != "iphoneos-arm64e" ]]; then
             echo "Unsafe package architecture: $architecture" >&2
@@ -128,6 +133,11 @@ jobs:
 
           if ! dpkg-deb -f "$package" Depends | grep -q 'mobilesubstrate'; then
             echo "Missing MobileSubstrate/ElleKit compatibility dependency" >&2
+            exit 1
+          fi
+          if [[ "$(dpkg-deb -f "$package" Conflicts)" != *"com.local.myrtleswitcherfix"* ]] ||
+             [[ "$(dpkg-deb -f "$package" Replaces)" != *"com.local.myrtleswitcherfix"* ]]; then
+            echo "Missing safe migration metadata for the old package identifier" >&2
             exit 1
           fi
 

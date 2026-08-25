@@ -5,7 +5,7 @@
 #import <stdarg.h>
 #import <substrate.h>
 
-static NSString *const MRLogPath = @"/var/mobile/Library/Preferences/com.local.myrtleswitcherfix.log";
+static NSString *const MRLogPath = @"/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.log";
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
 static const unsigned long long MRMaximumLogSize = 1024 * 1024;
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
@@ -644,7 +644,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
-            MRLog(@"MyrtleSwitcherFix 0.3.9 bounded reconciliation loaded");
+            MRLog(@"MyrtleSwitcherFix 0.4.0 package identifier migration loaded");
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
             MRInstallUserDeletionHook();

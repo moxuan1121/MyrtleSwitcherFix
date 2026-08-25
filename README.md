@@ -17,7 +17,7 @@
 3. 没有旧卡片时，从 Myrtle 正在托管的真实 Scene 取得 identifier，创建对应 `SBDisplayItem`，再通过 `addAppLayoutForDisplayItem:completion:` 写入正常最近任务模型；
 4. Hook 后台卡片删除入口，仅当卡片与 Myrtle 当前 Bundle ID 相同时调用 Myrtle 自己的关闭方法。
 
-点击生成的卡片仍由 SpringBoard 按系统方式全屏打开应用。诊断日志会写入 `/var/mobile/Library/Preferences/com.local.myrtleswitcherfix.log`，不依赖系统日志流。
+点击生成的卡片仍由 SpringBoard 按系统方式全屏打开应用。诊断日志会写入 `/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.log`，不依赖系统日志流。
 
 ## 构建
 
@@ -37,6 +37,7 @@ DEB_ARCH = iphoneos-arm64e
 
 GitHub Actions 会自动验证：
 
+- 包标识符必须为 `com.moxuan.myrtleswitcherfix`，并包含旧标识符的安全迁移声明；
 - 外层包架构必须为 `iphoneos-arm64e`；
 - 包内 Mach-O 必须为原生 `arm64e`，与 A15 SpringBoard 一致；
 - Mach-O 的原始 CPU subtype 必须为 `0x80000002`（Apple 新 arm64e ABI），发现 Linux 旧 ABI `0x00000002` 时立即拒绝产物；
@@ -50,10 +51,11 @@ GitHub Actions 会自动验证：
 - 不删除、覆盖、停止、更新或卸载 ElleKit；
 - 不调用 `apt autoremove`；
 - 安装或卸载后手动 Respring；
-- 卸载时只选择 `com.local.myrtleswitcherfix`，不要自动清理依赖。
+- 卸载时只选择 `com.moxuan.myrtleswitcherfix`，不要自动清理依赖；新包通过 Debian 的 `Conflicts`/`Replaces` 正常替换旧标识符 `com.local.myrtleswitcherfix`，不会处理 ElleKit。
 
 ## 版本说明
 
+- `0.4.0`：包标识符改为 `com.moxuan.myrtleswitcherfix`，日志文件同步使用新标识符；声明替换旧包 `com.local.myrtleswitcherfix`，避免迁移时两个插件同时注入 SpringBoard。
 - `0.3.9`：为后台排序重试增加批次代号和 10 秒硬截止，已有卡片与新建卡片统一清理待排序状态；新的 Myrtle 状态变化会取消旧的“返回主应用”延迟任务；诊断日志达到 1 MiB 后自动重置，避免长期无限增长。
 - `0.3.8`：打开分屏应用时记录其下方的主应用；Myrtle 关闭分屏并清空 Bundle ID 时，立即将主应用已有卡片前置，使关闭 B 返回 A 后无需等待系统延迟即可得到 `[A, B, ...]`。
 - `0.3.7`：删除会生成临时、幽灵及重复卡片的 `_insertCardForDisplayIdentifier:` 测试入口；改用 Myrtle 实际 Scene identifier 创建 `SBDisplayItem`，再调用生产接口 `addAppLayoutForDisplayItem:completion:`。待排序状态改为有序队列，并 Hook 用户直接删除卡片的回调。
