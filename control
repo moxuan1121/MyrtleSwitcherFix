@@ -1,8 +1,8 @@
 Package: com.local.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.3.6
+Version: 0.3.7
 Architecture: iphoneos-arm64e
-Description: Synchronizes Myrtle 1.4.1 cards with the iOS 15 switcher and reconciles asynchronous ordering.
+Description: Adds Myrtle 1.4.1 scenes to the iOS 15 switcher through production display-item APIs.
 Maintainer: Local
 Author: Local
 Section: Tweaks

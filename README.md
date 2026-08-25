@@ -14,7 +14,7 @@
 
 1. Hook `-[MyrtleHostManager setCurrentBundleID:]`，取得 Myrtle 已确认的目标 Bundle ID；
 2. 从 iOS 15 的 `SBMainSwitcherViewController.recentAppLayouts` 查找现有 `SBAppLayout`，并通过 `_addAppLayoutToFront:` 移到最前；
-3. 没有旧卡片时，通过系统自己的 `_insertCardForDisplayIdentifier:atIndex:` 按 Bundle ID 在索引 0 创建卡片；
+3. 没有旧卡片时，从 Myrtle 正在托管的真实 Scene 取得 identifier，创建对应 `SBDisplayItem`，再通过 `addAppLayoutForDisplayItem:completion:` 写入正常最近任务模型；
 4. Hook 后台卡片删除入口，仅当卡片与 Myrtle 当前 Bundle ID 相同时调用 Myrtle 自己的关闭方法。
 
 点击生成的卡片仍由 SpringBoard 按系统方式全屏打开应用。诊断日志会写入 `/var/mobile/Library/Preferences/com.local.myrtleswitcherfix.log`，不依赖系统日志流。
@@ -54,6 +54,7 @@ GitHub Actions 会自动验证：
 
 ## 版本说明
 
+- `0.3.7`：删除会生成临时、幽灵及重复卡片的 `_insertCardForDisplayIdentifier:` 测试入口；改用 Myrtle 实际 Scene identifier 创建 `SBDisplayItem`，再调用生产接口 `addAppLayoutForDisplayItem:completion:`。待排序状态改为有序队列，并 Hook 用户直接删除卡片的回调。
 - `0.3.6`：确认无卡片插入会异步落入模型后，记录最新 Myrtle Bundle ID，并在模型变化、后台界面出现及定时重试时调用已验证有效的 `_addAppLayoutToFront:`，保证最终索引为 0。
 - `0.3.5`：按 iOS 15.5/15.6 的真实类结构改用 `SBMainSwitcherViewController` 单例；严格分离已有卡片前置与无卡片插入，并在调用后验证真实索引。删除卡片 Hook 也迁移到该类。
 - `0.3.4`：尝试 Hook `-[SBAppSwitcherModel init]`；真机日志证明模型并不经过这个入口，因此未能获得实例。

@@ -7,7 +7,7 @@
 
 static NSString *const MRLogPath = @"/var/mobile/Library/Preferences/com.local.myrtleswitcherfix.log";
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
-static __strong NSString *MRPendingFrontBundleID = nil;
+static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
 static BOOL MRReconcilingFront = NO;
 
 static void MRLog(NSString *format, ...)
@@ -123,13 +123,30 @@ static void MRLogSwitcherCapabilities(id switcher)
 {
     Class cls = [switcher class];
     NSArray *layouts = MRRecentAppLayouts(switcher);
-    MRLog(@"switcher=%@ class=%@ layouts=%lu recent=%d promote=%d insert=%d remove=%d changed=%d",
+    MRLog(@"switcher=%@ class=%@ layouts=%lu recent=%d promote=%d addDisplay=%d remove=%d changed=%d",
           switcher, NSStringFromClass(cls), (unsigned long)layouts.count,
           MRHasInstanceMethod(cls, @"recentAppLayouts", 2),
           MRHasInstanceMethod(cls, @"_addAppLayoutToFront:", 3),
-          MRHasInstanceMethod(cls, @"_insertCardForDisplayIdentifier:atIndex:", 4),
+          MRHasInstanceMethod(cls, @"addAppLayoutForDisplayItem:completion:", 4),
           MRHasInstanceMethod(cls, @"_removeAppLayout:forReason:", 4),
           MRHasInstanceMethod(cls, @"_switcherModelChanged:", 3));
+}
+
+static void MREnqueueDesiredFront(NSString *bundleID)
+{
+    if (bundleID.length == 0) return;
+    if (MRDesiredFrontOrder == nil) MRDesiredFrontOrder = [NSMutableArray array];
+    [MRDesiredFrontOrder removeObject:bundleID];
+    [MRDesiredFrontOrder addObject:bundleID];
+    while (MRDesiredFrontOrder.count > 32) [MRDesiredFrontOrder removeObjectAtIndex:0];
+    MRLog(@"desired front order oldest-to-newest=%@", MRDesiredFrontOrder);
+}
+
+static void MRRemoveDesiredFront(NSString *bundleID)
+{
+    if (bundleID.length == 0) return;
+    [MRDesiredFrontOrder removeObject:bundleID];
+    MRLog(@"removed %@ from desired order remaining=%@", bundleID, MRDesiredFrontOrder);
 }
 
 static void MRVerifySwitcherResult(NSString *bundleID, NSString *action)
@@ -147,43 +164,129 @@ static void MRVerifySwitcherResult(NSString *bundleID, NSString *action)
 
 static void MRReconcilePendingFront(NSString *trigger)
 {
-    if (MRReconcilingFront || MRPendingFrontBundleID.length == 0) return;
-    NSString *bundleID = [MRPendingFrontBundleID copy];
+    if (MRReconcilingFront || MRDesiredFrontOrder.count == 0) return;
+    NSArray<NSString *> *desired = [MRDesiredFrontOrder copy];
     id switcher = MRMainSwitcher();
     NSArray *layouts = MRRecentAppLayouts(switcher);
-    NSUInteger index = NSNotFound;
-    id layout = MRLayoutForBundleIdentifier(layouts, bundleID, &index);
-    if (layout == nil) {
-        MRLog(@"reconcile %@ trigger=%@ pending-not-materialized count=%lu",
-              bundleID, trigger, (unsigned long)layouts.count);
-        return;
+    NSMutableArray<NSString *> *resolvedIDs = [NSMutableArray array];
+    NSMutableArray *resolvedLayouts = [NSMutableArray array];
+    for (NSString *bundleID in desired) {
+        id layout = MRLayoutForBundleIdentifier(layouts, bundleID, NULL);
+        if (layout != nil) {
+            [resolvedIDs addObject:bundleID];
+            [resolvedLayouts addObject:layout];
+        }
     }
 
-    if (index != 0) {
-        SEL selector = NSSelectorFromString(@"_addAppLayoutToFront:");
-        if (![switcher respondsToSelector:selector]) {
-            MRLog(@"reconcile %@ trigger=%@ promote-unavailable index=%lu",
-                  bundleID, trigger, (unsigned long)index);
-            return;
+    BOOL stable = resolvedIDs.count == desired.count;
+    NSArray<NSString *> *expectedFront = [[resolvedIDs reverseObjectEnumerator] allObjects];
+    if (stable && layouts.count >= expectedFront.count) {
+        for (NSUInteger index = 0; index < expectedFront.count; index++) {
+            if (!MRLayoutContainsBundleIdentifier(layouts[index], expectedFront[index])) {
+                stable = NO;
+                break;
+            }
         }
+    } else {
+        stable = NO;
+    }
+
+    if (!stable && resolvedLayouts.count != 0) {
+        SEL selector = NSSelectorFromString(@"_addAppLayoutToFront:");
+        if (![switcher respondsToSelector:selector]) return;
         MRReconcilingFront = YES;
-        ((void (*)(id, SEL, id))objc_msgSend)(switcher, selector, layout);
+        for (NSUInteger index = 0; index < resolvedLayouts.count; index++) {
+            ((void (*)(id, SEL, id))objc_msgSend)(switcher, selector, resolvedLayouts[index]);
+            MRLog(@"reconcile promoted %@ trigger=%@", resolvedIDs[index], trigger);
+        }
         MRReconcilingFront = NO;
-        MRLog(@"reconcile promoted %@ trigger=%@ oldIndex=%lu",
-              bundleID, trigger, (unsigned long)index);
     }
 
     NSArray *updatedLayouts = MRRecentAppLayouts(switcher);
-    NSUInteger updatedIndex = NSNotFound;
-    id updatedLayout = MRLayoutForBundleIdentifier(updatedLayouts, bundleID, &updatedIndex);
-    MRLog(@"reconcile verify %@ trigger=%@ found=%d index=%@ count=%lu",
-          bundleID, trigger, updatedLayout != nil,
-          updatedIndex == NSNotFound ? @"NSNotFound" : [NSString stringWithFormat:@"%lu", (unsigned long)updatedIndex],
-          (unsigned long)updatedLayouts.count);
-    if (updatedLayout != nil && updatedIndex == 0 &&
-        [MRPendingFrontBundleID isEqualToString:bundleID]) {
-        MRPendingFrontBundleID = nil;
+    NSMutableArray<NSString *> *actualFront = [NSMutableArray array];
+    for (NSUInteger index = 0; index < MIN(updatedLayouts.count, expectedFront.count); index++) {
+        NSString *bundleID = MRBundleIdentifierFromLayout(updatedLayouts[index]);
+        [actualFront addObject:bundleID ?: @"(unknown)"];
     }
+    BOOL allMaterialized = resolvedIDs.count == desired.count;
+    BOOL verified = allMaterialized && actualFront.count == expectedFront.count;
+    if (verified) {
+        for (NSUInteger index = 0; index < expectedFront.count; index++) {
+            if (!MRLayoutContainsBundleIdentifier(updatedLayouts[index], expectedFront[index])) {
+                verified = NO;
+                break;
+            }
+        }
+    }
+    MRLog(@"reconcile trigger=%@ desired=%@ resolved=%@ expectedFront=%@ actualFront=%@ all=%d verified=%d count=%lu",
+          trigger, desired, resolvedIDs, expectedFront, actualFront,
+          allMaterialized, verified, (unsigned long)updatedLayouts.count);
+    if (verified && [trigger hasPrefix:@"timer-6"] &&
+        [MRDesiredFrontOrder isEqualToArray:desired]) {
+        [MRDesiredFrontOrder removeAllObjects];
+        MRLog(@"cleared verified desired order");
+    }
+}
+
+static id MRMyrtleSceneForApplication(id application)
+{
+    Class cls = NSClassFromString(@"MyrtleHostCore");
+    SEL selector = NSSelectorFromString(@"MT_IllllIIlllIllIllllIl:");
+    Method method = class_getClassMethod(cls, selector);
+    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 3) return nil;
+    @try { return ((id (*)(id, SEL, id))objc_msgSend)(cls, selector, application); }
+    @catch (NSException *exception) {
+        MRLog(@"Myrtle scene lookup exception for %@: %@", application, exception);
+        return nil;
+    }
+}
+
+static NSString *MRSceneIdentifier(id application, id *sceneOut)
+{
+    id scene = MRMyrtleSceneForApplication(application);
+    if (sceneOut != NULL) *sceneOut = scene;
+    id identifier = MRSafeValue(scene, @"identifier");
+    if (![identifier isKindOfClass:NSString.class] || [identifier length] == 0)
+        identifier = MRSafeValue(application, @"_baseSceneIdentifier");
+    return [identifier isKindOfClass:NSString.class] ? identifier : nil;
+}
+
+static BOOL MRAddProductionDisplayItem(id switcher, id application, NSString *bundleID)
+{
+    id scene = nil;
+    NSString *sceneIdentifier = MRSceneIdentifier(application, &scene);
+    if (sceneIdentifier.length == 0) {
+        MRLog(@"refusing production add %@ because no real scene identifier was found; scene=%@",
+              bundleID, scene);
+        return NO;
+    }
+    Class displayItemClass = NSClassFromString(@"SBDisplayItem");
+    SEL factory = NSSelectorFromString(@"applicationDisplayItemWithBundleIdentifier:sceneIdentifier:");
+    Method factoryMethod = class_getClassMethod(displayItemClass, factory);
+    if (displayItemClass == Nil || factoryMethod == NULL ||
+        method_getNumberOfArguments(factoryMethod) != 4) {
+        MRLog(@"cannot create production display item for %@: factory unavailable", bundleID);
+        return NO;
+    }
+    id displayItem = ((id (*)(id, SEL, id, id))objc_msgSend)(displayItemClass, factory,
+                                                             bundleID, sceneIdentifier);
+    SEL addSelector = NSSelectorFromString(@"addAppLayoutForDisplayItem:completion:");
+    if (displayItem == nil || ![switcher respondsToSelector:addSelector] ||
+        !MRHasInstanceMethod([switcher class], @"addAppLayoutForDisplayItem:completion:", 4)) {
+        MRLog(@"cannot add production display item %@: scene=%@ sceneID=%@ item=%@",
+              bundleID, scene, sceneIdentifier, displayItem);
+        return NO;
+    }
+
+    dispatch_block_t completion = ^{
+        MRLog(@"production add completion %@ sceneID=%@", bundleID, sceneIdentifier);
+        dispatch_async(dispatch_get_main_queue(), ^{ MRReconcilePendingFront(@"add-completion"); });
+    };
+    ((void (*)(id, SEL, id, id))objc_msgSend)(switcher, addSelector, displayItem, completion);
+    MRLog(@"sent production add %@ sceneClass=%@ sceneID=%@ item=%@",
+          bundleID, scene == nil ? @"(null)" : NSStringFromClass([scene class]),
+          sceneIdentifier, displayItem);
+    return YES;
 }
 
 static void MRPromoteOrInsertSwitcherCard(NSString *bundleID)
@@ -209,9 +312,9 @@ static void MRPromoteOrInsertSwitcherCard(NSString *bundleID)
     NSUInteger oldIndex = NSNotFound;
     id existing = MRLayoutForBundleIdentifier(layouts, bundleID, &oldIndex);
     NSString *action = nil;
+    MREnqueueDesiredFront(bundleID);
 
     if (existing != nil) {
-        MRPendingFrontBundleID = nil;
         SEL promoteSelector = NSSelectorFromString(@"_addAppLayoutToFront:");
         if (![switcher respondsToSelector:promoteSelector] ||
             !MRHasInstanceMethod([switcher class], @"_addAppLayoutToFront:", 3)) {
@@ -223,16 +326,11 @@ static void MRPromoteOrInsertSwitcherCard(NSString *bundleID)
         MRLog(@"sent promote %@ oldIndex=%lu layoutClass=%@", bundleID,
               (unsigned long)oldIndex, NSStringFromClass([existing class]));
     } else {
-        SEL insertSelector = NSSelectorFromString(@"_insertCardForDisplayIdentifier:atIndex:");
-        if (![switcher respondsToSelector:insertSelector] ||
-            !MRHasInstanceMethod([switcher class], @"_insertCardForDisplayIdentifier:atIndex:", 4)) {
-            MRLog(@"cannot insert %@: _insertCardForDisplayIdentifier:atIndex: unavailable", bundleID);
+        if (!MRAddProductionDisplayItem(switcher, application, bundleID)) {
+            MRRemoveDesiredFront(bundleID);
             return;
         }
-        MRPendingFrontBundleID = [bundleID copy];
-        ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(switcher, insertSelector, bundleID, 0);
-        action = @"insert-absent";
-        MRLog(@"sent insert %@ atIndex=0", bundleID);
+        action = @"add-production-display-item";
     }
 
     if ([action isEqualToString:@"promote-existing"]) {
@@ -295,26 +393,43 @@ static MRModelChangedIMP MROriginalModelChanged = NULL;
 typedef void (*MRViewWillAppearIMP)(id, SEL, BOOL);
 static MRViewWillAppearIMP MROriginalViewWillAppear = NULL;
 
+typedef void (*MRDeletedDisplayItemIMP)(id, SEL, id, id, id, long long);
+static MRDeletedDisplayItemIMP MROriginalDeletedDisplayItem = NULL;
+
 static void MRHookRemoveLayout(id self, SEL selector, id layout, long long reason)
 {
     NSString *bundleID = [MRBundleIdentifierFromLayout(layout) copy];
     MRLog(@"switcher removing %@ reason=%lld layoutClass=%@", bundleID, reason,
           layout == nil ? @"(null)" : NSStringFromClass([layout class]));
     MROriginalRemoveLayout(self, selector, layout, reason);
+    MRRemoveDesiredFront(bundleID);
+    MRCloseMyrtleWindowForBundleID(bundleID);
+}
+
+static void MRHookDeletedDisplayItem(id self, SEL selector, id controller,
+                                     id displayItem, id layout, long long reason)
+{
+    NSString *bundleID = [MRDirectBundleIdentifier(displayItem) copy];
+    if (bundleID.length == 0) bundleID = [MRBundleIdentifierFromLayout(layout) copy];
+    MRLog(@"user deleted display item %@ reason=%lld item=%@ layoutClass=%@",
+          bundleID, reason, displayItem,
+          layout == nil ? @"(null)" : NSStringFromClass([layout class]));
+    MROriginalDeletedDisplayItem(self, selector, controller, displayItem, layout, reason);
+    MRRemoveDesiredFront(bundleID);
     MRCloseMyrtleWindowForBundleID(bundleID);
 }
 
 static void MRHookModelChanged(id self, SEL selector, id model)
 {
     MROriginalModelChanged(self, selector, model);
-    if (MRPendingFrontBundleID.length != 0 && !MRReconcilingFront)
+    if (MRDesiredFrontOrder.count != 0 && !MRReconcilingFront)
         dispatch_async(dispatch_get_main_queue(), ^{ MRReconcilePendingFront(@"model-changed"); });
 }
 
 static void MRHookViewWillAppear(id self, SEL selector, BOOL animated)
 {
     MROriginalViewWillAppear(self, selector, animated);
-    if (MRPendingFrontBundleID.length != 0)
+    if (MRDesiredFrontOrder.count != 0)
         dispatch_async(dispatch_get_main_queue(), ^{ MRReconcilePendingFront(@"view-will-appear"); });
 }
 
@@ -368,6 +483,20 @@ static void MRInstallSwitcherReconciliationHooks(void)
     }
 }
 
+static void MRInstallUserDeletionHook(void)
+{
+    Class cls = NSClassFromString(@"SBMainSwitcherViewController");
+    SEL selector = NSSelectorFromString(@"switcherContentController:deletedDisplayItem:inAppLayout:forReason:");
+    Method method = class_getInstanceMethod(cls, selector);
+    if (cls != Nil && method != NULL && method_getNumberOfArguments(method) == 6) {
+        MSHookMessageEx(cls, selector, (IMP)MRHookDeletedDisplayItem,
+                        (IMP *)&MROriginalDeletedDisplayItem);
+        MRLog(@"installed direct user-card deletion hook");
+    } else {
+        MRLog(@"direct user-card deletion method unavailable");
+    }
+}
+
 static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     if (MRInstallMyrtleHook()) return;
@@ -383,9 +512,10 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
-            MRLog(@"MyrtleSwitcherFix 0.3.6 async front reconciliation loaded");
+            MRLog(@"MyrtleSwitcherFix 0.3.7 production display-item path loaded");
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
+            MRInstallUserDeletionHook();
             id existingSwitcher = MRSendClassNoArgs(@"SBMainSwitcherViewController", @"sharedInstanceIfExists");
             if (existingSwitcher != nil) MRLogSwitcherCapabilities(existingSwitcher);
             MRInstallMyrtleWhenReady(0);
