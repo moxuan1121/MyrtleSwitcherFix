@@ -205,8 +205,6 @@ static void MRInventoryRuntime(void)
 %ctor
 {
     @autoreleasepool {
-        if (![NSProcessInfo.processInfo.processName isEqualToString:@"SpringBoard"]) return;
-
         MRLog(@"diagnostic tweak loaded; no App Switcher or Myrtle state will be modified");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC),
                        dispatch_get_main_queue(), ^{

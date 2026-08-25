@@ -83,6 +83,21 @@ jobs:
             fi
           done
 
+          payload="$RUNNER_TEMP/debian-payload"
+          mkdir -p "$payload"
+          dpkg-deb -x "$package" "$payload"
+          dylib="$payload/Library/MobileSubstrate/DynamicLibraries/MyrtleSwitcherFix.dylib"
+          if [[ ! -f "$dylib" ]]; then
+            echo "Expected tweak dylib is missing" >&2
+            exit 1
+          fi
+          macho_info="$(file "$dylib")"
+          echo "$macho_info"
+          if [[ "$macho_info" != *"arm64"* || "$macho_info" == *"arm64e"* ]]; then
+            echo "Unsafe Mach-O architecture; expected arm64 inside iphoneos-arm64e package" >&2
+            exit 1
+          fi
+
           if ! dpkg-deb -f "$package" Depends | grep -q 'mobilesubstrate'; then
             echo "Missing MobileSubstrate/ElleKit compatibility dependency" >&2
             exit 1

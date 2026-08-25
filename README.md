@@ -7,7 +7,9 @@
 - Dopamine RootHide
 - Myrtle 1.4.1
 
-当前 `0.1.0` 版本只记录运行时信息，不添加或删除后台卡片，不终止应用，也不修改 Myrtle 状态。
+当前 `0.1.1` 版本只记录运行时信息，不添加或删除后台卡片，不终止应用，也不修改 Myrtle 状态。
+
+> 安全提示：请勿安装已经撤回的 `0.1.0`。该版本误将 tweak Mach-O 编译为 `arm64e`，在目标设备上会使 SpringBoard 在加载阶段崩溃并进入安全模式。其 Actions artifact 已删除。请只使用 `0.1.1` 或更高版本。
 
 ## GitHub Actions 自动打包
 
@@ -16,6 +18,7 @@
 工作流在 GitHub 的 Linux 托管运行器上使用 RootHide 官方 Theos 安装脚本，并在上传构建产物前强制验证：
 
 - Debian 包架构必须是 `iphoneos-arm64e`；
+- 包内 Mach-O 必须是兼容 A12+ 的 `arm64`，不得误编译为 `arm64e` PAC ABI；
 - 成品必须只有一个 `.deb`；
 - 包内不得包含 `preinst`、`postinst`、`prerm` 或 `postrm`；
 - 必须保留 `mobilesubstrate`（ElleKit 兼容接口）依赖；
@@ -46,12 +49,13 @@ make clean package FINALPACKAGE=1
 项目已设置：
 
 ```make
-ARCHS = arm64e
+ARCHS = arm64
 TARGET = iphone:clang:latest:15.0
 THEOS_PACKAGE_SCHEME = roothide
+DEB_ARCH = iphoneos-arm64e
 ```
 
-这里的 `latest` 只选择构建机已安装的 SDK；最低部署版本仍固定为 iOS 15.0，因此兼容目标设备的 iOS 15.6。生成的包应为 `iphoneos-arm64e` 架构。安装或卸载后请手动执行一次用户熟悉且确认安全的 Respring；本包不会自行操作 ElleKit 服务。
+这里的 `latest` 只选择构建机已安装的 SDK；最低部署版本仍固定为 iOS 15.0，因此兼容目标设备的 iOS 15.6。`iphoneos-arm64e` 是 RootHide Debian 包格式，包内 tweak Mach-O 使用 `arm64`，与 RootHide 官方工程的做法一致。安装或卸载后请手动执行一次用户熟悉且确认安全的 Respring；本包不会自行操作 ElleKit 服务。
 
 ## 复现步骤
 
