@@ -682,6 +682,23 @@ static void MRHookDeletedDisplayItem(id self, SEL selector, id controller,
 static void MRHookModelChanged(id self, SEL selector, id model)
 {
     MROriginalModelChanged(self, selector, model);
+    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+    NSString *myrtleBundleID = [MRSafeValue(manager, @"currentBundleID") copy];
+    if (myrtleBundleID.length != 0) {
+        NSString *systemCurrentBundleID = [MRCurrentMainApplicationBundleID() copy];
+        MRLog(@"model changed while Myrtle hosts=%@ systemCurrent=%@ underlyingMain=%@",
+              myrtleBundleID, systemCurrentBundleID, MRUnderlyingMainBundleID);
+        if ([systemCurrentBundleID isEqualToString:myrtleBundleID] &&
+            ![MRUnderlyingMainBundleID isEqualToString:myrtleBundleID]) {
+            // Myrtle's fullscreen action may activate the already-hosted scene
+            // without using either of its explicit launch helpers. SpringBoard
+            // publishes the new current app layout before Myrtle clears its
+            // currentBundleID, which is a reliable distinction from a normal
+            // close back to the underlying app.
+            MRRecordMyrtleFullscreenIntent(myrtleBundleID,
+                                           @"switcher-current-layout");
+        }
+    }
     if (MRDesiredFrontOrder.count != 0 && !MRReconcilingFront)
         dispatch_async(dispatch_get_main_queue(), ^{ MRReconcilePendingFront(@"model-changed"); });
 }
@@ -803,7 +820,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
-            MRLog(@"MyrtleSwitcherFix 0.4.2 HostCore fullscreen launch loaded");
+            MRLog(@"MyrtleSwitcherFix 0.4.3 switcher-current fullscreen detection loaded");
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
             MRInstallUserDeletionHook();

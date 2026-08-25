@@ -57,6 +57,7 @@ GitHub Actions 会自动验证：
 
 ## 版本说明
 
+- `0.4.3`：根据 0.4.2 真机日志确认部分全屏动作不调用 Myrtle 的两个显式启动帮助方法，而是在清空 Bundle ID 前由 SpringBoard 连续发布模型变化；在模型回调中比对系统 `_currentAppLayout` 与 Myrtle 当前 Bundle ID，系统已切换到 B 时直接标记全屏转换，消除无旧卡片应用等待系统最终登记后才回到首位的延迟。
 - `0.4.2`：根据 0.4.1 真机日志确认 ViewController 全屏入口虽成功 Hook 但测试按钮未经过它；新增实际命中的 MyrtleHostCore 启动入口，并加入 0.75 秒最近关闭关联和 0.08 秒普通关闭判别窗口，覆盖 Myrtle 在启动调用前后清空 Bundle ID 的两种顺序。
 - `0.4.1`：识别 Myrtle 自带的全屏启动入口，避免全屏进入 B 时被普通关闭逻辑误判为返回 A；全屏转换会立即保持 B 的后台最近顺序，并让过期的 A 前置任务失效。
 - `0.4.0`：包标识符改为 `com.moxuan.myrtleswitcherfix`，日志文件同步使用新标识符；声明替换旧包 `com.local.myrtleswitcherfix`，避免迁移时两个插件同时注入 SpringBoard。
