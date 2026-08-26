@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <stdarg.h>
 #import <substrate.h>
 
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
@@ -15,10 +16,34 @@ static NSUInteger MRReturnToMainGeneration = 0;
 static NSUInteger MRMyrtleFullscreenIntentGeneration = 0;
 static NSTimeInterval MRRecentlyClosedMyrtleTime = 0;
 static const CGFloat MRFixedPortraitKeyboardHeight = 360.0;
+static NSString *const MRKeyboardLogPath =
+    @"/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.keyboard.log";
+static const unsigned long long MRMaximumKeyboardLogSize = 256 * 1024;
 
 // Performance build: the preprocessor discards the complete call expression, so
 // diagnostic arguments are not evaluated and SpringBoard performs no log I/O.
 #define MRLog(...) do {} while (0)
+
+static void MRKeyboardLog(NSString *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments];
+    va_end(arguments);
+    NSData *data = [[NSString stringWithFormat:@"%@ %@\n", NSDate.date, message]
+                    dataUsingEncoding:NSUTF8StringEncoding];
+    unsigned long long size = [[[NSFileManager defaultManager]
+                                attributesOfItemAtPath:MRKeyboardLogPath error:nil]
+                               fileSize];
+    if (size >= MRMaximumKeyboardLogSize) return;
+    NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:MRKeyboardLogPath];
+    if (handle == nil) [data writeToFile:MRKeyboardLogPath atomically:YES];
+    else {
+        [handle seekToEndOfFile];
+        [handle writeData:data];
+        [handle closeFile];
+    }
+}
 
 static id MRSafeValue(id object, NSString *key)
 {
@@ -678,32 +703,78 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
     // frame: Myrtle first intersects that frame with the handle in a different
     // view coordinate space, and a synthetic screen frame can suppress the
     // avoidance path entirely on iOS 15.
+    UIView *beforeHandle = MRSafeValue(self, @"handle");
+    NSNumber *beforeMoved = MRSafeValue(self, @"handleWasMovedForKeyboard");
+    NSDictionary *beforeUserInfo = [notification isKindOfClass:NSNotification.class]
+        ? notification.userInfo : nil;
+    NSValue *beforeFrameValue = beforeUserInfo[UIKeyboardFrameEndUserInfoKey];
+    CGRect beforeKeyboardFrame = CGRectZero;
+    if ([beforeFrameValue isKindOfClass:NSValue.class] &&
+        strcmp(beforeFrameValue.objCType, @encode(CGRect)) == 0)
+        beforeKeyboardFrame = beforeFrameValue.CGRectValue;
+    MRKeyboardLog(@"willShow enter class=%@ notification=%@ frame=%@ screen=%@ moved=%@ handle=%@ super=%@",
+                  NSStringFromClass([self class]),
+                  [notification isKindOfClass:NSNotification.class]
+                      ? notification.name : @"<invalid>",
+                  NSStringFromCGRect(beforeKeyboardFrame),
+                  NSStringFromCGRect(UIScreen.mainScreen.bounds), beforeMoved,
+                  [beforeHandle isKindOfClass:UIView.class]
+                      ? NSStringFromCGPoint(beforeHandle.center) : @"<invalid>",
+                  [beforeHandle isKindOfClass:UIView.class]
+                      ? NSStringFromClass([beforeHandle.superview class]) : @"<invalid>");
+
     MROriginalKeyboardWillShow(self, selector, notification);
 
-    if (![notification isKindOfClass:NSNotification.class]) return;
+    NSNumber *afterMoved = MRSafeValue(self, @"handleWasMovedForKeyboard");
+    UIView *afterHandle = MRSafeValue(self, @"handle");
+    MRKeyboardLog(@"willShow original returned moved=%@ handle=%@",
+                  afterMoved, [afterHandle isKindOfClass:UIView.class]
+                      ? NSStringFromCGPoint(afterHandle.center) : @"<invalid>");
+
+    if (![notification isKindOfClass:NSNotification.class]) {
+        MRKeyboardLog(@"skip: notification is not NSNotification");
+        return;
+    }
     NSDictionary *userInfo = notification.userInfo;
     NSValue *frameValue = userInfo[UIKeyboardFrameEndUserInfoKey];
     if (![frameValue isKindOfClass:NSValue.class] ||
-        strcmp(frameValue.objCType, @encode(CGRect)) != 0) return;
+        strcmp(frameValue.objCType, @encode(CGRect)) != 0) {
+        MRKeyboardLog(@"skip: missing or incompatible keyboard frame value=%@ type=%s",
+                      frameValue, [frameValue isKindOfClass:NSValue.class]
+                          ? frameValue.objCType : "<none>");
+        return;
+    }
 
     CGRect screenBounds = UIScreen.mainScreen.bounds;
     CGRect keyboardFrame = frameValue.CGRectValue;
     BOOL portrait = CGRectGetHeight(screenBounds) > CGRectGetWidth(screenBounds);
     BOOL usableFrame = CGRectGetWidth(keyboardFrame) > 0.0 &&
                        CGRectGetHeight(keyboardFrame) > 0.0;
-    if (!portrait || !usableFrame) return;
+    if (!portrait || !usableFrame) {
+        MRKeyboardLog(@"skip: portrait=%d usableFrame=%d", portrait, usableFrame);
+        return;
+    }
 
     // A true value proves that Myrtle accepted this notification, enabled its
     // avoidance feature, saved the original handle position and scheduled its
     // normal animation.  This avoids changing behavior when the preference is
     // disabled or the keyboard does not overlap the handle.
     NSNumber *movedValue = MRSafeValue(self, @"handleWasMovedForKeyboard");
-    if (![movedValue respondsToSelector:@selector(boolValue)] || !movedValue.boolValue) return;
+    if (![movedValue respondsToSelector:@selector(boolValue)] || !movedValue.boolValue) {
+        MRKeyboardLog(@"skip: Myrtle did not set moved flag value=%@", movedValue);
+        return;
+    }
 
     UIView *handle = MRSafeValue(self, @"handle");
-    if (![handle isKindOfClass:UIView.class]) return;
+    if (![handle isKindOfClass:UIView.class]) {
+        MRKeyboardLog(@"skip: invalid handle=%@", handle);
+        return;
+    }
     UIView *coordinateView = handle.superview ?: MRSafeValue(self, @"view");
-    if (![coordinateView isKindOfClass:UIView.class]) return;
+    if (![coordinateView isKindOfClass:UIView.class]) {
+        MRKeyboardLog(@"skip: invalid coordinate view=%@", coordinateView);
+        return;
+    }
 
     // Convert the fixed screen-space keyboard top into the handle's actual
     // superview.  Keeping Myrtle's real notification above means this step no
@@ -728,11 +799,21 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
     if (duration <= 0.0 || duration > 2.0) duration = 0.25;
     UIViewAnimationOptions options =
         (UIViewAnimationOptions)([userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue] << 16);
+    MRKeyboardLog(@"apply: keyboard=%@ fixedTop=%.2f convertedTop=%@ oldCenter=%@ target=%@ "
+                   "viewBounds=%@ safeInsets=%@ duration=%.3f options=%lu",
+                  NSStringFromCGRect(keyboardFrame), fixedKeyboardTop,
+                  NSStringFromCGPoint(fixedTopInView), NSStringFromCGPoint(handle.center),
+                  NSStringFromCGPoint(fixedCenter), NSStringFromCGRect(availableBounds),
+                  NSStringFromUIEdgeInsets(safeInsets), duration, (unsigned long)options);
     [UIView animateWithDuration:duration
                           delay:0.0
                         options:options | UIViewAnimationOptionBeginFromCurrentState
                      animations:^{ handle.center = fixedCenter; }
-                     completion:nil];
+                     completion:^(__unused BOOL finished) {
+                         MRKeyboardLog(@"completion: finished=%d center=%@ moved=%@",
+                                       finished, NSStringFromCGPoint(handle.center),
+                                       MRSafeValue(self, @"handleWasMovedForKeyboard"));
+                     }];
 }
 
 static BOOL MRInstallMyrtleHook(void)
@@ -790,6 +871,10 @@ static BOOL MRInstallMyrtleKeyboardAvoidanceHook(void)
 
     MSHookMessageEx(cls, selector, (IMP)MRHookKeyboardWillShow,
                     (IMP *)&MROriginalKeyboardWillShow);
+    MRKeyboardLog(@"install: class=%@ selector=%@ type=%s args=%u original=%p success=%d",
+                  NSStringFromClass(cls), NSStringFromSelector(selector),
+                  method_getTypeEncoding(method), method_getNumberOfArguments(method),
+                  MROriginalKeyboardWillShow, MROriginalKeyboardWillShow != NULL);
     return MROriginalKeyboardWillShow != NULL;
 }
 
