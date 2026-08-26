@@ -15,6 +15,7 @@ static NSUInteger MRReturnToMainGeneration = 0;
 static NSUInteger MRMyrtleFullscreenIntentGeneration = 0;
 static NSTimeInterval MRRecentlyClosedMyrtleTime = 0;
 static const CGFloat MRFixedPortraitKeyboardHeight = 360.0;
+static const CGFloat MRKeyboardHandleGap = 12.0;
 
 // Performance build: the preprocessor discards the complete call expression, so
 // diagnostic arguments are not evaluated and SpringBoard performs no log I/O.
@@ -693,13 +694,6 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
                        CGRectGetHeight(keyboardFrame) > 0.0;
     if (!portrait || !usableFrame) return;
 
-    // A true value proves that Myrtle accepted this notification, enabled its
-    // avoidance feature, saved the original handle position and scheduled its
-    // normal animation.  This avoids changing behavior when the preference is
-    // disabled or the keyboard does not overlap the handle.
-    NSNumber *movedValue = MRSafeValue(self, @"handleWasMovedForKeyboard");
-    if (![movedValue respondsToSelector:@selector(boolValue)] || !movedValue.boolValue) return;
-
     UIView *handle = MRSafeValue(self, @"handle");
     if (![handle isKindOfClass:UIView.class]) return;
     // Myrtle uses `handle` only to measure the visible grip.  The object whose
@@ -711,6 +705,25 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
     UIView *coordinateView = movementView.superview ?: MRSafeValue(self, @"view");
     if (![coordinateView isKindOfClass:UIView.class]) return;
 
+    NSNumber *movedValue = MRSafeValue(self, @"handleWasMovedForKeyboard");
+    BOOL movedForKeyboard = [movedValue respondsToSelector:@selector(boolValue)] &&
+                            movedValue.boolValue;
+    if (!movedForKeyboard) {
+        // Myrtle 1.4.1 rejects SpringBoard-owned keyboards (notably Spotlight)
+        // before setting its movement state.  Use the real outer hit view for
+        // an independent overlap check, then populate Myrtle's own saved state
+        // so its unchanged keyboard-hide handler restores the original center.
+        CGRect movementFrameOnScreen = [movementView convertRect:movementView.bounds toView:nil];
+        if (!CGRectIntersectsRect(movementFrameOnScreen, keyboardFrame)) return;
+
+        SEL saveSelector = NSSelectorFromString(@"setSavedHandleCenterForKeyboard:");
+        SEL movedSelector = NSSelectorFromString(@"setHandleWasMovedForKeyboard:");
+        if (![self respondsToSelector:saveSelector] ||
+            ![self respondsToSelector:movedSelector]) return;
+        ((void (*)(id, SEL, CGPoint))objc_msgSend)(self, saveSelector, movementView.center);
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(self, movedSelector, YES);
+    }
+
     // Convert the fixed screen-space keyboard top into the handle's actual
     // superview.  Keeping Myrtle's real notification above means this step no
     // longer participates in its CGRectIntersectsRect gate.
@@ -719,12 +732,14 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
                                                                       fixedKeyboardTop)
                                                   fromView:nil];
     CGFloat halfHandleHeight = CGRectGetHeight(handle.bounds) * 0.5;
-    CGFloat targetY = fixedTopInView.y - halfHandleHeight - 8.0;
+    CGFloat targetY = fixedTopInView.y - halfHandleHeight - MRKeyboardHandleGap;
 
     CGRect availableBounds = coordinateView.bounds;
     UIEdgeInsets safeInsets = coordinateView.safeAreaInsets;
-    CGFloat minimumY = CGRectGetMinY(availableBounds) + safeInsets.top + halfHandleHeight + 8.0;
-    CGFloat maximumY = CGRectGetMaxY(availableBounds) - safeInsets.bottom - halfHandleHeight - 8.0;
+    CGFloat minimumY = CGRectGetMinY(availableBounds) + safeInsets.top +
+                       halfHandleHeight + MRKeyboardHandleGap;
+    CGFloat maximumY = CGRectGetMaxY(availableBounds) - safeInsets.bottom -
+                       halfHandleHeight - MRKeyboardHandleGap;
     if (maximumY >= minimumY)
         targetY = MIN(MAX(targetY, minimumY), maximumY);
 
