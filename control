@@ -1,8 +1,8 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.5.1~beta2
+Version: 0.5.1~beta5
 Architecture: iphoneos-arm64e
-Description: Log-free test build that keeps Myrtle's radial selector aligned with fixed 360pt in-app keyboard avoidance.
+Description: Log-free test build that pins Myrtle's handle and radial selector above the active in-app keyboard without interrupting its native animations.
 Maintainer: Local
 Author: Local
 Section: Tweaks

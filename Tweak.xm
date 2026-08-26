@@ -671,10 +671,16 @@ static void MRHookViewWillAppear(id self, SEL selector, BOOL animated)
 
 typedef void (*MRKeyboardWillShowIMP)(id, SEL, NSNotification *);
 static MRKeyboardWillShowIMP MROriginalKeyboardWillShow = NULL;
+typedef void (*MRKeyboardWillHideIMP)(id, SEL, NSNotification *);
+static MRKeyboardWillHideIMP MROriginalKeyboardWillHide = NULL;
 typedef void (*MROpenSelectorAtPointIMP)(id, SEL, CGPoint);
 static MROpenSelectorAtPointIMP MROriginalOpenSelectorAtPoint = NULL;
+static const void *MRPinnedHandleControllerKey = &MRPinnedHandleControllerKey;
+static const void *MRPinnedHandleInstalledKey = &MRPinnedHandleInstalledKey;
+static const void *MRPinnedHandleBypassKey = &MRPinnedHandleBypassKey;
 
-static BOOL MRApplyFixedKeyboardHandlePosition(id controller, NSDictionary *animationInfo)
+static BOOL MRFixedKeyboardHandleCenter(id controller, UIView *movementView,
+                                        CGPoint proposedCenter, CGPoint *fixedCenter)
 {
     CGRect screenBounds = UIScreen.mainScreen.bounds;
     BOOL portrait = CGRectGetHeight(screenBounds) > CGRectGetWidth(screenBounds);
@@ -692,7 +698,6 @@ static BOOL MRApplyFixedKeyboardHandlePosition(id controller, NSDictionary *anim
     // center it saves, animates and restores is the outer `handleHitView`.
     // Moving the inner handle merely shifts it inside a 37x120 hit container
     // and does not relocate the control on screen.
-    UIView *movementView = MRSafeValue(controller, @"handleHitView");
     if (![movementView isKindOfClass:UIView.class]) return NO;
     UIView *coordinateView = movementView.superview ?: MRSafeValue(controller, @"view");
     if (![coordinateView isKindOfClass:UIView.class]) return NO;
@@ -716,8 +721,69 @@ static BOOL MRApplyFixedKeyboardHandlePosition(id controller, NSDictionary *anim
     if (maximumY >= minimumY)
         targetY = MIN(MAX(targetY, minimumY), maximumY);
 
-    CGPoint fixedCenter = movementView.center;
-    fixedCenter.y = targetY;
+    proposedCenter.y = targetY;
+    if (fixedCenter != NULL) *fixedCenter = proposedCenter;
+    return YES;
+}
+
+static void MRPinnedHandleSetCenter(id view, SEL selector, CGPoint proposedCenter)
+{
+    id controller = objc_getAssociatedObject(view, MRPinnedHandleControllerKey);
+    NSNumber *bypass = objc_getAssociatedObject(view, MRPinnedHandleBypassKey);
+    CGPoint effectiveCenter = proposedCenter;
+    if (!bypass.boolValue)
+        MRFixedKeyboardHandleCenter(controller, view, proposedCenter, &effectiveCenter);
+
+    // The generated subclass is installed directly above the handle's original
+    // UIKit class, so forwarding here preserves every original animation.  We
+    // change only the model-layer Y destination while the keyboard is active.
+    Class originalClass = class_getSuperclass(object_getClass(view));
+    IMP implementation = class_getMethodImplementation(originalClass, selector);
+    ((void (*)(id, SEL, CGPoint))implementation)(view, selector, effectiveCenter);
+}
+
+static BOOL MRInstallPinnedHandleCenterGuard(id controller)
+{
+    UIView *movementView = MRSafeValue(controller, @"handleHitView");
+    if (![movementView isKindOfClass:UIView.class]) return NO;
+
+    objc_setAssociatedObject(movementView, MRPinnedHandleControllerKey, controller,
+                             OBJC_ASSOCIATION_ASSIGN);
+    if ([objc_getAssociatedObject(movementView, MRPinnedHandleInstalledKey) boolValue])
+        return YES;
+
+    Class originalClass = object_getClass(movementView);
+    NSString *subclassName = [NSString stringWithFormat:@"MRMyrtleKeyboardPinned_%s",
+                                                        class_getName(originalClass)];
+    Class subclass = NSClassFromString(subclassName);
+    if (subclass == Nil) {
+        subclass = objc_allocateClassPair(originalClass, subclassName.UTF8String, 0);
+        if (subclass == Nil) return NO;
+
+        Method method = class_getInstanceMethod(originalClass, @selector(setCenter:));
+        const char *types = method == NULL ? "v@:{CGPoint=dd}" : method_getTypeEncoding(method);
+        if (!class_addMethod(subclass, @selector(setCenter:),
+                             (IMP)MRPinnedHandleSetCenter, types)) {
+            objc_disposeClassPair(subclass);
+            return NO;
+        }
+        objc_registerClassPair(subclass);
+    }
+
+    object_setClass(movementView, subclass);
+    objc_setAssociatedObject(movementView, MRPinnedHandleInstalledKey, @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return YES;
+}
+
+static BOOL MRApplyFixedKeyboardHandlePosition(id controller, NSDictionary *animationInfo)
+{
+    UIView *movementView = MRSafeValue(controller, @"handleHitView");
+    if (![movementView isKindOfClass:UIView.class]) return NO;
+    CGPoint targetCenter;
+    if (!MRFixedKeyboardHandleCenter(controller, movementView,
+                                     movementView.center, &targetCenter)) return NO;
+
     NSTimeInterval duration = [animationInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
     if (duration <= 0.0 || duration > 2.0) duration = 0.25;
     NSNumber *curveValue = animationInfo[UIKeyboardAnimationCurveUserInfoKey];
@@ -727,7 +793,7 @@ static BOOL MRApplyFixedKeyboardHandlePosition(id controller, NSDictionary *anim
     [UIView animateWithDuration:duration
                           delay:0.0
                         options:options | UIViewAnimationOptionBeginFromCurrentState
-                     animations:^{ movementView.center = fixedCenter; }
+                     animations:^{ movementView.center = targetCenter; }
                      completion:nil];
     return YES;
 }
@@ -748,7 +814,25 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
         strcmp(frameValue.objCType, @encode(CGRect)) != 0) return;
     CGRect keyboardFrame = frameValue.CGRectValue;
     if (CGRectGetWidth(keyboardFrame) <= 0.0 || CGRectGetHeight(keyboardFrame) <= 0.0) return;
+    MRInstallPinnedHandleCenterGuard(self);
     MRApplyFixedKeyboardHandlePosition(self, userInfo);
+}
+
+static void MRHookKeyboardWillHide(id self, SEL selector, NSNotification *notification)
+{
+    UIView *movementView = MRSafeValue(self, @"handleHitView");
+    BOOL guarded = [movementView isKindOfClass:UIView.class] &&
+        [objc_getAssociatedObject(movementView, MRPinnedHandleInstalledKey) boolValue];
+    if (guarded)
+        objc_setAssociatedObject(movementView, MRPinnedHandleBypassKey, @YES,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    @try {
+        MROriginalKeyboardWillHide(self, selector, notification);
+    } @finally {
+        if (guarded)
+            objc_setAssociatedObject(movementView, MRPinnedHandleBypassKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
 }
 
 static void MRHookOpenSelectorAtPoint(id self, SEL selector, CGPoint centerPoint)
@@ -757,6 +841,7 @@ static void MRHookOpenSelectorAtPoint(id self, SEL selector, CGPoint centerPoint
     // radial menu's center before `setIsOverlayOpen:YES`.  Correct both the
     // live handle model and the incoming center before Myrtle creates/layouts
     // the selector, keeping the grip and radial items in one coordinate system.
+    MRInstallPinnedHandleCenterGuard(self);
     if (MRApplyFixedKeyboardHandlePosition(self, nil)) {
         UIView *movementView = MRSafeValue(self, @"handleHitView");
         if ([movementView isKindOfClass:UIView.class]) centerPoint.y = movementView.center.y;
@@ -805,21 +890,36 @@ static BOOL MRInstallMyrtleHostCoreLaunchHook(void)
 
 static BOOL MRInstallMyrtleKeyboardAvoidanceHook(void)
 {
-    if (MROriginalKeyboardWillShow != NULL) return YES;
     Class cls = NSClassFromString(@"MyrtleViewController");
-    SEL selector = NSSelectorFromString(@"MT_IIlIllIllIIIIlllllII:");
-    Method method = class_getInstanceMethod(cls, selector);
-    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+    if (cls == Nil) return NO;
 
-    char returnType[16] = {};
-    char argumentType[16] = {};
-    method_getReturnType(method, returnType, sizeof(returnType));
-    method_getArgumentType(method, 2, argumentType, sizeof(argumentType));
-    if (returnType[0] != 'v' || argumentType[0] != '@') return NO;
+    if (MROriginalKeyboardWillShow == NULL) {
+        SEL showSelector = NSSelectorFromString(@"MT_IIlIllIllIIIIlllllII:");
+        Method showMethod = class_getInstanceMethod(cls, showSelector);
+        if (showMethod == NULL || method_getNumberOfArguments(showMethod) != 3) return NO;
+        char returnType[16] = {};
+        char argumentType[16] = {};
+        method_getReturnType(showMethod, returnType, sizeof(returnType));
+        method_getArgumentType(showMethod, 2, argumentType, sizeof(argumentType));
+        if (returnType[0] != 'v' || argumentType[0] != '@') return NO;
+        MSHookMessageEx(cls, showSelector, (IMP)MRHookKeyboardWillShow,
+                        (IMP *)&MROriginalKeyboardWillShow);
+    }
 
-    MSHookMessageEx(cls, selector, (IMP)MRHookKeyboardWillShow,
-                    (IMP *)&MROriginalKeyboardWillShow);
-    return MROriginalKeyboardWillShow != NULL;
+    if (MROriginalKeyboardWillHide == NULL) {
+        SEL hideSelector = NSSelectorFromString(@"MT_lIIlIlIIIIlIIlIlllIl:");
+        Method hideMethod = class_getInstanceMethod(cls, hideSelector);
+        if (hideMethod == NULL || method_getNumberOfArguments(hideMethod) != 3) return NO;
+        char returnType[16] = {};
+        char argumentType[16] = {};
+        method_getReturnType(hideMethod, returnType, sizeof(returnType));
+        method_getArgumentType(hideMethod, 2, argumentType, sizeof(argumentType));
+        if (returnType[0] != 'v' || argumentType[0] != '@') return NO;
+        MSHookMessageEx(cls, hideSelector, (IMP)MRHookKeyboardWillHide,
+                        (IMP *)&MROriginalKeyboardWillHide);
+    }
+
+    return MROriginalKeyboardWillShow != NULL && MROriginalKeyboardWillHide != NULL;
 }
 
 static BOOL MRInstallMyrtleSelectorCenterHook(void)
