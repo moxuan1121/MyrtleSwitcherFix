@@ -673,8 +673,6 @@ typedef void (*MRKeyboardWillShowIMP)(id, SEL, NSNotification *);
 static MRKeyboardWillShowIMP MROriginalKeyboardWillShow = NULL;
 typedef void (*MROpenSelectorAtPointIMP)(id, SEL, CGPoint);
 static MROpenSelectorAtPointIMP MROriginalOpenSelectorAtPoint = NULL;
-typedef void (*MRSetOverlayOpenIMP)(id, SEL, BOOL);
-static MRSetOverlayOpenIMP MROriginalSetOverlayOpen = NULL;
 
 static BOOL MRApplyFixedKeyboardHandlePosition(id controller, NSDictionary *animationInfo)
 {
@@ -766,20 +764,6 @@ static void MRHookOpenSelectorAtPoint(id self, SEL selector, CGPoint centerPoint
     MROriginalOpenSelectorAtPoint(self, selector, centerPoint);
 }
 
-static void MRHookSetOverlayOpen(id self, SEL selector, BOOL open)
-{
-    MROriginalSetOverlayOpen(self, selector, open);
-    if (open) return;
-    // The close path restores Myrtle's pre-selector handle center after the
-    // radial items disappear.  Reassert the fixed in-app keyboard position on
-    // the next main-queue turn.  The open path is deliberately untouched here;
-    // its shared handle/selector center is corrected before construction above.
-    __weak id weakController = self;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        MRApplyFixedKeyboardHandlePosition(weakController, nil);
-    });
-}
-
 static BOOL MRInstallMyrtleHook(void)
 {
     if (MROriginalSetCurrentBundle != NULL) return YES;
@@ -857,25 +841,6 @@ static BOOL MRInstallMyrtleSelectorCenterHook(void)
     return MROriginalOpenSelectorAtPoint != NULL;
 }
 
-static BOOL MRInstallMyrtleOverlayCloseHook(void)
-{
-    if (MROriginalSetOverlayOpen != NULL) return YES;
-    Class cls = NSClassFromString(@"MyrtleViewController");
-    SEL selector = @selector(setIsOverlayOpen:);
-    Method method = class_getInstanceMethod(cls, selector);
-    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 3) return NO;
-
-    char returnType[16] = {};
-    char argumentType[16] = {};
-    method_getReturnType(method, returnType, sizeof(returnType));
-    method_getArgumentType(method, 2, argumentType, sizeof(argumentType));
-    if (returnType[0] != 'v' || (argumentType[0] != 'B' && argumentType[0] != 'c')) return NO;
-
-    MSHookMessageEx(cls, selector, (IMP)MRHookSetOverlayOpen,
-                    (IMP *)&MROriginalSetOverlayOpen);
-    return MROriginalSetOverlayOpen != NULL;
-}
-
 static void MRInstallSwitcherRemoveHook(void)
 {
     Class cls = NSClassFromString(@"SBMainSwitcherViewController");
@@ -935,13 +900,12 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL hostCoreLaunchInstalled = MRInstallMyrtleHostCoreLaunchHook();
     BOOL keyboardAvoidanceInstalled = MRInstallMyrtleKeyboardAvoidanceHook();
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
-    BOOL overlayCloseInstalled = MRInstallMyrtleOverlayCloseHook();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
-        keyboardAvoidanceInstalled && selectorCenterInstalled && overlayCloseInstalled) return;
+        keyboardAvoidanceInstalled && selectorCenterInstalled) return;
     if (attempt >= 60) {
-        MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d selectorCenter=%d overlayClose=%d",
+        MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d selectorCenter=%d",
               managerInstalled, fullscreenInstalled, hostCoreLaunchInstalled,
-              keyboardAvoidanceInstalled, selectorCenterInstalled, overlayCloseInstalled);
+              keyboardAvoidanceInstalled, selectorCenterInstalled);
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
