@@ -673,37 +673,66 @@ static MRKeyboardWillShowIMP MROriginalKeyboardWillShow = NULL;
 
 static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notification)
 {
-    if (![notification isKindOfClass:NSNotification.class]) {
-        MROriginalKeyboardWillShow(self, selector, notification);
-        return;
-    }
+    // Preserve Myrtle's own eligibility checks, saved-center bookkeeping and
+    // hide-time restoration.  In particular, do not replace the notification
+    // frame: Myrtle first intersects that frame with the handle in a different
+    // view coordinate space, and a synthetic screen frame can suppress the
+    // avoidance path entirely on iOS 15.
+    MROriginalKeyboardWillShow(self, selector, notification);
 
+    if (![notification isKindOfClass:NSNotification.class]) return;
     NSDictionary *userInfo = notification.userInfo;
     NSValue *frameValue = userInfo[UIKeyboardFrameEndUserInfoKey];
     if (![frameValue isKindOfClass:NSValue.class] ||
-        strcmp(frameValue.objCType, @encode(CGRect)) != 0) {
-        MROriginalKeyboardWillShow(self, selector, notification);
-        return;
-    }
+        strcmp(frameValue.objCType, @encode(CGRect)) != 0) return;
 
     CGRect screenBounds = UIScreen.mainScreen.bounds;
     CGRect keyboardFrame = frameValue.CGRectValue;
     BOOL portrait = CGRectGetHeight(screenBounds) > CGRectGetWidth(screenBounds);
-    BOOL fullWidthKeyboard = CGRectGetWidth(keyboardFrame) >= CGRectGetWidth(screenBounds) * 0.85;
-    BOOL usableFrame = CGRectGetWidth(keyboardFrame) > 0.0 && CGRectGetHeight(keyboardFrame) > 0.0;
-    if (!portrait || !fullWidthKeyboard || !usableFrame) {
-        MROriginalKeyboardWillShow(self, selector, notification);
-        return;
-    }
+    BOOL usableFrame = CGRectGetWidth(keyboardFrame) > 0.0 &&
+                       CGRectGetHeight(keyboardFrame) > 0.0;
+    if (!portrait || !usableFrame) return;
 
-    keyboardFrame.origin.y = CGRectGetMaxY(screenBounds) - MRFixedPortraitKeyboardHeight;
-    keyboardFrame.size.height = MRFixedPortraitKeyboardHeight;
-    NSMutableDictionary *fixedUserInfo = [userInfo mutableCopy] ?: [NSMutableDictionary dictionary];
-    fixedUserInfo[UIKeyboardFrameEndUserInfoKey] = [NSValue valueWithCGRect:keyboardFrame];
-    NSNotification *fixedNotification = [NSNotification notificationWithName:notification.name
-                                                                       object:notification.object
-                                                                     userInfo:fixedUserInfo];
-    MROriginalKeyboardWillShow(self, selector, fixedNotification);
+    // A true value proves that Myrtle accepted this notification, enabled its
+    // avoidance feature, saved the original handle position and scheduled its
+    // normal animation.  This avoids changing behavior when the preference is
+    // disabled or the keyboard does not overlap the handle.
+    NSNumber *movedValue = MRSafeValue(self, @"handleWasMovedForKeyboard");
+    if (![movedValue respondsToSelector:@selector(boolValue)] || !movedValue.boolValue) return;
+
+    UIView *handle = MRSafeValue(self, @"handle");
+    if (![handle isKindOfClass:UIView.class]) return;
+    UIView *coordinateView = handle.superview ?: MRSafeValue(self, @"view");
+    if (![coordinateView isKindOfClass:UIView.class]) return;
+
+    // Convert the fixed screen-space keyboard top into the handle's actual
+    // superview.  Keeping Myrtle's real notification above means this step no
+    // longer participates in its CGRectIntersectsRect gate.
+    CGFloat fixedKeyboardTop = CGRectGetMaxY(screenBounds) - MRFixedPortraitKeyboardHeight;
+    CGPoint fixedTopInView = [coordinateView convertPoint:CGPointMake(CGRectGetMidX(screenBounds),
+                                                                      fixedKeyboardTop)
+                                                  fromView:nil];
+    CGFloat halfHandleHeight = CGRectGetHeight(handle.bounds) * 0.5;
+    CGFloat targetY = fixedTopInView.y - halfHandleHeight - 8.0;
+
+    CGRect availableBounds = coordinateView.bounds;
+    UIEdgeInsets safeInsets = coordinateView.safeAreaInsets;
+    CGFloat minimumY = CGRectGetMinY(availableBounds) + safeInsets.top + halfHandleHeight + 8.0;
+    CGFloat maximumY = CGRectGetMaxY(availableBounds) - safeInsets.bottom - halfHandleHeight - 8.0;
+    if (maximumY >= minimumY)
+        targetY = MIN(MAX(targetY, minimumY), maximumY);
+
+    CGPoint fixedCenter = handle.center;
+    fixedCenter.y = targetY;
+    NSTimeInterval duration = [userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
+    if (duration <= 0.0 || duration > 2.0) duration = 0.25;
+    UIViewAnimationOptions options =
+        (UIViewAnimationOptions)([userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue] << 16);
+    [UIView animateWithDuration:duration
+                          delay:0.0
+                        options:options | UIViewAnimationOptionBeginFromCurrentState
+                     animations:^{ handle.center = fixedCenter; }
+                     completion:nil];
 }
 
 static BOOL MRInstallMyrtleHook(void)

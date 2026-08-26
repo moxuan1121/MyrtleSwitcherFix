@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - performance/no-logging
+      - feature/fixed-keyboard-avoidance
     paths:
       - "Makefile"
       - "control"
