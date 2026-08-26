@@ -671,45 +671,31 @@ static void MRHookViewWillAppear(id self, SEL selector, BOOL animated)
 
 typedef void (*MRKeyboardWillShowIMP)(id, SEL, NSNotification *);
 static MRKeyboardWillShowIMP MROriginalKeyboardWillShow = NULL;
+typedef void (*MRSetOverlayOpenIMP)(id, SEL, BOOL);
+static MRSetOverlayOpenIMP MROriginalSetOverlayOpen = NULL;
 
-static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notification)
+static BOOL MRApplyFixedKeyboardHandlePosition(id controller, NSDictionary *animationInfo)
 {
-    // Preserve Myrtle's own eligibility checks, saved-center bookkeeping and
-    // hide-time restoration.  In particular, do not replace the notification
-    // frame: Myrtle first intersects that frame with the handle in a different
-    // view coordinate space, and a synthetic screen frame can suppress the
-    // avoidance path entirely on iOS 15.
-    MROriginalKeyboardWillShow(self, selector, notification);
-
-    if (![notification isKindOfClass:NSNotification.class]) return;
-    NSDictionary *userInfo = notification.userInfo;
-    NSValue *frameValue = userInfo[UIKeyboardFrameEndUserInfoKey];
-    if (![frameValue isKindOfClass:NSValue.class] ||
-        strcmp(frameValue.objCType, @encode(CGRect)) != 0) return;
-
     CGRect screenBounds = UIScreen.mainScreen.bounds;
-    CGRect keyboardFrame = frameValue.CGRectValue;
     BOOL portrait = CGRectGetHeight(screenBounds) > CGRectGetWidth(screenBounds);
-    BOOL usableFrame = CGRectGetWidth(keyboardFrame) > 0.0 &&
-                       CGRectGetHeight(keyboardFrame) > 0.0;
-    if (!portrait || !usableFrame) return;
+    if (!portrait) return NO;
 
     // Apply the fixed height only after Myrtle itself accepted an in-app
     // keyboard notification and saved the original handle position.  System
     // surfaces that Myrtle rejects are deliberately left completely untouched.
-    NSNumber *movedValue = MRSafeValue(self, @"handleWasMovedForKeyboard");
-    if (![movedValue respondsToSelector:@selector(boolValue)] || !movedValue.boolValue) return;
+    NSNumber *movedValue = MRSafeValue(controller, @"handleWasMovedForKeyboard");
+    if (![movedValue respondsToSelector:@selector(boolValue)] || !movedValue.boolValue) return NO;
 
-    UIView *handle = MRSafeValue(self, @"handle");
-    if (![handle isKindOfClass:UIView.class]) return;
+    UIView *handle = MRSafeValue(controller, @"handle");
+    if (![handle isKindOfClass:UIView.class]) return NO;
     // Myrtle uses `handle` only to measure the visible grip.  The object whose
     // center it saves, animates and restores is the outer `handleHitView`.
     // Moving the inner handle merely shifts it inside a 37x120 hit container
     // and does not relocate the control on screen.
-    UIView *movementView = MRSafeValue(self, @"handleHitView");
-    if (![movementView isKindOfClass:UIView.class]) return;
-    UIView *coordinateView = movementView.superview ?: MRSafeValue(self, @"view");
-    if (![coordinateView isKindOfClass:UIView.class]) return;
+    UIView *movementView = MRSafeValue(controller, @"handleHitView");
+    if (![movementView isKindOfClass:UIView.class]) return NO;
+    UIView *coordinateView = movementView.superview ?: MRSafeValue(controller, @"view");
+    if (![coordinateView isKindOfClass:UIView.class]) return NO;
 
     // Convert the fixed screen-space keyboard top into the handle's actual
     // superview.  Keeping Myrtle's real notification above means this step no
@@ -732,15 +718,50 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
 
     CGPoint fixedCenter = movementView.center;
     fixedCenter.y = targetY;
-    NSTimeInterval duration = [userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
+    NSTimeInterval duration = [animationInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
     if (duration <= 0.0 || duration > 2.0) duration = 0.25;
-    UIViewAnimationOptions options =
-        (UIViewAnimationOptions)([userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue] << 16);
+    NSNumber *curveValue = animationInfo[UIKeyboardAnimationCurveUserInfoKey];
+    UIViewAnimationOptions options = curveValue != nil
+        ? (UIViewAnimationOptions)(curveValue.integerValue << 16)
+        : UIViewAnimationOptionCurveEaseInOut;
     [UIView animateWithDuration:duration
                           delay:0.0
                         options:options | UIViewAnimationOptionBeginFromCurrentState
                      animations:^{ movementView.center = fixedCenter; }
                      completion:nil];
+    return YES;
+}
+
+static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notification)
+{
+    // Preserve Myrtle's own eligibility checks, saved-center bookkeeping and
+    // hide-time restoration.  In particular, do not replace the notification
+    // frame: Myrtle first intersects that frame with the handle in a different
+    // view coordinate space, and a synthetic screen frame can suppress the
+    // avoidance path entirely on iOS 15.
+    MROriginalKeyboardWillShow(self, selector, notification);
+
+    if (![notification isKindOfClass:NSNotification.class]) return;
+    NSDictionary *userInfo = notification.userInfo;
+    NSValue *frameValue = userInfo[UIKeyboardFrameEndUserInfoKey];
+    if (![frameValue isKindOfClass:NSValue.class] ||
+        strcmp(frameValue.objCType, @encode(CGRect)) != 0) return;
+    CGRect keyboardFrame = frameValue.CGRectValue;
+    if (CGRectGetWidth(keyboardFrame) <= 0.0 || CGRectGetHeight(keyboardFrame) <= 0.0) return;
+    MRApplyFixedKeyboardHandlePosition(self, userInfo);
+}
+
+static void MRHookSetOverlayOpen(id self, SEL selector, BOOL open)
+{
+    MROriginalSetOverlayOpen(self, selector, open);
+    if (!open) return;
+    // Myrtle lays out the selector after changing this state.  Reapply on the
+    // next main-queue turn so its synchronous open layout cannot overwrite the
+    // already-active in-app keyboard avoidance position.
+    __weak id weakController = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        MRApplyFixedKeyboardHandlePosition(weakController, nil);
+    });
 }
 
 static BOOL MRInstallMyrtleHook(void)
@@ -801,6 +822,25 @@ static BOOL MRInstallMyrtleKeyboardAvoidanceHook(void)
     return MROriginalKeyboardWillShow != NULL;
 }
 
+static BOOL MRInstallMyrtleOverlayOpenHook(void)
+{
+    if (MROriginalSetOverlayOpen != NULL) return YES;
+    Class cls = NSClassFromString(@"MyrtleViewController");
+    SEL selector = @selector(setIsOverlayOpen:);
+    Method method = class_getInstanceMethod(cls, selector);
+    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+
+    char returnType[16] = {};
+    char argumentType[16] = {};
+    method_getReturnType(method, returnType, sizeof(returnType));
+    method_getArgumentType(method, 2, argumentType, sizeof(argumentType));
+    if (returnType[0] != 'v' || (argumentType[0] != 'B' && argumentType[0] != 'c')) return NO;
+
+    MSHookMessageEx(cls, selector, (IMP)MRHookSetOverlayOpen,
+                    (IMP *)&MROriginalSetOverlayOpen);
+    return MROriginalSetOverlayOpen != NULL;
+}
+
 static void MRInstallSwitcherRemoveHook(void)
 {
     Class cls = NSClassFromString(@"SBMainSwitcherViewController");
@@ -859,12 +899,13 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL fullscreenInstalled = MRInstallMyrtleFullscreenHook();
     BOOL hostCoreLaunchInstalled = MRInstallMyrtleHostCoreLaunchHook();
     BOOL keyboardAvoidanceInstalled = MRInstallMyrtleKeyboardAvoidanceHook();
+    BOOL overlayOpenInstalled = MRInstallMyrtleOverlayOpenHook();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
-        keyboardAvoidanceInstalled) return;
+        keyboardAvoidanceInstalled && overlayOpenInstalled) return;
     if (attempt >= 60) {
-        MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d",
+        MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d overlay=%d",
               managerInstalled, fullscreenInstalled, hostCoreLaunchInstalled,
-              keyboardAvoidanceInstalled);
+              keyboardAvoidanceInstalled, overlayOpenInstalled);
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
