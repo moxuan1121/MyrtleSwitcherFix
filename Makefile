@@ -9,7 +9,7 @@ TWEAK_NAME = MyrtleSwitcherFix
 
 MyrtleSwitcherFix_FILES = Tweak.xm
 MyrtleSwitcherFix_CFLAGS = -fobjc-arc -Wall -Wextra
-MyrtleSwitcherFix_FRAMEWORKS = Foundation UIKit QuartzCore
+MyrtleSwitcherFix_FRAMEWORKS = Foundation UIKit
 MyrtleSwitcherFix_LIBRARIES = substrate
 
 include $(THEOS_MAKE_PATH)/tweak.mk
