@@ -1,6 +1,6 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.5.0~beta7
+Version: 0.5.0~beta6
 Architecture: iphoneos-arm64e
 Description: Spotlight keyboard diagnostic build with fixed 360pt portrait avoidance for Myrtle 1.4.1.
 Maintainer: Local
