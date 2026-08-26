@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <stdarg.h>
 #import <substrate.h>
 
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
@@ -15,7 +16,12 @@ static NSUInteger MRReturnToMainGeneration = 0;
 static NSUInteger MRMyrtleFullscreenIntentGeneration = 0;
 static NSTimeInterval MRRecentlyClosedMyrtleTime = 0;
 static const CGFloat MRFixedPortraitKeyboardHeight = 360.0;
-static const CGFloat MRKeyboardHandleGap = 12.0;
+static const CGFloat MRKeyboardHandleGap = 16.0;
+static NSString *const MRSpotlightKeyboardLogPath =
+    @"/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.spotlight.log";
+static const unsigned long long MRMaximumSpotlightLogSize = 256 * 1024;
+static __strong NSMutableArray *MRKeyboardDiagnosticTokens = nil;
+static void MRSpotlightLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 
 // Performance build: the preprocessor discards the complete call expression, so
 // diagnostic arguments are not evaluated and SpringBoard performs no log I/O.
@@ -34,6 +40,49 @@ static id MRSendClassNoArgs(NSString *className, NSString *selectorName)
     SEL selector = NSSelectorFromString(selectorName);
     if (cls == Nil || ![cls respondsToSelector:selector]) return nil;
     return ((id (*)(id, SEL))objc_msgSend)(cls, selector);
+}
+
+static id MRSharedMyrtleViewController(void)
+{
+    id window = MRSendClassNoArgs(@"MyrtleWindow", @"sharedWindow");
+    return MRSafeValue(window, @"controller");
+}
+
+static CGRect MRKeyboardFrameFromNotification(NSNotification *notification)
+{
+    if (![notification isKindOfClass:NSNotification.class]) return CGRectNull;
+    NSValue *value = notification.userInfo[UIKeyboardFrameEndUserInfoKey];
+    if (![value isKindOfClass:NSValue.class] ||
+        strcmp(value.objCType, @encode(CGRect)) != 0) return CGRectNull;
+    return value.CGRectValue;
+}
+
+static void MRLogKeyboardState(NSString *source, NSNotification *notification)
+{
+    id window = MRSendClassNoArgs(@"MyrtleWindow", @"sharedWindow");
+    id controller = MRSafeValue(window, @"controller");
+    UIView *handle = MRSafeValue(controller, @"handle");
+    UIView *hitView = MRSafeValue(controller, @"handleHitView");
+    CGRect hitScreenFrame = [hitView isKindOfClass:UIView.class]
+        ? [hitView convertRect:hitView.bounds toView:nil] : CGRectNull;
+    MRSpotlightLog(@"%@ name=%@ objectClass=%@ notification=%p frame=%@ screen=%@ "
+                   "window=%p/%@ controller=%p/%@ moved=%@ isWindowOpen=%@ willWindowOpen=%@ "
+                   "handleCenter=%@ hitCenter=%@ hitScreenFrame=%@ hitSuperview=%@",
+                   source, notification.name, NSStringFromClass([notification.object class]),
+                   notification, NSStringFromCGRect(MRKeyboardFrameFromNotification(notification)),
+                   NSStringFromCGRect(UIScreen.mainScreen.bounds), window,
+                   NSStringFromClass([window class]), controller,
+                   NSStringFromClass([controller class]),
+                   MRSafeValue(controller, @"handleWasMovedForKeyboard"),
+                   MRSafeValue(controller, @"isWindowOpen"),
+                   MRSafeValue(controller, @"willWindowOpen"),
+                   [handle isKindOfClass:UIView.class]
+                       ? NSStringFromCGPoint(handle.center) : @"<invalid>",
+                   [hitView isKindOfClass:UIView.class]
+                       ? NSStringFromCGPoint(hitView.center) : @"<invalid>",
+                   NSStringFromCGRect(hitScreenFrame),
+                   [hitView isKindOfClass:UIView.class]
+                       ? NSStringFromClass([hitView.superview class]) : @"<invalid>");
 }
 
 static id MRMainSwitcher(void)
@@ -679,7 +728,9 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
     // frame: Myrtle first intersects that frame with the handle in a different
     // view coordinate space, and a synthetic screen frame can suppress the
     // avoidance path entirely on iOS 15.
+    MRLogKeyboardState(@"MYRTLE_SHOW_ENTER", notification);
     MROriginalKeyboardWillShow(self, selector, notification);
+    MRLogKeyboardState(@"MYRTLE_SHOW_AFTER_ORIGINAL", notification);
 
     if (![notification isKindOfClass:NSNotification.class]) return;
     NSDictionary *userInfo = notification.userInfo;
@@ -714,7 +765,11 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
         // an independent overlap check, then populate Myrtle's own saved state
         // so its unchanged keyboard-hide handler restores the original center.
         CGRect movementFrameOnScreen = [movementView convertRect:movementView.bounds toView:nil];
-        if (!CGRectIntersectsRect(movementFrameOnScreen, keyboardFrame)) return;
+        BOOL intersects = CGRectIntersectsRect(movementFrameOnScreen, keyboardFrame);
+        MRSpotlightLog(@"MYRTLE_FALLBACK_CHECK intersects=%d hitScreenFrame=%@ keyboard=%@",
+                       intersects, NSStringFromCGRect(movementFrameOnScreen),
+                       NSStringFromCGRect(keyboardFrame));
+        if (!intersects) return;
 
         SEL saveSelector = NSSelectorFromString(@"setSavedHandleCenterForKeyboard:");
         SEL movedSelector = NSSelectorFromString(@"setHandleWasMovedForKeyboard:");
@@ -749,11 +804,37 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
     if (duration <= 0.0 || duration > 2.0) duration = 0.25;
     UIViewAnimationOptions options =
         (UIViewAnimationOptions)([userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue] << 16);
+    MRSpotlightLog(@"MYRTLE_APPLY oldCenter=%@ targetCenter=%@ fixedTop=%.2f convertedTop=%@ "
+                   "coordinateBounds=%@ duration=%.3f",
+                   NSStringFromCGPoint(movementView.center), NSStringFromCGPoint(fixedCenter),
+                   fixedKeyboardTop, NSStringFromCGPoint(fixedTopInView),
+                   NSStringFromCGRect(availableBounds), duration);
     [UIView animateWithDuration:duration
                           delay:0.0
                         options:options | UIViewAnimationOptionBeginFromCurrentState
                      animations:^{ movementView.center = fixedCenter; }
                      completion:nil];
+}
+
+static void MRSpotlightLog(NSString *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments];
+    va_end(arguments);
+    NSData *data = [[NSString stringWithFormat:@"%@ %@\n", NSDate.date, message]
+                    dataUsingEncoding:NSUTF8StringEncoding];
+    unsigned long long size = [[[NSFileManager defaultManager]
+                                attributesOfItemAtPath:MRSpotlightKeyboardLogPath error:nil]
+                               fileSize];
+    if (size >= MRMaximumSpotlightLogSize) return;
+    NSFileHandle *file = [NSFileHandle fileHandleForWritingAtPath:MRSpotlightKeyboardLogPath];
+    if (file == nil) [data writeToFile:MRSpotlightKeyboardLogPath atomically:YES];
+    else {
+        [file seekToEndOfFile];
+        [file writeData:data];
+        [file closeFile];
+    }
 }
 
 static BOOL MRInstallMyrtleHook(void)
@@ -811,7 +892,41 @@ static BOOL MRInstallMyrtleKeyboardAvoidanceHook(void)
 
     MSHookMessageEx(cls, selector, (IMP)MRHookKeyboardWillShow,
                     (IMP *)&MROriginalKeyboardWillShow);
+    MRSpotlightLog(@"INSTALL_MYRTLE_SHOW class=%@ selector=%@ type=%s original=%p success=%d",
+                   NSStringFromClass(cls), NSStringFromSelector(selector),
+                   method_getTypeEncoding(method), MROriginalKeyboardWillShow,
+                   MROriginalKeyboardWillShow != NULL);
     return MROriginalKeyboardWillShow != NULL;
+}
+
+static void MRInstallKeyboardDiagnosticObservers(void)
+{
+    if (MRKeyboardDiagnosticTokens != nil) return;
+    MRKeyboardDiagnosticTokens = [NSMutableArray array];
+    NSArray<NSNotificationName> *names = @[
+        UIKeyboardWillShowNotification,
+        UIKeyboardWillChangeFrameNotification,
+        UIKeyboardDidShowNotification,
+        UIKeyboardWillHideNotification,
+        UIKeyboardDidHideNotification
+    ];
+    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+    for (NSNotificationName name in names) {
+        id token = [center addObserverForName:name
+                                       object:nil
+                                        queue:NSOperationQueue.mainQueue
+                                   usingBlock:^(NSNotification *notification) {
+            MRLogKeyboardState(@"GLOBAL_IMMEDIATE", notification);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                MRLogKeyboardState(@"GLOBAL_AFTER_EVENT", notification);
+            });
+        }];
+        if (token != nil) [MRKeyboardDiagnosticTokens addObject:token];
+    }
+    MRSpotlightLog(@"INSTALL_GLOBAL_OBSERVERS count=%lu sharedController=%p/%@",
+                   (unsigned long)MRKeyboardDiagnosticTokens.count,
+                   MRSharedMyrtleViewController(),
+                   NSStringFromClass([MRSharedMyrtleViewController() class]));
 }
 
 static void MRInstallSwitcherRemoveHook(void)
@@ -888,6 +1003,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
+            MRInstallKeyboardDiagnosticObservers();
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
             MRInstallUserDeletionHook();
