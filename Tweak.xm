@@ -14,6 +14,7 @@ static NSUInteger MRDesiredFrontGeneration = 0;
 static NSUInteger MRReturnToMainGeneration = 0;
 static NSUInteger MRMyrtleFullscreenIntentGeneration = 0;
 static NSTimeInterval MRRecentlyClosedMyrtleTime = 0;
+static const CGFloat MRFixedPortraitKeyboardHeight = 360.0;
 
 // Performance build: the preprocessor discards the complete call expression, so
 // diagnostic arguments are not evaluated and SpringBoard performs no log I/O.
@@ -667,6 +668,44 @@ static void MRHookViewWillAppear(id self, SEL selector, BOOL animated)
         dispatch_async(dispatch_get_main_queue(), ^{ MRReconcilePendingFront(); });
 }
 
+typedef void (*MRKeyboardWillShowIMP)(id, SEL, NSNotification *);
+static MRKeyboardWillShowIMP MROriginalKeyboardWillShow = NULL;
+
+static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notification)
+{
+    if (![notification isKindOfClass:NSNotification.class]) {
+        MROriginalKeyboardWillShow(self, selector, notification);
+        return;
+    }
+
+    NSDictionary *userInfo = notification.userInfo;
+    NSValue *frameValue = userInfo[UIKeyboardFrameEndUserInfoKey];
+    if (![frameValue isKindOfClass:NSValue.class] ||
+        strcmp(frameValue.objCType, @encode(CGRect)) != 0) {
+        MROriginalKeyboardWillShow(self, selector, notification);
+        return;
+    }
+
+    CGRect screenBounds = UIScreen.mainScreen.bounds;
+    CGRect keyboardFrame = frameValue.CGRectValue;
+    BOOL portrait = CGRectGetHeight(screenBounds) > CGRectGetWidth(screenBounds);
+    BOOL fullWidthKeyboard = CGRectGetWidth(keyboardFrame) >= CGRectGetWidth(screenBounds) * 0.85;
+    BOOL usableFrame = CGRectGetWidth(keyboardFrame) > 0.0 && CGRectGetHeight(keyboardFrame) > 0.0;
+    if (!portrait || !fullWidthKeyboard || !usableFrame) {
+        MROriginalKeyboardWillShow(self, selector, notification);
+        return;
+    }
+
+    keyboardFrame.origin.y = CGRectGetMaxY(screenBounds) - MRFixedPortraitKeyboardHeight;
+    keyboardFrame.size.height = MRFixedPortraitKeyboardHeight;
+    NSMutableDictionary *fixedUserInfo = [userInfo mutableCopy] ?: [NSMutableDictionary dictionary];
+    fixedUserInfo[UIKeyboardFrameEndUserInfoKey] = [NSValue valueWithCGRect:keyboardFrame];
+    NSNotification *fixedNotification = [NSNotification notificationWithName:notification.name
+                                                                       object:notification.object
+                                                                     userInfo:fixedUserInfo];
+    MROriginalKeyboardWillShow(self, selector, fixedNotification);
+}
+
 static BOOL MRInstallMyrtleHook(void)
 {
     if (MROriginalSetCurrentBundle != NULL) return YES;
@@ -704,6 +743,25 @@ static BOOL MRInstallMyrtleHostCoreLaunchHook(void)
                     (IMP *)&MROriginalMyrtleHostCoreLaunch);
     MRLog(@"installed direct Myrtle HostCore launch hook");
     return MROriginalMyrtleHostCoreLaunch != NULL;
+}
+
+static BOOL MRInstallMyrtleKeyboardAvoidanceHook(void)
+{
+    if (MROriginalKeyboardWillShow != NULL) return YES;
+    Class cls = NSClassFromString(@"MyrtleViewController");
+    SEL selector = NSSelectorFromString(@"MT_IIlIllIllIIIIlllllII:");
+    Method method = class_getInstanceMethod(cls, selector);
+    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+
+    char returnType[16] = {};
+    char argumentType[16] = {};
+    method_getReturnType(method, returnType, sizeof(returnType));
+    method_getArgumentType(method, 2, argumentType, sizeof(argumentType));
+    if (returnType[0] != 'v' || argumentType[0] != '@') return NO;
+
+    MSHookMessageEx(cls, selector, (IMP)MRHookKeyboardWillShow,
+                    (IMP *)&MROriginalKeyboardWillShow);
+    return MROriginalKeyboardWillShow != NULL;
 }
 
 static void MRInstallSwitcherRemoveHook(void)
@@ -763,10 +821,13 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL managerInstalled = MRInstallMyrtleHook();
     BOOL fullscreenInstalled = MRInstallMyrtleFullscreenHook();
     BOOL hostCoreLaunchInstalled = MRInstallMyrtleHostCoreLaunchHook();
-    if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled) return;
+    BOOL keyboardAvoidanceInstalled = MRInstallMyrtleKeyboardAvoidanceHook();
+    if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
+        keyboardAvoidanceInstalled) return;
     if (attempt >= 60) {
-        MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d",
-              managerInstalled, fullscreenInstalled, hostCoreLaunchInstalled);
+        MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d",
+              managerInstalled, fullscreenInstalled, hostCoreLaunchInstalled,
+              keyboardAvoidanceInstalled);
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
