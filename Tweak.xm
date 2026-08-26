@@ -118,11 +118,7 @@ static void MRLogKeyboardVisualState(NSString *source)
                        ? NSStringFromCGPoint(secondary.center) : @"<invalid>",
                    NSStringFromCGRect(secondaryScreenFrame));
 
-    NSMutableArray<UIWindow *> *windows = [NSMutableArray array];
-    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if ([scene isKindOfClass:UIWindowScene.class])
-            [windows addObjectsFromArray:((UIWindowScene *)scene).windows];
-    }
+    NSArray<UIWindow *> *windows = UIApplication.sharedApplication.windows;
     [windows enumerateObjectsUsingBlock:^(UIWindow *candidate, NSUInteger index, BOOL *stop) {
         (void)stop;
         MRSpotlightLog(@"%@ WINDOW[%lu] ptr=%p class=%@ level=%.3f hidden=%d alpha=%.3f "
