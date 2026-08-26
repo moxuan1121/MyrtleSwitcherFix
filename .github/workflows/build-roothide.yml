@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - main
+      - performance/no-logging
+      - feature/fixed-keyboard-avoidance
     paths:
       - "Makefile"
       - "control"
@@ -62,7 +64,7 @@ jobs:
         shell: bash
         run: echo "THEOS=$GITHUB_WORKSPACE/theos" >> "$GITHUB_ENV"
 
-      - name: Build diagnostic package
+      - name: Build package
         shell: bash
         run: |
           set -euo pipefail
@@ -114,6 +116,26 @@ jobs:
           if [[ "$macho_info" != *"arm64e"* ]]; then
             echo "Wrong Mach-O architecture; expected native arm64e for A15 SpringBoard" >&2
             exit 1
+          fi
+
+          # Every published branch is log-free. MRLog is a preprocessing no-op,
+          # so neither the old file path nor representative diagnostic format
+          # strings may survive in the optimized SpringBoard dylib.
+          if strings "$dylib" | grep -Eq \
+             'com\.(local|moxuan)\.myrtleswitcherfix.*\.log|desired front generation=|installed direct Myrtle'; then
+            echo "Diagnostic logging material survived in the production dylib" >&2
+            exit 1
+          fi
+
+          if [[ "$GITHUB_REF" == "refs/heads/performance/no-logging" ]]; then
+            if strings "$dylib" | grep -q 'com.moxuan.myrtleswitcherfix.log'; then
+              echo "Performance build still contains the diagnostic log path" >&2
+              exit 1
+            fi
+            if [[ "$(dpkg-deb -f "$package" Version)" != "0.4.4.1" ]]; then
+              echo "Unexpected performance package version" >&2
+              exit 1
+            fi
           fi
 
           # New-ABI arm64e uses CPU_SUBTYPE_ARM64E with the capability bit set:
