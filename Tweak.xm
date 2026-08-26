@@ -2,12 +2,9 @@
 #import <UIKit/UIKit.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
-#import <stdarg.h>
 #import <substrate.h>
 
-static NSString *const MRLogPath = @"/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.log";
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
-static const unsigned long long MRMaximumLogSize = 1024 * 1024;
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
 static __strong NSString *MRUnderlyingMainBundleID = nil;
 static __strong NSString *MRMyrtleFullscreenIntentBundleID = nil;
@@ -17,35 +14,12 @@ static NSUInteger MRDesiredFrontGeneration = 0;
 static NSUInteger MRReturnToMainGeneration = 0;
 static NSUInteger MRMyrtleFullscreenIntentGeneration = 0;
 static NSTimeInterval MRRecentlyClosedMyrtleTime = 0;
+static const CGFloat MRFixedPortraitKeyboardHeight = 360.0;
+static const CGFloat MRKeyboardHandleGap = 18.0;
 
-static void MRLog(NSString *format, ...)
-{
-    va_list arguments;
-    va_start(arguments, format);
-    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments];
-    va_end(arguments);
-    NSData *data = [[NSString stringWithFormat:@"%@ %@\n", NSDate.date, message]
-                    dataUsingEncoding:NSUTF8StringEncoding];
-    unsigned long long size = [[[NSFileManager defaultManager]
-                                attributesOfItemAtPath:MRLogPath error:nil]
-                               fileSize];
-    if (size >= MRMaximumLogSize) {
-        NSData *rotated = [[NSString stringWithFormat:
-                            @"%@ log reset after reaching 1 MiB\n%@",
-                            NSDate.date, [[NSString alloc] initWithData:data
-                                                               encoding:NSUTF8StringEncoding]]
-                           dataUsingEncoding:NSUTF8StringEncoding];
-        [rotated writeToFile:MRLogPath atomically:YES];
-        return;
-    }
-    NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:MRLogPath];
-    if (handle == nil) [data writeToFile:MRLogPath atomically:YES];
-    else {
-        [handle seekToEndOfFile];
-        [handle writeData:data];
-        [handle closeFile];
-    }
-}
+// Stable builds discard the complete diagnostic expression at preprocessing
+// time: no arguments, strings, filesystem access or log I/O reach SpringBoard.
+#define MRLog(...) do {} while (0)
 
 static id MRSafeValue(id object, NSString *key)
 {
@@ -139,19 +113,6 @@ static BOOL MRHasInstanceMethod(Class cls, NSString *name, unsigned int argument
     return method != NULL && method_getNumberOfArguments(method) == argumentCount;
 }
 
-static void MRLogSwitcherCapabilities(id switcher)
-{
-    Class cls = [switcher class];
-    NSArray *layouts = MRRecentAppLayouts(switcher);
-    MRLog(@"switcher=%@ class=%@ layouts=%lu recent=%d promote=%d addDisplay=%d remove=%d changed=%d",
-          switcher, NSStringFromClass(cls), (unsigned long)layouts.count,
-          MRHasInstanceMethod(cls, @"recentAppLayouts", 2),
-          MRHasInstanceMethod(cls, @"_addAppLayoutToFront:", 3),
-          MRHasInstanceMethod(cls, @"addAppLayoutForDisplayItem:completion:", 4),
-          MRHasInstanceMethod(cls, @"_removeAppLayout:forReason:", 4),
-          MRHasInstanceMethod(cls, @"_switcherModelChanged:", 3));
-}
-
 static NSUInteger MREnqueueDesiredFront(NSString *bundleID)
 {
     if (bundleID.length == 0) return MRDesiredFrontGeneration;
@@ -172,20 +133,7 @@ static void MRRemoveDesiredFront(NSString *bundleID)
     MRLog(@"removed %@ from desired order remaining=%@", bundleID, MRDesiredFrontOrder);
 }
 
-static void MRVerifySwitcherResult(NSString *bundleID, NSString *action)
-{
-    id switcher = MRMainSwitcher();
-    NSArray *layouts = MRRecentAppLayouts(switcher);
-    NSUInteger index = NSNotFound;
-    id layout = MRLayoutForBundleIdentifier(layouts, bundleID, &index);
-    MRLog(@"verify %@ action=%@ found=%d index=%@ count=%lu layoutClass=%@",
-          bundleID, action, layout != nil,
-          index == NSNotFound ? @"NSNotFound" : [NSString stringWithFormat:@"%lu", (unsigned long)index],
-          (unsigned long)layouts.count,
-          layout == nil ? @"(null)" : NSStringFromClass([layout class]));
-}
-
-static BOOL MRReconcilePendingFront(NSString *trigger)
+static BOOL MRReconcilePendingFront(void)
 {
     if (MRReconcilingFront || MRDesiredFrontOrder.count == 0) return NO;
     NSArray<NSString *> *desired = [MRDesiredFrontOrder copy];
@@ -220,19 +168,13 @@ static BOOL MRReconcilePendingFront(NSString *trigger)
         MRReconcilingFront = YES;
         for (NSUInteger index = 0; index < resolvedLayouts.count; index++) {
             ((void (*)(id, SEL, id))objc_msgSend)(switcher, selector, resolvedLayouts[index]);
-            MRLog(@"reconcile promoted %@ trigger=%@", resolvedIDs[index], trigger);
         }
         MRReconcilingFront = NO;
     }
 
     NSArray *updatedLayouts = MRRecentAppLayouts(switcher);
-    NSMutableArray<NSString *> *actualFront = [NSMutableArray array];
-    for (NSUInteger index = 0; index < MIN(updatedLayouts.count, expectedFront.count); index++) {
-        NSString *bundleID = MRBundleIdentifierFromLayout(updatedLayouts[index]);
-        [actualFront addObject:bundleID ?: @"(unknown)"];
-    }
     BOOL allMaterialized = resolvedIDs.count == desired.count;
-    BOOL verified = allMaterialized && actualFront.count == expectedFront.count;
+    BOOL verified = allMaterialized && updatedLayouts.count >= expectedFront.count;
     if (verified) {
         for (NSUInteger index = 0; index < expectedFront.count; index++) {
             if (!MRLayoutContainsBundleIdentifier(updatedLayouts[index], expectedFront[index])) {
@@ -241,9 +183,6 @@ static BOOL MRReconcilePendingFront(NSString *trigger)
             }
         }
     }
-    MRLog(@"reconcile trigger=%@ desired=%@ resolved=%@ expectedFront=%@ actualFront=%@ all=%d verified=%d count=%lu",
-          trigger, desired, resolvedIDs, expectedFront, actualFront,
-          allMaterialized, verified, (unsigned long)updatedLayouts.count);
     return verified;
 }
 
@@ -252,23 +191,16 @@ static void MRScheduleFrontReconciliation(NSUInteger generation)
     NSArray<NSNumber *> *delays = @[@0.75, @1.5, @3.0, @6.0, @10.0];
     for (NSNumber *delay in delays) {
         BOOL finalAttempt = delay.doubleValue == 10.0;
-        NSString *trigger = [NSString stringWithFormat:@"batch-%lu-%.2fs",
-                             (unsigned long)generation, delay.doubleValue];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                      (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (generation != MRDesiredFrontGeneration) {
-                MRLog(@"skip stale reconciliation %@ currentGeneration=%lu",
-                      trigger, (unsigned long)MRDesiredFrontGeneration);
                 return;
             }
-            BOOL verified = MRReconcilePendingFront(trigger);
+            MRReconcilePendingFront();
             if (finalAttempt && generation == MRDesiredFrontGeneration) {
-                NSArray *expired = [MRDesiredFrontOrder copy];
                 [MRDesiredFrontOrder removeAllObjects];
                 MRDesiredFrontGeneration++;
-                MRLog(@"finished reconciliation generation=%lu verified=%d cleared=%@",
-                      (unsigned long)generation, verified, expired);
             }
         });
     }
@@ -281,16 +213,14 @@ static id MRMyrtleSceneForApplication(id application)
     Method method = class_getClassMethod(cls, selector);
     if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 3) return nil;
     @try { return ((id (*)(id, SEL, id))objc_msgSend)(cls, selector, application); }
-    @catch (NSException *exception) {
-        MRLog(@"Myrtle scene lookup exception for %@: %@", application, exception);
+    @catch (__unused NSException *exception) {
         return nil;
     }
 }
 
-static NSString *MRSceneIdentifier(id application, id *sceneOut)
+static NSString *MRSceneIdentifier(id application)
 {
     id scene = MRMyrtleSceneForApplication(application);
-    if (sceneOut != NULL) *sceneOut = scene;
     id identifier = MRSafeValue(scene, @"identifier");
     if (![identifier isKindOfClass:NSString.class] || [identifier length] == 0)
         identifier = MRSafeValue(application, @"_baseSceneIdentifier");
@@ -299,8 +229,7 @@ static NSString *MRSceneIdentifier(id application, id *sceneOut)
 
 static BOOL MRAddProductionDisplayItem(id switcher, id application, NSString *bundleID)
 {
-    id scene = nil;
-    NSString *sceneIdentifier = MRSceneIdentifier(application, &scene);
+    NSString *sceneIdentifier = MRSceneIdentifier(application);
     if (sceneIdentifier.length == 0) {
         MRLog(@"refusing production add %@ because no real scene identifier was found; scene=%@",
               bundleID, scene);
@@ -327,7 +256,7 @@ static BOOL MRAddProductionDisplayItem(id switcher, id application, NSString *bu
     dispatch_block_t completion = ^{
         dispatch_async(dispatch_get_main_queue(), ^{
             MRLog(@"production add completion %@ sceneID=%@", bundleID, sceneIdentifier);
-            MRReconcilePendingFront(@"add-completion");
+            MRReconcilePendingFront();
         });
     };
     ((void (*)(id, SEL, id, id))objc_msgSend)(switcher, addSelector, displayItem, completion);
@@ -355,9 +284,9 @@ static NSString *MRCurrentMainApplicationBundleID(void)
     return MRDirectBundleIdentifier(application);
 }
 
-static BOOL MRPromoteExistingCard(NSString *bundleID, NSString *trigger)
+static void MRPromoteExistingCard(NSString *bundleID)
 {
-    if (bundleID.length == 0) return NO;
+    if (bundleID.length == 0) return;
     id switcher = MRMainSwitcher();
     NSArray *layouts = MRRecentAppLayouts(switcher);
     NSUInteger index = NSNotFound;
@@ -365,23 +294,15 @@ static BOOL MRPromoteExistingCard(NSString *bundleID, NSString *trigger)
     if (layout == nil) {
         MRLog(@"return-to-main %@ trigger=%@ layout-not-found count=%lu",
               bundleID, trigger, (unsigned long)layouts.count);
-        return NO;
+        return;
     }
     if (index != 0) {
         SEL selector = NSSelectorFromString(@"_addAppLayoutToFront:");
-        if (![switcher respondsToSelector:selector]) return NO;
+        if (![switcher respondsToSelector:selector]) return;
         ((void (*)(id, SEL, id))objc_msgSend)(switcher, selector, layout);
         MRLog(@"return-to-main promoted %@ trigger=%@ oldIndex=%lu",
               bundleID, trigger, (unsigned long)index);
     }
-    NSArray *updated = MRRecentAppLayouts(switcher);
-    NSUInteger updatedIndex = NSNotFound;
-    id updatedLayout = MRLayoutForBundleIdentifier(updated, bundleID, &updatedIndex);
-    MRLog(@"return-to-main verify %@ trigger=%@ found=%d index=%@ count=%lu",
-          bundleID, trigger, updatedLayout != nil,
-          updatedIndex == NSNotFound ? @"NSNotFound" : [NSString stringWithFormat:@"%lu", (unsigned long)updatedIndex],
-          (unsigned long)updated.count);
-    return updatedLayout != nil && updatedIndex == 0;
 }
 
 static void MRScheduleReturnToMainPromotion(NSString *bundleID, NSUInteger generation)
@@ -393,7 +314,6 @@ static void MRScheduleReturnToMainPromotion(NSString *bundleID, NSUInteger gener
     // far faster than the system's native recency update.
     NSArray<NSNumber *> *delays = @[@0.08, @0.2, @0.5, @1.0];
     for (NSNumber *delay in delays) {
-        NSString *trigger = [NSString stringWithFormat:@"close-%.2fs", delay.doubleValue];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                      (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
@@ -409,7 +329,7 @@ static void MRScheduleReturnToMainPromotion(NSString *bundleID, NSUInteger gener
                 MRLog(@"skip return-to-main %@ because Myrtle now hosts %@", trigger, current);
                 return;
             }
-            MRPromoteExistingCard(bundleID, trigger);
+            MRPromoteExistingCard(bundleID);
         });
     }
 }
@@ -419,7 +339,6 @@ static void MRScheduleFullscreenPromotion(NSString *bundleID, NSUInteger generat
     if (bundleID.length == 0) return;
     NSArray<NSNumber *> *delays = @[@0.0, @0.15, @0.5];
     for (NSNumber *delay in delays) {
-        NSString *trigger = [NSString stringWithFormat:@"fullscreen-%.2fs", delay.doubleValue];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                      (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
@@ -436,7 +355,7 @@ static void MRScheduleFullscreenPromotion(NSString *bundleID, NSUInteger generat
                       trigger, current);
                 return;
             }
-            MRPromoteExistingCard(bundleID, trigger);
+            MRPromoteExistingCard(bundleID);
         });
     }
 }
@@ -457,13 +376,8 @@ static BOOL MRPromoteOrInsertSwitcherCard(NSString *bundleID)
         return NO;
     }
 
-    static dispatch_once_t capabilityOnce;
-    dispatch_once(&capabilityOnce, ^{ MRLogSwitcherCapabilities(switcher); });
-
     NSArray *layouts = MRRecentAppLayouts(switcher);
-    NSUInteger oldIndex = NSNotFound;
-    id existing = MRLayoutForBundleIdentifier(layouts, bundleID, &oldIndex);
-    NSString *action = nil;
+    id existing = MRLayoutForBundleIdentifier(layouts, bundleID, NULL);
     NSUInteger generation = MREnqueueDesiredFront(bundleID);
     MRScheduleFrontReconciliation(generation);
 
@@ -476,7 +390,6 @@ static BOOL MRPromoteOrInsertSwitcherCard(NSString *bundleID)
             return NO;
         }
         ((void (*)(id, SEL, id))objc_msgSend)(switcher, promoteSelector, existing);
-        action = @"promote-existing";
         MRLog(@"sent promote %@ oldIndex=%lu layoutClass=%@", bundleID,
               (unsigned long)oldIndex, NSStringFromClass([existing class]));
     } else {
@@ -484,12 +397,6 @@ static BOOL MRPromoteOrInsertSwitcherCard(NSString *bundleID)
             MRRemoveDesiredFront(bundleID);
             return NO;
         }
-        action = @"add-production-display-item";
-    }
-
-    if ([action isEqualToString:@"promote-existing"]) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ MRVerifySwitcherResult(bundleID, action); });
     }
     return YES;
 }
@@ -614,7 +521,7 @@ static MRMyrtleFullscreenIMP MROriginalMyrtleFullscreen = NULL;
 typedef void (*MRMyrtleHostCoreLaunchIMP)(id, SEL, NSString *);
 static MRMyrtleHostCoreLaunchIMP MROriginalMyrtleHostCoreLaunch = NULL;
 
-static void MRRecordMyrtleFullscreenIntent(NSString *bundleID, NSString *source)
+static void MRRecordMyrtleFullscreenIntent(NSString *bundleID)
 {
     if (bundleID.length == 0) return;
     NSUInteger intentGeneration = ++MRMyrtleFullscreenIntentGeneration;
@@ -644,7 +551,7 @@ static void MRHookMyrtleFullscreen(id self, SEL selector)
         bundleID = [MRSafeValue(manager, @"currentBundleID") copy];
     }
 
-    MRRecordMyrtleFullscreenIntent(bundleID, @"view-controller");
+    MRRecordMyrtleFullscreenIntent(bundleID);
     MROriginalMyrtleFullscreen(self, selector);
 }
 
@@ -658,7 +565,7 @@ static void MRHookMyrtleHostCoreLaunch(id self, SEL selector, NSString *bundleID
 
     if (stableBundleID.length != 0 &&
         [currentBundleID isEqualToString:stableBundleID]) {
-        MRRecordMyrtleFullscreenIntent(stableBundleID, @"host-core-current");
+        MRRecordMyrtleFullscreenIntent(stableBundleID);
     } else if (stableBundleID.length != 0 &&
                [MRRecentlyClosedMyrtleBundleID isEqualToString:stableBundleID] &&
                MRRecentlyClosedMyrtleTime > 0 && sinceClose >= 0 && sinceClose <= 0.75) {
@@ -748,19 +655,202 @@ static void MRHookModelChanged(id self, SEL selector, id model)
             // publishes the new current app layout before Myrtle clears its
             // currentBundleID, which is a reliable distinction from a normal
             // close back to the underlying app.
-            MRRecordMyrtleFullscreenIntent(myrtleBundleID,
-                                           @"switcher-current-layout");
+            MRRecordMyrtleFullscreenIntent(myrtleBundleID);
         }
     }
     if (MRDesiredFrontOrder.count != 0 && !MRReconcilingFront)
-        dispatch_async(dispatch_get_main_queue(), ^{ MRReconcilePendingFront(@"model-changed"); });
+        dispatch_async(dispatch_get_main_queue(), ^{ MRReconcilePendingFront(); });
 }
 
 static void MRHookViewWillAppear(id self, SEL selector, BOOL animated)
 {
     MROriginalViewWillAppear(self, selector, animated);
     if (MRDesiredFrontOrder.count != 0)
-        dispatch_async(dispatch_get_main_queue(), ^{ MRReconcilePendingFront(@"view-will-appear"); });
+        dispatch_async(dispatch_get_main_queue(), ^{ MRReconcilePendingFront(); });
+}
+
+typedef void (*MRKeyboardWillShowIMP)(id, SEL, NSNotification *);
+static MRKeyboardWillShowIMP MROriginalKeyboardWillShow = NULL;
+typedef void (*MRKeyboardWillHideIMP)(id, SEL, NSNotification *);
+static MRKeyboardWillHideIMP MROriginalKeyboardWillHide = NULL;
+typedef void (*MROpenSelectorAtPointIMP)(id, SEL, CGPoint);
+static MROpenSelectorAtPointIMP MROriginalOpenSelectorAtPoint = NULL;
+static const void *MRPinnedHandleControllerKey = &MRPinnedHandleControllerKey;
+static const void *MRPinnedHandleInstalledKey = &MRPinnedHandleInstalledKey;
+static const void *MRPinnedHandleBypassKey = &MRPinnedHandleBypassKey;
+
+static BOOL MRFixedKeyboardHandleCenter(id controller, UIView *movementView,
+                                        CGPoint proposedCenter, CGPoint *fixedCenter)
+{
+    CGRect screenBounds = UIScreen.mainScreen.bounds;
+    BOOL portrait = CGRectGetHeight(screenBounds) > CGRectGetWidth(screenBounds);
+    if (!portrait) return NO;
+
+    // Apply the fixed height only after Myrtle itself accepted an in-app
+    // keyboard notification and saved the original handle position.  System
+    // surfaces that Myrtle rejects are deliberately left completely untouched.
+    NSNumber *movedValue = MRSafeValue(controller, @"handleWasMovedForKeyboard");
+    if (![movedValue respondsToSelector:@selector(boolValue)] || !movedValue.boolValue) return NO;
+
+    UIView *handle = MRSafeValue(controller, @"handle");
+    if (![handle isKindOfClass:UIView.class]) return NO;
+    // Myrtle uses `handle` only to measure the visible grip.  The object whose
+    // center it saves, animates and restores is the outer `handleHitView`.
+    // Moving the inner handle merely shifts it inside a 37x120 hit container
+    // and does not relocate the control on screen.
+    if (![movementView isKindOfClass:UIView.class]) return NO;
+    UIView *coordinateView = movementView.superview ?: MRSafeValue(controller, @"view");
+    if (![coordinateView isKindOfClass:UIView.class]) return NO;
+
+    // Convert the fixed screen-space keyboard top into the handle's actual
+    // superview.  Keeping Myrtle's real notification above means this step no
+    // longer participates in its CGRectIntersectsRect gate.
+    CGFloat fixedKeyboardTop = CGRectGetMaxY(screenBounds) - MRFixedPortraitKeyboardHeight;
+    CGPoint fixedTopInView = [coordinateView convertPoint:CGPointMake(CGRectGetMidX(screenBounds),
+                                                                      fixedKeyboardTop)
+                                                  fromView:nil];
+    CGFloat halfHandleHeight = CGRectGetHeight(handle.bounds) * 0.5;
+    CGFloat targetY = fixedTopInView.y - halfHandleHeight - MRKeyboardHandleGap;
+
+    CGRect availableBounds = coordinateView.bounds;
+    UIEdgeInsets safeInsets = coordinateView.safeAreaInsets;
+    CGFloat minimumY = CGRectGetMinY(availableBounds) + safeInsets.top +
+                       halfHandleHeight + MRKeyboardHandleGap;
+    CGFloat maximumY = CGRectGetMaxY(availableBounds) - safeInsets.bottom -
+                       halfHandleHeight - MRKeyboardHandleGap;
+    if (maximumY >= minimumY)
+        targetY = MIN(MAX(targetY, minimumY), maximumY);
+
+    proposedCenter.y = targetY;
+    if (fixedCenter != NULL) *fixedCenter = proposedCenter;
+    return YES;
+}
+
+static void MRPinnedHandleSetCenter(id view, SEL selector, CGPoint proposedCenter)
+{
+    id controller = objc_getAssociatedObject(view, MRPinnedHandleControllerKey);
+    NSNumber *bypass = objc_getAssociatedObject(view, MRPinnedHandleBypassKey);
+    CGPoint effectiveCenter = proposedCenter;
+    if (!bypass.boolValue)
+        MRFixedKeyboardHandleCenter(controller, view, proposedCenter, &effectiveCenter);
+
+    // The generated subclass is installed directly above the handle's original
+    // UIKit class, so forwarding here preserves every original animation.  We
+    // change only the model-layer Y destination while the keyboard is active.
+    Class originalClass = class_getSuperclass(object_getClass(view));
+    IMP implementation = class_getMethodImplementation(originalClass, selector);
+    ((void (*)(id, SEL, CGPoint))implementation)(view, selector, effectiveCenter);
+}
+
+static BOOL MRInstallPinnedHandleCenterGuard(id controller)
+{
+    UIView *movementView = MRSafeValue(controller, @"handleHitView");
+    if (![movementView isKindOfClass:UIView.class]) return NO;
+
+    objc_setAssociatedObject(movementView, MRPinnedHandleControllerKey, controller,
+                             OBJC_ASSOCIATION_ASSIGN);
+    if ([objc_getAssociatedObject(movementView, MRPinnedHandleInstalledKey) boolValue])
+        return YES;
+
+    Class originalClass = object_getClass(movementView);
+    NSString *subclassName = [NSString stringWithFormat:@"MRMyrtleKeyboardPinned_%s",
+                                                        class_getName(originalClass)];
+    Class subclass = NSClassFromString(subclassName);
+    if (subclass == Nil) {
+        subclass = objc_allocateClassPair(originalClass, subclassName.UTF8String, 0);
+        if (subclass == Nil) return NO;
+
+        Method method = class_getInstanceMethod(originalClass, @selector(setCenter:));
+        if (method == NULL) {
+            objc_disposeClassPair(subclass);
+            return NO;
+        }
+        const char *types = method_getTypeEncoding(method);
+        if (!class_addMethod(subclass, @selector(setCenter:),
+                             (IMP)MRPinnedHandleSetCenter, types)) {
+            objc_disposeClassPair(subclass);
+            return NO;
+        }
+        objc_registerClassPair(subclass);
+    }
+
+    object_setClass(movementView, subclass);
+    objc_setAssociatedObject(movementView, MRPinnedHandleInstalledKey, @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return YES;
+}
+
+static BOOL MRApplyFixedKeyboardHandlePosition(id controller, NSDictionary *animationInfo)
+{
+    UIView *movementView = MRSafeValue(controller, @"handleHitView");
+    if (![movementView isKindOfClass:UIView.class]) return NO;
+    CGPoint targetCenter;
+    if (!MRFixedKeyboardHandleCenter(controller, movementView,
+                                     movementView.center, &targetCenter)) return NO;
+
+    NSTimeInterval duration = [animationInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
+    if (duration <= 0.0 || duration > 2.0) duration = 0.25;
+    NSNumber *curveValue = animationInfo[UIKeyboardAnimationCurveUserInfoKey];
+    UIViewAnimationOptions options = curveValue != nil
+        ? (UIViewAnimationOptions)(curveValue.integerValue << 16)
+        : UIViewAnimationOptionCurveEaseInOut;
+    [UIView animateWithDuration:duration
+                          delay:0.0
+                        options:options | UIViewAnimationOptionBeginFromCurrentState
+                     animations:^{ movementView.center = targetCenter; }
+                     completion:nil];
+    return YES;
+}
+
+static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notification)
+{
+    // Preserve Myrtle's own eligibility checks, saved-center bookkeeping and
+    // hide-time restoration.  In particular, do not replace the notification
+    // frame: Myrtle first intersects that frame with the handle in a different
+    // view coordinate space, and a synthetic screen frame can suppress the
+    // avoidance path entirely on iOS 15.
+    MROriginalKeyboardWillShow(self, selector, notification);
+
+    if (![notification isKindOfClass:NSNotification.class]) return;
+    NSDictionary *userInfo = notification.userInfo;
+    NSValue *frameValue = userInfo[UIKeyboardFrameEndUserInfoKey];
+    if (![frameValue isKindOfClass:NSValue.class] ||
+        strcmp(frameValue.objCType, @encode(CGRect)) != 0) return;
+    CGRect keyboardFrame = frameValue.CGRectValue;
+    if (CGRectGetWidth(keyboardFrame) <= 0.0 || CGRectGetHeight(keyboardFrame) <= 0.0) return;
+    MRInstallPinnedHandleCenterGuard(self);
+    MRApplyFixedKeyboardHandlePosition(self, userInfo);
+}
+
+static void MRHookKeyboardWillHide(id self, SEL selector, NSNotification *notification)
+{
+    UIView *movementView = MRSafeValue(self, @"handleHitView");
+    BOOL guarded = [movementView isKindOfClass:UIView.class] &&
+        [objc_getAssociatedObject(movementView, MRPinnedHandleInstalledKey) boolValue];
+    if (guarded)
+        objc_setAssociatedObject(movementView, MRPinnedHandleBypassKey, @YES,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    @try {
+        MROriginalKeyboardWillHide(self, selector, notification);
+    } @finally {
+        if (guarded)
+            objc_setAssociatedObject(movementView, MRPinnedHandleBypassKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+static void MRHookOpenSelectorAtPoint(id self, SEL selector, CGPoint centerPoint)
+{
+    // This is Myrtle's selector-construction method.  Its CGPoint becomes the
+    // radial menu's center before `setIsOverlayOpen:YES`.  Correct both the
+    // live handle model and the incoming center before Myrtle creates/layouts
+    // the selector, keeping the grip and radial items in one coordinate system.
+    MRInstallPinnedHandleCenterGuard(self);
+    if (MRApplyFixedKeyboardHandlePosition(self, nil)) {
+        UIView *movementView = MRSafeValue(self, @"handleHitView");
+        if ([movementView isKindOfClass:UIView.class]) centerPoint.y = movementView.center.y;
+    }
+    MROriginalOpenSelectorAtPoint(self, selector, centerPoint);
 }
 
 static BOOL MRInstallMyrtleHook(void)
@@ -800,6 +890,59 @@ static BOOL MRInstallMyrtleHostCoreLaunchHook(void)
                     (IMP *)&MROriginalMyrtleHostCoreLaunch);
     MRLog(@"installed direct Myrtle HostCore launch hook");
     return MROriginalMyrtleHostCoreLaunch != NULL;
+}
+
+static BOOL MRInstallMyrtleKeyboardAvoidanceHook(void)
+{
+    Class cls = NSClassFromString(@"MyrtleViewController");
+    if (cls == Nil) return NO;
+
+    if (MROriginalKeyboardWillShow == NULL) {
+        SEL showSelector = NSSelectorFromString(@"MT_IIlIllIllIIIIlllllII:");
+        Method showMethod = class_getInstanceMethod(cls, showSelector);
+        if (showMethod == NULL || method_getNumberOfArguments(showMethod) != 3) return NO;
+        char returnType[16] = {};
+        char argumentType[16] = {};
+        method_getReturnType(showMethod, returnType, sizeof(returnType));
+        method_getArgumentType(showMethod, 2, argumentType, sizeof(argumentType));
+        if (returnType[0] != 'v' || argumentType[0] != '@') return NO;
+        MSHookMessageEx(cls, showSelector, (IMP)MRHookKeyboardWillShow,
+                        (IMP *)&MROriginalKeyboardWillShow);
+    }
+
+    if (MROriginalKeyboardWillHide == NULL) {
+        SEL hideSelector = NSSelectorFromString(@"MT_lIIlIlIIIIlIIlIlllIl:");
+        Method hideMethod = class_getInstanceMethod(cls, hideSelector);
+        if (hideMethod == NULL || method_getNumberOfArguments(hideMethod) != 3) return NO;
+        char returnType[16] = {};
+        char argumentType[16] = {};
+        method_getReturnType(hideMethod, returnType, sizeof(returnType));
+        method_getArgumentType(hideMethod, 2, argumentType, sizeof(argumentType));
+        if (returnType[0] != 'v' || argumentType[0] != '@') return NO;
+        MSHookMessageEx(cls, hideSelector, (IMP)MRHookKeyboardWillHide,
+                        (IMP *)&MROriginalKeyboardWillHide);
+    }
+
+    return MROriginalKeyboardWillShow != NULL && MROriginalKeyboardWillHide != NULL;
+}
+
+static BOOL MRInstallMyrtleSelectorCenterHook(void)
+{
+    if (MROriginalOpenSelectorAtPoint != NULL) return YES;
+    Class cls = NSClassFromString(@"MyrtleViewController");
+    SEL selector = NSSelectorFromString(@"MT_IIllIlllIIIIllIIIlII:");
+    Method method = class_getInstanceMethod(cls, selector);
+    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+
+    char returnType[16] = {};
+    char argumentType[16] = {};
+    method_getReturnType(method, returnType, sizeof(returnType));
+    method_getArgumentType(method, 2, argumentType, sizeof(argumentType));
+    if (returnType[0] != 'v' || argumentType[0] != '{') return NO;
+
+    MSHookMessageEx(cls, selector, (IMP)MRHookOpenSelectorAtPoint,
+                    (IMP *)&MROriginalOpenSelectorAtPoint);
+    return MROriginalOpenSelectorAtPoint != NULL;
 }
 
 static void MRInstallSwitcherRemoveHook(void)
@@ -859,10 +1002,14 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL managerInstalled = MRInstallMyrtleHook();
     BOOL fullscreenInstalled = MRInstallMyrtleFullscreenHook();
     BOOL hostCoreLaunchInstalled = MRInstallMyrtleHostCoreLaunchHook();
-    if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled) return;
+    BOOL keyboardAvoidanceInstalled = MRInstallMyrtleKeyboardAvoidanceHook();
+    BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
+    if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
+        keyboardAvoidanceInstalled && selectorCenterInstalled) return;
     if (attempt >= 60) {
-        MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d",
-              managerInstalled, fullscreenInstalled, hostCoreLaunchInstalled);
+        MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d selectorCenter=%d",
+              managerInstalled, fullscreenInstalled, hostCoreLaunchInstalled,
+              keyboardAvoidanceInstalled, selectorCenterInstalled);
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
@@ -873,12 +1020,9 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
-            MRLog(@"MyrtleSwitcherFix 0.4.4 immediate quick-close card registration loaded");
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
             MRInstallUserDeletionHook();
-            id existingSwitcher = MRSendClassNoArgs(@"SBMainSwitcherViewController", @"sharedInstanceIfExists");
-            if (existingSwitcher != nil) MRLogSwitcherCapabilities(existingSwitcher);
             MRInstallMyrtleWhenReady(0);
         });
     }
