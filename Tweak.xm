@@ -702,7 +702,13 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
 
     UIView *handle = MRSafeValue(self, @"handle");
     if (![handle isKindOfClass:UIView.class]) return;
-    UIView *coordinateView = handle.superview ?: MRSafeValue(self, @"view");
+    // Myrtle uses `handle` only to measure the visible grip.  The object whose
+    // center it saves, animates and restores is the outer `handleHitView`.
+    // Moving the inner handle merely shifts it inside a 37x120 hit container
+    // and does not relocate the control on screen.
+    UIView *movementView = MRSafeValue(self, @"handleHitView");
+    if (![movementView isKindOfClass:UIView.class]) return;
+    UIView *coordinateView = movementView.superview ?: MRSafeValue(self, @"view");
     if (![coordinateView isKindOfClass:UIView.class]) return;
 
     // Convert the fixed screen-space keyboard top into the handle's actual
@@ -722,7 +728,7 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
     if (maximumY >= minimumY)
         targetY = MIN(MAX(targetY, minimumY), maximumY);
 
-    CGPoint fixedCenter = handle.center;
+    CGPoint fixedCenter = movementView.center;
     fixedCenter.y = targetY;
     NSTimeInterval duration = [userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
     if (duration <= 0.0 || duration > 2.0) duration = 0.25;
@@ -731,7 +737,7 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
     [UIView animateWithDuration:duration
                           delay:0.0
                         options:options | UIViewAnimationOptionBeginFromCurrentState
-                     animations:^{ handle.center = fixedCenter; }
+                     animations:^{ movementView.center = fixedCenter; }
                      completion:nil];
 }
 
