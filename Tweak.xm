@@ -15,11 +15,7 @@ static NSUInteger MRReturnToMainGeneration = 0;
 static NSUInteger MRMyrtleFullscreenIntentGeneration = 0;
 static NSTimeInterval MRRecentlyClosedMyrtleTime = 0;
 static const CGFloat MRFixedPortraitKeyboardHeight = 360.0;
-static const CGFloat MRKeyboardHandleGap = 16.0;
-static __weak UIWindow *MRSpotlightElevatedMyrtleWindow = nil;
-static CGFloat MRSpotlightOriginalMyrtleWindowLevel = 0.0;
-static BOOL MRSpotlightMyrtleWindowIsElevated = NO;
-static __strong id MRKeyboardHideObserver = nil;
+static const CGFloat MRKeyboardHandleGap = 12.0;
 
 // Performance build: the preprocessor discards the complete call expression, so
 // diagnostic arguments are not evaluated and SpringBoard performs no log I/O.
@@ -676,59 +672,6 @@ static void MRHookViewWillAppear(id self, SEL selector, BOOL animated)
 typedef void (*MRKeyboardWillShowIMP)(id, SEL, NSNotification *);
 static MRKeyboardWillShowIMP MROriginalKeyboardWillShow = NULL;
 
-static void MRRestoreMyrtleWindowLevel(void)
-{
-    if (!MRSpotlightMyrtleWindowIsElevated) return;
-    UIWindow *window = MRSpotlightElevatedMyrtleWindow;
-    if (window != nil) window.windowLevel = MRSpotlightOriginalMyrtleWindowLevel;
-    MRSpotlightElevatedMyrtleWindow = nil;
-    MRSpotlightOriginalMyrtleWindowLevel = 0.0;
-    MRSpotlightMyrtleWindowIsElevated = NO;
-}
-
-static UIWindow *MRVisibleSpotlightPanelAboveWindow(UIWindow *myrtleWindow)
-{
-    if (myrtleWindow == nil) return nil;
-    UIWindow *highestPanel = nil;
-    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if (![scene isKindOfClass:UIWindowScene.class]) continue;
-        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-            if (window.hidden || window.alpha <= 0.01 || window == myrtleWindow) continue;
-            NSString *windowClass = NSStringFromClass(window.class);
-            NSString *rootClass = NSStringFromClass(window.rootViewController.class);
-            BOOL isSpotlightPanel = [windowClass isEqualToString:@"SGPanelWindow"] ||
-                                    [rootClass isEqualToString:@"SGPanelViewController"];
-            if (!isSpotlightPanel || window.windowLevel <= myrtleWindow.windowLevel) continue;
-            if (highestPanel == nil || window.windowLevel > highestPanel.windowLevel)
-                highestPanel = window;
-        }
-    }
-    return highestPanel;
-}
-
-static void MRElevateMyrtleWindowForSpotlightIfNeeded(id controller)
-{
-    NSNumber *openValue = MRSafeValue(controller, @"isWindowOpen");
-    NSNumber *willOpenValue = MRSafeValue(controller, @"willWindowOpen");
-    if (([openValue respondsToSelector:@selector(boolValue)] && openValue.boolValue) ||
-        ([willOpenValue respondsToSelector:@selector(boolValue)] && willOpenValue.boolValue)) {
-        MRRestoreMyrtleWindowLevel();
-        return;
-    }
-
-    UIWindow *myrtleWindow = MRSendClassNoArgs(@"MyrtleWindow", @"sharedWindow");
-    if (![myrtleWindow isKindOfClass:UIWindow.class]) return;
-    UIWindow *panelWindow = MRVisibleSpotlightPanelAboveWindow(myrtleWindow);
-    if (panelWindow == nil) return;
-
-    if (!MRSpotlightMyrtleWindowIsElevated) {
-        MRSpotlightElevatedMyrtleWindow = myrtleWindow;
-        MRSpotlightOriginalMyrtleWindowLevel = myrtleWindow.windowLevel;
-        MRSpotlightMyrtleWindowIsElevated = YES;
-    }
-    myrtleWindow.windowLevel = panelWindow.windowLevel + 1.0;
-}
-
 static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notification)
 {
     // Preserve Myrtle's own eligibility checks, saved-center bookkeeping and
@@ -780,12 +723,6 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
         ((void (*)(id, SEL, CGPoint))objc_msgSend)(self, saveSelector, movementView.center);
         ((void (*)(id, SEL, BOOL))objc_msgSend)(self, movedSelector, YES);
     }
-
-    // Spotlight is rendered in SGPanelWindow at a much higher level than
-    // MyrtleWindow on iOS 15.6.  The handle's model and presentation positions
-    // are already correct, so only lift Myrtle while Spotlight owns the
-    // keyboard; never make it key, and restore its exact original level on hide.
-    MRElevateMyrtleWindowForSpotlightIfNeeded(self);
 
     // Convert the fixed screen-space keyboard top into the handle's actual
     // superview.  Keeping Myrtle's real notification above means this step no
@@ -951,13 +888,6 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
-            MRKeyboardHideObserver = [NSNotificationCenter.defaultCenter
-                addObserverForName:UIKeyboardWillHideNotification
-                            object:nil
-                             queue:NSOperationQueue.mainQueue
-                        usingBlock:^(__unused NSNotification *notification) {
-                            MRRestoreMyrtleWindowLevel();
-                        }];
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
             MRInstallUserDeletionHook();
