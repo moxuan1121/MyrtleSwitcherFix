@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <substrate.h>
@@ -20,10 +21,33 @@ static __weak UIWindow *MRSpotlightElevatedMyrtleWindow = nil;
 static CGFloat MRSpotlightOriginalMyrtleWindowLevel = 0.0;
 static BOOL MRSpotlightMyrtleWindowIsElevated = NO;
 static __strong id MRKeyboardHideObserver = nil;
+static NSString *const MRSpotlightLevelLogPath =
+    @"/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.spotlight-level.log";
 
 // Performance build: the preprocessor discards the complete call expression, so
 // diagnostic arguments are not evaluated and SpringBoard performs no log I/O.
 #define MRLog(...) do {} while (0)
+
+static void MRSpotlightLevelLog(NSString *format, ...)
+{
+    if (format.length == 0) return;
+    va_list arguments;
+    va_start(arguments, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments];
+    va_end(arguments);
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", NSDate.date, message];
+    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+    @try {
+        NSFileHandle *file = [NSFileHandle fileHandleForWritingAtPath:MRSpotlightLevelLogPath];
+        if (file == nil) {
+            [data writeToFile:MRSpotlightLevelLogPath atomically:YES];
+        } else {
+            [file seekToEndOfFile];
+            [file writeData:data];
+            [file closeFile];
+        }
+    } @catch (__unused NSException *exception) {}
+}
 
 static id MRSafeValue(id object, NSString *key)
 {
@@ -680,10 +704,44 @@ static void MRRestoreMyrtleWindowLevel(void)
 {
     if (!MRSpotlightMyrtleWindowIsElevated) return;
     UIWindow *window = MRSpotlightElevatedMyrtleWindow;
+    MRSpotlightLevelLog(@"RESTORE window=%p before=%.3f original=%.3f",
+                        window, window.windowLevel, MRSpotlightOriginalMyrtleWindowLevel);
     if (window != nil) window.windowLevel = MRSpotlightOriginalMyrtleWindowLevel;
     MRSpotlightElevatedMyrtleWindow = nil;
     MRSpotlightOriginalMyrtleWindowLevel = 0.0;
     MRSpotlightMyrtleWindowIsElevated = NO;
+}
+
+static void MRLogSpotlightLevelSnapshot(NSString *source, id controller, UIWindow *myrtleWindow)
+{
+    UIView *movementView = MRSafeValue(controller, @"handleHitView");
+    CALayer *presentation = [movementView.layer presentationLayer];
+    UIWindow *highestPanel = nil;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:UIWindowScene.class]) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            NSString *windowClass = NSStringFromClass(window.class);
+            NSString *rootClass = NSStringFromClass(window.rootViewController.class);
+            if (([windowClass isEqualToString:@"SGPanelWindow"] ||
+                 [rootClass isEqualToString:@"SGPanelViewController"]) &&
+                !window.hidden && window.alpha > 0.01 &&
+                (highestPanel == nil || window.windowLevel > highestPanel.windowLevel)) {
+                highestPanel = window;
+            }
+        }
+    }
+    MRSpotlightLevelLog(@"%@ open=%@ willOpen=%@ myrtle=%p level=%.3f hidden=%d alpha=%.3f "
+                         "panel=%p/%@ panelLevel=%.3f panelHidden=%d panelAlpha=%.3f "
+                         "handle=%p model=%@ presentation=%@ screenFrame=%@",
+                        source, MRSafeValue(controller, @"isWindowOpen"),
+                        MRSafeValue(controller, @"willWindowOpen"), myrtleWindow,
+                        myrtleWindow.windowLevel, myrtleWindow.hidden, myrtleWindow.alpha,
+                        highestPanel, NSStringFromClass(highestPanel.class),
+                        highestPanel.windowLevel, highestPanel.hidden, highestPanel.alpha,
+                        movementView, NSStringFromCGPoint(movementView.center),
+                        presentation ? NSStringFromCGPoint(presentation.position) : @"<nil>",
+                        movementView ? NSStringFromCGRect([movementView convertRect:movementView.bounds
+                                                                             toView:nil]) : @"<nil>");
 }
 
 static UIWindow *MRVisibleSpotlightPanelAboveWindow(UIWindow *myrtleWindow)
@@ -710,16 +768,26 @@ static void MRElevateMyrtleWindowForSpotlightIfNeeded(id controller)
 {
     NSNumber *openValue = MRSafeValue(controller, @"isWindowOpen");
     NSNumber *willOpenValue = MRSafeValue(controller, @"willWindowOpen");
+    MRSpotlightLevelLog(@"ELEVATE_ENTER controller=%p open=%@ willOpen=%@",
+                        controller, openValue, willOpenValue);
     if (([openValue respondsToSelector:@selector(boolValue)] && openValue.boolValue) ||
         ([willOpenValue respondsToSelector:@selector(boolValue)] && willOpenValue.boolValue)) {
+        MRSpotlightLevelLog(@"ELEVATE_SKIP reason=myrtle-window-open");
         MRRestoreMyrtleWindowLevel();
         return;
     }
 
     UIWindow *myrtleWindow = MRSendClassNoArgs(@"MyrtleWindow", @"sharedWindow");
-    if (![myrtleWindow isKindOfClass:UIWindow.class]) return;
+    if (![myrtleWindow isKindOfClass:UIWindow.class]) {
+        MRSpotlightLevelLog(@"ELEVATE_SKIP reason=no-myrtle-window object=%p", myrtleWindow);
+        return;
+    }
     UIWindow *panelWindow = MRVisibleSpotlightPanelAboveWindow(myrtleWindow);
-    if (panelWindow == nil) return;
+    MRLogSpotlightLevelSnapshot(@"ELEVATE_BEFORE", controller, myrtleWindow);
+    if (panelWindow == nil) {
+        MRSpotlightLevelLog(@"ELEVATE_SKIP reason=no-higher-spotlight-panel");
+        return;
+    }
 
     if (!MRSpotlightMyrtleWindowIsElevated) {
         MRSpotlightElevatedMyrtleWindow = myrtleWindow;
@@ -727,6 +795,19 @@ static void MRElevateMyrtleWindowForSpotlightIfNeeded(id controller)
         MRSpotlightMyrtleWindowIsElevated = YES;
     }
     myrtleWindow.windowLevel = panelWindow.windowLevel + 1.0;
+    MRSpotlightLevelLog(@"ELEVATE_SET panel=%p panelLevel=%.3f requested=%.3f actual=%.3f",
+                        panelWindow, panelWindow.windowLevel, panelWindow.windowLevel + 1.0,
+                        myrtleWindow.windowLevel);
+    __weak id weakController = controller;
+    __weak UIWindow *weakWindow = myrtleWindow;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        MRLogSpotlightLevelSnapshot(@"ELEVATE_PLUS_0.1S", weakController, weakWindow);
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        MRLogSpotlightLevelSnapshot(@"ELEVATE_PLUS_0.5S", weakController, weakWindow);
+    });
 }
 
 static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notification)
@@ -951,6 +1032,8 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
+            [NSFileManager.defaultManager removeItemAtPath:MRSpotlightLevelLogPath error:nil];
+            MRSpotlightLevelLog(@"BETA9_START");
             MRKeyboardHideObserver = [NSNotificationCenter.defaultCenter
                 addObserverForName:UIKeyboardWillHideNotification
                             object:nil
