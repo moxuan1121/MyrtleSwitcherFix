@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <substrate.h>
@@ -734,6 +735,28 @@ static BOOL MRApplyFixedKeyboardHandlePosition(id controller, NSDictionary *anim
     return YES;
 }
 
+static BOOL MRPinFixedKeyboardHandleWithoutPositionAnimation(id controller,
+                                                              CGPoint *fixedCenterOut)
+{
+    if (!MRApplyFixedKeyboardHandlePosition(controller, nil)) return NO;
+    UIView *movementView = MRSafeValue(controller, @"handleHitView");
+    if (![movementView isKindOfClass:UIView.class]) return NO;
+
+    // UIView animations update the model center immediately while the layer's
+    // presentation position can continue along Myrtle's previous close path.
+    // Remove only that positional animation, preserving the selector's own
+    // opacity/transform animations, then commit the fixed model center without
+    // creating another transition.
+    CGPoint fixedCenter = movementView.center;
+    [movementView.layer removeAnimationForKey:@"position"];
+    [UIView performWithoutAnimation:^{
+        movementView.center = fixedCenter;
+        [movementView layoutIfNeeded];
+    }];
+    if (fixedCenterOut != NULL) *fixedCenterOut = fixedCenter;
+    return YES;
+}
+
 static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notification)
 {
     // Preserve Myrtle's own eligibility checks, saved-center bookkeeping and
@@ -759,10 +782,9 @@ static void MRHookOpenSelectorAtPoint(id self, SEL selector, CGPoint centerPoint
     // radial menu's center before `setIsOverlayOpen:YES`.  Correct both the
     // live handle model and the incoming center before Myrtle creates/layouts
     // the selector, keeping the grip and radial items in one coordinate system.
-    if (MRApplyFixedKeyboardHandlePosition(self, nil)) {
-        UIView *movementView = MRSafeValue(self, @"handleHitView");
-        if ([movementView isKindOfClass:UIView.class]) centerPoint.y = movementView.center.y;
-    }
+    CGPoint fixedCenter = CGPointZero;
+    if (MRPinFixedKeyboardHandleWithoutPositionAnimation(self, &fixedCenter))
+        centerPoint.y = fixedCenter.y;
     MROriginalOpenSelectorAtPoint(self, selector, centerPoint);
 }
 
@@ -776,7 +798,7 @@ static void MRHookSetOverlayOpen(id self, SEL selector, BOOL open)
     // its shared handle/selector center is corrected before construction above.
     __weak id weakController = self;
     dispatch_async(dispatch_get_main_queue(), ^{
-        MRApplyFixedKeyboardHandlePosition(weakController, nil);
+        MRPinFixedKeyboardHandleWithoutPositionAnimation(weakController, NULL);
     });
 }
 
