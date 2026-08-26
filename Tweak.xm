@@ -15,13 +15,7 @@ static NSUInteger MRReturnToMainGeneration = 0;
 static NSUInteger MRMyrtleFullscreenIntentGeneration = 0;
 static NSTimeInterval MRRecentlyClosedMyrtleTime = 0;
 static const CGFloat MRFixedPortraitKeyboardHeight = 360.0;
-static const CGFloat MRKeyboardHandleGap = 16.0;
-static __strong UIView *MRSpotlightOriginalHandleSuperview = nil;
-static __weak UIView *MRSpotlightAttachedHandleView = nil;
-static NSUInteger MRSpotlightOriginalHandleIndex = NSNotFound;
-static BOOL MRHandleIsAttachedToSpotlight = NO;
-static __strong id MRKeyboardWillHideObserver = nil;
-static __strong id MRKeyboardDidHideObserver = nil;
+static const CGFloat MRKeyboardHandleGap = 12.0;
 
 // Performance build: the preprocessor discards the complete call expression, so
 // diagnostic arguments are not evaluated and SpringBoard performs no log I/O.
@@ -678,80 +672,6 @@ static void MRHookViewWillAppear(id self, SEL selector, BOOL animated)
 typedef void (*MRKeyboardWillShowIMP)(id, SEL, NSNotification *);
 static MRKeyboardWillShowIMP MROriginalKeyboardWillShow = NULL;
 
-static UIWindow *MRVisibleSpotlightPanelWindow(void)
-{
-    UIWindow *highestPanel = nil;
-    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if (![scene isKindOfClass:UIWindowScene.class]) continue;
-        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-            if (window.hidden || window.alpha <= 0.01) continue;
-            NSString *windowClass = NSStringFromClass(window.class);
-            NSString *rootClass = NSStringFromClass(window.rootViewController.class);
-            BOOL isSpotlightPanel = [windowClass isEqualToString:@"SGPanelWindow"] ||
-                                    [rootClass isEqualToString:@"SGPanelViewController"];
-            if (!isSpotlightPanel) continue;
-            if (highestPanel == nil || window.windowLevel > highestPanel.windowLevel)
-                highestPanel = window;
-        }
-    }
-    return highestPanel;
-}
-
-static void MRRestoreHandleFromSpotlight(void)
-{
-    if (!MRHandleIsAttachedToSpotlight) return;
-    UIView *movementView = MRSpotlightAttachedHandleView;
-    UIView *originalSuperview = MRSpotlightOriginalHandleSuperview;
-    if (movementView != nil && originalSuperview != nil) {
-        CGRect screenFrame = [movementView convertRect:movementView.bounds toView:nil];
-        NSUInteger count = originalSuperview.subviews.count;
-        if (MRSpotlightOriginalHandleIndex != NSNotFound &&
-            MRSpotlightOriginalHandleIndex < count) {
-            [originalSuperview insertSubview:movementView atIndex:MRSpotlightOriginalHandleIndex];
-        } else {
-            [originalSuperview addSubview:movementView];
-        }
-        movementView.frame = [originalSuperview convertRect:screenFrame fromView:nil];
-    }
-    MRSpotlightOriginalHandleSuperview = nil;
-    MRSpotlightAttachedHandleView = nil;
-    MRSpotlightOriginalHandleIndex = NSNotFound;
-    MRHandleIsAttachedToSpotlight = NO;
-}
-
-static BOOL MRAttachHandleToSpotlightIfNeeded(id controller, UIView *movementView)
-{
-    NSNumber *openValue = MRSafeValue(controller, @"isWindowOpen");
-    NSNumber *willOpenValue = MRSafeValue(controller, @"willWindowOpen");
-    BOOL myrtleWindowOpen =
-        ([openValue respondsToSelector:@selector(boolValue)] && openValue.boolValue) ||
-        ([willOpenValue respondsToSelector:@selector(boolValue)] && willOpenValue.boolValue);
-    if (myrtleWindowOpen) {
-        MRRestoreHandleFromSpotlight();
-        return NO;
-    }
-
-    UIWindow *panelWindow = MRVisibleSpotlightPanelWindow();
-    if (panelWindow == nil || movementView == nil) return NO;
-    if (MRHandleIsAttachedToSpotlight) {
-        if (movementView.superview == panelWindow) [panelWindow bringSubviewToFront:movementView];
-        return movementView.superview == panelWindow;
-    }
-
-    UIView *originalSuperview = movementView.superview;
-    if (originalSuperview == nil || originalSuperview == panelWindow) return NO;
-    CGRect screenFrame = [movementView convertRect:movementView.bounds toView:nil];
-    NSUInteger originalIndex = [originalSuperview.subviews indexOfObjectIdenticalTo:movementView];
-    MRSpotlightOriginalHandleSuperview = originalSuperview;
-    MRSpotlightAttachedHandleView = movementView;
-    MRSpotlightOriginalHandleIndex = originalIndex;
-    MRHandleIsAttachedToSpotlight = YES;
-    [panelWindow addSubview:movementView];
-    movementView.frame = [panelWindow convertRect:screenFrame fromView:nil];
-    [panelWindow bringSubviewToFront:movementView];
-    return YES;
-}
-
 static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notification)
 {
     // Preserve Myrtle's own eligibility checks, saved-center bookkeeping and
@@ -782,6 +702,8 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
     // and does not relocate the control on screen.
     UIView *movementView = MRSafeValue(self, @"handleHitView");
     if (![movementView isKindOfClass:UIView.class]) return;
+    UIView *coordinateView = movementView.superview ?: MRSafeValue(self, @"view");
+    if (![coordinateView isKindOfClass:UIView.class]) return;
 
     NSNumber *movedValue = MRSafeValue(self, @"handleWasMovedForKeyboard");
     BOOL movedForKeyboard = [movedValue respondsToSelector:@selector(boolValue)] &&
@@ -801,15 +723,6 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
         ((void (*)(id, SEL, CGPoint))objc_msgSend)(self, saveSelector, movementView.center);
         ((void (*)(id, SEL, BOOL))objc_msgSend)(self, movedSelector, YES);
     }
-
-    // Spotlight composites a cached underlying surface on iOS 15.6: both the
-    // live handle layer and MyrtleWindow can move above SGPanelWindow without
-    // changing the visible copy.  Put Myrtle's real hit view in the live panel
-    // for the lifetime of the keyboard, preserving its gestures and restoring
-    // its original hierarchy when the keyboard begins to hide.
-    MRAttachHandleToSpotlightIfNeeded(self, movementView);
-    UIView *coordinateView = movementView.superview ?: MRSafeValue(self, @"view");
-    if (![coordinateView isKindOfClass:UIView.class]) return;
 
     // Convert the fixed screen-space keyboard top into the handle's actual
     // superview.  Keeping Myrtle's real notification above means this step no
@@ -975,20 +888,6 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
-            MRKeyboardWillHideObserver = [NSNotificationCenter.defaultCenter
-                addObserverForName:UIKeyboardWillHideNotification
-                            object:nil
-                             queue:NSOperationQueue.mainQueue
-                        usingBlock:^(__unused NSNotification *notification) {
-                            MRRestoreHandleFromSpotlight();
-                        }];
-            MRKeyboardDidHideObserver = [NSNotificationCenter.defaultCenter
-                addObserverForName:UIKeyboardDidHideNotification
-                            object:nil
-                             queue:NSOperationQueue.mainQueue
-                        usingBlock:^(__unused NSNotification *notification) {
-                            MRRestoreHandleFromSpotlight();
-                        }];
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
             MRInstallUserDeletionHook();
