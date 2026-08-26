@@ -85,6 +85,53 @@ static void MRLogKeyboardState(NSString *source, NSNotification *notification)
                        ? NSStringFromClass([hitView.superview class]) : @"<invalid>");
 }
 
+static void MRLogKeyboardVisualState(NSString *source)
+{
+    id window = MRSendClassNoArgs(@"MyrtleWindow", @"sharedWindow");
+    id controller = MRSafeValue(window, @"controller");
+    UIView *hitView = MRSafeValue(controller, @"handleHitView");
+    UIView *secondary = MRSafeValue(controller, @"secondaryHandleHitView");
+    CALayer *presentation = [hitView isKindOfClass:UIView.class]
+        ? hitView.layer.presentationLayer : nil;
+    CGRect hitScreenFrame = [hitView isKindOfClass:UIView.class]
+        ? [hitView convertRect:hitView.bounds toView:nil] : CGRectNull;
+    CGRect secondaryScreenFrame = [secondary isKindOfClass:UIView.class]
+        ? [secondary convertRect:secondary.bounds toView:nil] : CGRectNull;
+    MRSpotlightLog(@"%@ MYRTLE_VISUAL window=%p level=%.3f hidden=%d alpha=%.3f key=%d "
+                   "frame=%@ controller=%p moved=%@ modelCenter=%@ modelScreenFrame=%@ "
+                   "presentationPosition=%@ presentationFrame=%@ secondaryCenter=%@ "
+                   "secondaryScreenFrame=%@",
+                   source, window,
+                   [window isKindOfClass:UIWindow.class] ? ((UIWindow *)window).windowLevel : -1.0,
+                   [window isKindOfClass:UIWindow.class] ? ((UIWindow *)window).hidden : -1,
+                   [window isKindOfClass:UIWindow.class] ? ((UIWindow *)window).alpha : -1.0,
+                   [window isKindOfClass:UIWindow.class] ? ((UIWindow *)window).keyWindow : -1,
+                   [window isKindOfClass:UIWindow.class]
+                       ? NSStringFromCGRect(((UIWindow *)window).frame) : @"<invalid>",
+                   controller, MRSafeValue(controller, @"handleWasMovedForKeyboard"),
+                   [hitView isKindOfClass:UIView.class]
+                       ? NSStringFromCGPoint(hitView.center) : @"<invalid>",
+                   NSStringFromCGRect(hitScreenFrame),
+                   presentation ? NSStringFromCGPoint(presentation.position) : @"<none>",
+                   presentation ? NSStringFromCGRect(presentation.frame) : @"<none>",
+                   [secondary isKindOfClass:UIView.class]
+                       ? NSStringFromCGPoint(secondary.center) : @"<invalid>",
+                   NSStringFromCGRect(secondaryScreenFrame));
+
+    NSArray<UIWindow *> *windows = UIApplication.sharedApplication.windows;
+    [windows enumerateObjectsUsingBlock:^(UIWindow *candidate, NSUInteger index, BOOL *stop) {
+        (void)stop;
+        MRSpotlightLog(@"%@ WINDOW[%lu] ptr=%p class=%@ level=%.3f hidden=%d alpha=%.3f "
+                       "key=%d frame=%@ root=%@ sceneState=%ld",
+                       source, (unsigned long)index, candidate,
+                       NSStringFromClass([candidate class]), candidate.windowLevel,
+                       candidate.hidden, candidate.alpha, candidate.keyWindow,
+                       NSStringFromCGRect(candidate.frame),
+                       NSStringFromClass([candidate.rootViewController class]),
+                       (long)candidate.windowScene.activationState);
+    }];
+}
+
 static id MRMainSwitcher(void)
 {
     // iOS 15.5/15.6 owns both the recents UI and its model from this singleton.
@@ -920,6 +967,17 @@ static void MRInstallKeyboardDiagnosticObservers(void)
             dispatch_async(dispatch_get_main_queue(), ^{
                 MRLogKeyboardState(@"GLOBAL_AFTER_EVENT", notification);
             });
+            if ([notification.name isEqualToString:UIKeyboardDidShowNotification]) {
+                MRLogKeyboardVisualState(@"DID_SHOW_IMMEDIATE");
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    MRLogKeyboardVisualState(@"DID_SHOW_PLUS_0_5S");
+                });
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    MRLogKeyboardVisualState(@"DID_SHOW_PLUS_1_5S");
+                });
+            }
         }];
         if (token != nil) [MRKeyboardDiagnosticTokens addObject:token];
     }
