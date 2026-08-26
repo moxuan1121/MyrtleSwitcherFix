@@ -1,8 +1,8 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.5.0~beta5
+Version: 0.5.0
 Architecture: iphoneos-arm64e
-Description: Log-free performance build with fixed 360pt portrait keyboard avoidance for Myrtle 1.4.1.
+Description: Stable log-free performance build with fixed 360pt in-app portrait keyboard avoidance for Myrtle 1.4.1.
 Maintainer: Local
 Author: Local
 Section: Tweaks

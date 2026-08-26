@@ -15,7 +15,7 @@ static NSUInteger MRReturnToMainGeneration = 0;
 static NSUInteger MRMyrtleFullscreenIntentGeneration = 0;
 static NSTimeInterval MRRecentlyClosedMyrtleTime = 0;
 static const CGFloat MRFixedPortraitKeyboardHeight = 360.0;
-static const CGFloat MRKeyboardHandleGap = 12.0;
+static const CGFloat MRKeyboardHandleGap = 18.0;
 
 // Performance build: the preprocessor discards the complete call expression, so
 // diagnostic arguments are not evaluated and SpringBoard performs no log I/O.
@@ -694,6 +694,12 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
                        CGRectGetHeight(keyboardFrame) > 0.0;
     if (!portrait || !usableFrame) return;
 
+    // Apply the fixed height only after Myrtle itself accepted an in-app
+    // keyboard notification and saved the original handle position.  System
+    // surfaces that Myrtle rejects are deliberately left completely untouched.
+    NSNumber *movedValue = MRSafeValue(self, @"handleWasMovedForKeyboard");
+    if (![movedValue respondsToSelector:@selector(boolValue)] || !movedValue.boolValue) return;
+
     UIView *handle = MRSafeValue(self, @"handle");
     if (![handle isKindOfClass:UIView.class]) return;
     // Myrtle uses `handle` only to measure the visible grip.  The object whose
@@ -704,25 +710,6 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
     if (![movementView isKindOfClass:UIView.class]) return;
     UIView *coordinateView = movementView.superview ?: MRSafeValue(self, @"view");
     if (![coordinateView isKindOfClass:UIView.class]) return;
-
-    NSNumber *movedValue = MRSafeValue(self, @"handleWasMovedForKeyboard");
-    BOOL movedForKeyboard = [movedValue respondsToSelector:@selector(boolValue)] &&
-                            movedValue.boolValue;
-    if (!movedForKeyboard) {
-        // Myrtle 1.4.1 rejects SpringBoard-owned keyboards (notably Spotlight)
-        // before setting its movement state.  Use the real outer hit view for
-        // an independent overlap check, then populate Myrtle's own saved state
-        // so its unchanged keyboard-hide handler restores the original center.
-        CGRect movementFrameOnScreen = [movementView convertRect:movementView.bounds toView:nil];
-        if (!CGRectIntersectsRect(movementFrameOnScreen, keyboardFrame)) return;
-
-        SEL saveSelector = NSSelectorFromString(@"setSavedHandleCenterForKeyboard:");
-        SEL movedSelector = NSSelectorFromString(@"setHandleWasMovedForKeyboard:");
-        if (![self respondsToSelector:saveSelector] ||
-            ![self respondsToSelector:movedSelector]) return;
-        ((void (*)(id, SEL, CGPoint))objc_msgSend)(self, saveSelector, movementView.center);
-        ((void (*)(id, SEL, BOOL))objc_msgSend)(self, movedSelector, YES);
-    }
 
     // Convert the fixed screen-space keyboard top into the handle's actual
     // superview.  Keeping Myrtle's real notification above means this step no
