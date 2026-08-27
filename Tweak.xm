@@ -934,6 +934,102 @@ static MRCenterCommitIMP MROriginalCenterCommit = NULL;
 typedef void (*MRSelectorGestureIMP)(id, SEL, UIGestureRecognizer *);
 static MRSelectorGestureIMP MROriginalSelectorGesture = NULL;
 static const void *MRSelectorTraceStateKey = &MRSelectorTraceStateKey;
+static const void *MRDirectLongGenerationKey = &MRDirectLongGenerationKey;
+static const void *MRDirectLongFiredKey = &MRDirectLongFiredKey;
+static const void *MRDirectCenterWriteKey = &MRDirectCenterWriteKey;
+typedef void (*MRSetCenterHoldDetectedIMP)(id, SEL, BOOL);
+static MRSetCenterHoldDetectedIMP MROriginalSetCenterHoldDetected = NULL;
+
+static void MRHookSetCenterHoldDetected(id self, SEL selector, BOOL detected)
+{
+    BOOL internalWrite = [objc_getAssociatedObject(self, MRDirectCenterWriteKey) boolValue];
+    // The direct mode owns the fullscreen decision. Ignore Myrtle's original
+    // centre dwell so merely passing through the centre can no longer arm a
+    // later app selection for fullscreen.
+    MROriginalSetCenterHoldDetected(self, selector, internalWrite ? detected : NO);
+}
+
+static void MRSetDirectCenterState(id controller, BOOL detected)
+{
+    objc_setAssociatedObject(controller, MRDirectCenterWriteKey, @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(controller,
+        NSSelectorFromString(@"setCenterHoldDetected:"), detected);
+    objc_setAssociatedObject(controller, MRDirectCenterWriteKey, nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static id MRDirectItemForHighlightedIndex(id controller, long long highlightedIndex,
+                                          long long *itemIndex)
+{
+    // Myrtle's visual index zero is its centre slot. The radial item array
+    // starts at visual index one, confirmed across action and app commits.
+    long long resolved = highlightedIndex - 1;
+    NSArray *items = MRSafeValue(controller, @"selectorItems");
+    if (itemIndex != NULL) *itemIndex = resolved;
+    if (![items isKindOfClass:NSArray.class] || resolved < 0 ||
+        (NSUInteger)resolved >= items.count) return nil;
+    return items[(NSUInteger)resolved];
+}
+
+static BOOL MRDirectItemIsApp(id item)
+{
+    return [item isKindOfClass:NSDictionary.class] &&
+           [item[@"type"] isEqualToString:@"app"] &&
+           [item[@"bundle"] isKindOfClass:NSString.class] &&
+           [item[@"bundle"] length] != 0;
+}
+
+static void MRCancelDirectLongPress(id controller)
+{
+    NSUInteger generation = [objc_getAssociatedObject(controller,
+        MRDirectLongGenerationKey) unsignedIntegerValue] + 1;
+    objc_setAssociatedObject(controller, MRDirectLongGenerationKey, @(generation),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void MRScheduleDirectLongPress(id controller, long long highlightedIndex)
+{
+    long long itemIndex = -1;
+    id item = MRDirectItemForHighlightedIndex(controller, highlightedIndex, &itemIndex);
+    if (!MRDirectItemIsApp(item)) {
+        MRCancelDirectLongPress(controller);
+        return;
+    }
+
+    NSUInteger generation = [objc_getAssociatedObject(controller,
+        MRDirectLongGenerationKey) unsignedIntegerValue] + 1;
+    objc_setAssociatedObject(controller, MRDirectLongGenerationKey, @(generation),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak id weakController = controller;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.55 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        id strongController = weakController;
+        if (strongController == nil) return;
+        NSUInteger currentGeneration = [objc_getAssociatedObject(strongController,
+            MRDirectLongGenerationKey) unsignedIntegerValue];
+        long long currentHighlighted = [MRSafeValue(MRSafeValue(strongController,
+            @"selectorView"), @"lastHighlightedIndex") longLongValue];
+        if (currentGeneration != generation || currentHighlighted != highlightedIndex ||
+            [objc_getAssociatedObject(strongController, MRDirectLongFiredKey) boolValue]) return;
+        long long currentItemIndex = -1;
+        id currentItem = MRDirectItemForHighlightedIndex(strongController,
+                                                         currentHighlighted,
+                                                         &currentItemIndex);
+        if (!MRDirectItemIsApp(currentItem)) return;
+
+        objc_setAssociatedObject(strongController, MRDirectLongFiredKey, @YES,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        MRSetDirectCenterState(strongController, YES);
+        UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc]
+                                                initWithStyle:UIImpactFeedbackStyleMedium];
+        [feedback impactOccurred];
+        MRDirectSelectorTrace(@"DIRECT-LONG index=%lld item=%@",
+                              currentItemIndex, MRSelectorObjectSummary(currentItem));
+        ((void (*)(id, SEL, long long))objc_msgSend)(strongController,
+            NSSelectorFromString(@"MT_lIIIllIllIlllIlIlIll:"), currentItemIndex);
+    });
+}
 
 static NSString *MRSelectorTraceState(id controller, UIGestureRecognizer *gesture)
 {
@@ -952,9 +1048,40 @@ static NSString *MRSelectorTraceState(id controller, UIGestureRecognizer *gestur
 
 static void MRHookSelectorGesture(id self, SEL selector, UIGestureRecognizer *gesture)
 {
+    if ([objc_getAssociatedObject(self, MRDirectLongFiredKey) boolValue]) {
+        if (gesture.state == UIGestureRecognizerStateEnded ||
+            gesture.state == UIGestureRecognizerStateCancelled ||
+            gesture.state == UIGestureRecognizerStateFailed) {
+            MRCancelDirectLongPress(self);
+            objc_setAssociatedObject(self, MRDirectLongFiredKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            MRSetDirectCenterState(self, NO);
+        }
+        return;
+    }
+
+    long long highlightedBefore = [MRSafeValue(MRSafeValue(self, @"selectorView"),
+                                                @"lastHighlightedIndex") longLongValue];
     NSString *before = MRSelectorTraceState(self, gesture);
     MROriginalSelectorGesture(self, selector, gesture);
+    // Myrtle may have armed its centre-based fullscreen state during the
+    // original handler. The setter hook rejects that write; keep an explicit
+    // reset here as protection against direct ivar writes in this build.
+    MRSetDirectCenterState(self, NO);
     NSString *after = MRSelectorTraceState(self, gesture);
+    long long highlightedAfter = [MRSafeValue(MRSafeValue(self, @"selectorView"),
+                                               @"lastHighlightedIndex") longLongValue];
+    if (gesture.state == UIGestureRecognizerStateBegan ||
+        highlightedAfter != highlightedBefore) {
+        MRScheduleDirectLongPress(self, highlightedAfter);
+    }
+    if (gesture.state == UIGestureRecognizerStateEnded ||
+        gesture.state == UIGestureRecognizerStateCancelled ||
+        gesture.state == UIGestureRecognizerStateFailed) {
+        MRCancelDirectLongPress(self);
+        objc_setAssociatedObject(self, MRDirectLongFiredKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
     NSString *last = objc_getAssociatedObject(self, MRSelectorTraceStateKey);
     BOOL boundary = gesture.state == UIGestureRecognizerStateBegan ||
                     gesture.state == UIGestureRecognizerStateEnded ||
@@ -1216,6 +1343,11 @@ static void MRHookOpenSelectorAtPoint(id self, SEL selector, CGPoint centerPoint
         if ([movementView isKindOfClass:UIView.class]) centerPoint.y = movementView.center.y;
     }
     MROriginalOpenSelectorAtPoint(self, selector, centerPoint);
+    UIView *centerIcon = MRSafeValue(MRSafeValue(self, @"selectorView"), @"centerIconView");
+    if ([centerIcon isKindOfClass:UIView.class]) {
+        centerIcon.hidden = YES;
+        centerIcon.userInteractionEnabled = NO;
+    }
 }
 
 static BOOL MRInstallMyrtleHook(void)
@@ -1336,11 +1468,18 @@ static BOOL MRInstallDirectSelectorDiagnosticHooks(void)
         MSHookMessageEx(cls, selector, (IMP)MRHookSelectorGesture,
                         (IMP *)&MROriginalSelectorGesture);
     }
+    if (MROriginalSetCenterHoldDetected == NULL) {
+        SEL selector = NSSelectorFromString(@"setCenterHoldDetected:");
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+        MSHookMessageEx(cls, selector, (IMP)MRHookSetCenterHoldDetected,
+                        (IMP *)&MROriginalSetCenterHoldDetected);
+    }
     MRDirectSelectorTrace(@"INSTALLED item=%p center=%p gesture=%p",
                           MROriginalSelectorCommit, MROriginalCenterCommit,
                           MROriginalSelectorGesture);
     return MROriginalSelectorCommit != NULL && MROriginalCenterCommit != NULL &&
-           MROriginalSelectorGesture != NULL;
+           MROriginalSelectorGesture != NULL && MROriginalSetCenterHoldDetected != NULL;
 }
 
 static BOOL MRInstallMyrtleActionDispatcherHook(void)
