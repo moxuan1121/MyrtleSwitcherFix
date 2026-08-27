@@ -939,6 +939,23 @@ static const void *MRDirectLongFiredKey = &MRDirectLongFiredKey;
 static const void *MRDirectCenterWriteKey = &MRDirectCenterWriteKey;
 typedef void (*MRSetCenterHoldDetectedIMP)(id, SEL, BOOL);
 static MRSetCenterHoldDetectedIMP MROriginalSetCenterHoldDetected = NULL;
+typedef void (*MRSetCenterIconViewIMP)(id, SEL, UIView *);
+static MRSetCenterIconViewIMP MROriginalSetCenterIconView = NULL;
+
+static void MRHideDirectCenterView(UIView *view)
+{
+    if (![view isKindOfClass:UIView.class]) return;
+    view.hidden = YES;
+    view.alpha = 0.0;
+    view.userInteractionEnabled = NO;
+    view.accessibilityElementsHidden = YES;
+}
+
+static void MRHookSetCenterIconView(id self, SEL selector, UIView *view)
+{
+    MROriginalSetCenterIconView(self, selector, view);
+    MRHideDirectCenterView(view);
+}
 
 static void MRHookSetCenterHoldDetected(id self, SEL selector, BOOL detected)
 {
@@ -1020,14 +1037,11 @@ static void MRScheduleDirectLongPress(id controller, long long highlightedIndex)
 
         objc_setAssociatedObject(strongController, MRDirectLongFiredKey, @YES,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        MRSetDirectCenterState(strongController, YES);
         UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc]
                                                 initWithStyle:UIImpactFeedbackStyleMedium];
         [feedback impactOccurred];
-        MRDirectSelectorTrace(@"DIRECT-LONG index=%lld item=%@",
+        MRDirectSelectorTrace(@"DIRECT-LONG-ARMED index=%lld item=%@",
                               currentItemIndex, MRSelectorObjectSummary(currentItem));
-        ((void (*)(id, SEL, long long))objc_msgSend)(strongController,
-            NSSelectorFromString(@"MT_lIIIllIllIlllIlIlIll:"), currentItemIndex);
     });
 }
 
@@ -1053,9 +1067,17 @@ static void MRHookSelectorGesture(id self, SEL selector, UIGestureRecognizer *ge
             gesture.state == UIGestureRecognizerStateCancelled ||
             gesture.state == UIGestureRecognizerStateFailed) {
             MRCancelDirectLongPress(self);
+            if (gesture.state == UIGestureRecognizerStateEnded) {
+                // Let Myrtle perform its own one-shot app commit and, crucially,
+                // the remainder of its gesture cleanup that dismisses the
+                // selector. The guarded centre flag selects its fullscreen
+                // branch without re-enabling the old centre interaction.
+                MRSetDirectCenterState(self, YES);
+                MROriginalSelectorGesture(self, selector, gesture);
+            }
+            MRSetDirectCenterState(self, NO);
             objc_setAssociatedObject(self, MRDirectLongFiredKey, nil,
                                      OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            MRSetDirectCenterState(self, NO);
         }
         return;
     }
@@ -1344,10 +1366,13 @@ static void MRHookOpenSelectorAtPoint(id self, SEL selector, CGPoint centerPoint
     }
     MROriginalOpenSelectorAtPoint(self, selector, centerPoint);
     UIView *centerIcon = MRSafeValue(MRSafeValue(self, @"selectorView"), @"centerIconView");
-    if ([centerIcon isKindOfClass:UIView.class]) {
-        centerIcon.hidden = YES;
-        centerIcon.userInteractionEnabled = NO;
-    }
+    MRHideDirectCenterView(centerIcon);
+    __weak id weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id strongSelf = weakSelf;
+        MRHideDirectCenterView(MRSafeValue(MRSafeValue(strongSelf, @"selectorView"),
+                                           @"centerIconView"));
+    });
 }
 
 static BOOL MRInstallMyrtleHook(void)
@@ -1475,11 +1500,21 @@ static BOOL MRInstallDirectSelectorDiagnosticHooks(void)
         MSHookMessageEx(cls, selector, (IMP)MRHookSetCenterHoldDetected,
                         (IMP *)&MROriginalSetCenterHoldDetected);
     }
+    if (MROriginalSetCenterIconView == NULL) {
+        Class selectorViewClass = NSClassFromString(@"MyrtleSelectorView");
+        SEL selector = NSSelectorFromString(@"setCenterIconView:");
+        Method method = class_getInstanceMethod(selectorViewClass, selector);
+        if (selectorViewClass == Nil || method == NULL ||
+            method_getNumberOfArguments(method) != 3) return NO;
+        MSHookMessageEx(selectorViewClass, selector, (IMP)MRHookSetCenterIconView,
+                        (IMP *)&MROriginalSetCenterIconView);
+    }
     MRDirectSelectorTrace(@"INSTALLED item=%p center=%p gesture=%p",
                           MROriginalSelectorCommit, MROriginalCenterCommit,
                           MROriginalSelectorGesture);
     return MROriginalSelectorCommit != NULL && MROriginalCenterCommit != NULL &&
-           MROriginalSelectorGesture != NULL && MROriginalSetCenterHoldDetected != NULL;
+           MROriginalSelectorGesture != NULL && MROriginalSetCenterHoldDetected != NULL &&
+           MROriginalSetCenterIconView != NULL;
 }
 
 static BOOL MRInstallMyrtleActionDispatcherHook(void)
