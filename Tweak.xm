@@ -33,6 +33,10 @@ typedef void (*MRSetPageAnimatedIMP)(id, SEL, long long, BOOL);
 static MRSetPageAnimatedIMP MROriginalSetPageAnimated = NULL;
 typedef void (*MRSetPageIMP)(id, SEL, long long);
 static MRSetPageIMP MROriginalSetPage = NULL;
+typedef void (*MRSetContentOffsetAnimatedIMP)(id, SEL, CGPoint, BOOL);
+static MRSetContentOffsetAnimatedIMP MROriginalSetContentOffsetAnimated = NULL;
+typedef void (*MRSetContentOffsetIMP)(id, SEL, CGPoint);
+static MRSetContentOffsetIMP MROriginalSetContentOffset = NULL;
 
 // Stable builds discard the complete diagnostic expression at preprocessing
 // time: no arguments, strings, filesystem access or log I/O reach SpringBoard.
@@ -394,6 +398,51 @@ static void MRHookSetPage(id self, SEL selector, long long pageIndex)
         return;
     }
     MROriginalSetPage(self, selector, pageIndex);
+}
+
+static BOOL MRGuardRootScrollOffset(id scrollView, CGPoint requestedOffset,
+                                    CGPoint *replacementOffset)
+{
+    if (!MRHomePageGuardActive ||
+        [NSDate timeIntervalSinceReferenceDate] > MRHomePageGuardDeadline) return NO;
+    id controller = MRRootFolderController();
+    id rootFolderView = MRSafeValue(controller, @"rootFolderView");
+    id currentRootScrollView = MRSafeValue(rootFolderView, @"scrollView");
+    if (scrollView != currentRootScrollView ||
+        ![scrollView isKindOfClass:[UIScrollView class]]) return NO;
+    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+    NSString *currentBundleID = MRSafeValue(manager, @"currentBundleID");
+    if (![currentBundleID isEqualToString:MRHomePageGuardBundleID]) return NO;
+    UIScrollView *rootScrollView = scrollView;
+    CGFloat targetX = (CGFloat)(MRHomePageGuardPageIndex - MRHomePageGuardMinimumIndex) *
+        rootScrollView.bounds.size.width;
+    if (requestedOffset.x >= targetX - 0.5) return NO;
+    if (replacementOffset != NULL)
+        *replacementOffset = CGPointMake(targetX, requestedOffset.y);
+    MRHomePageTrace(@"INTERCEPT scroll requestedX=%.3f replacementX=%.3f currentX=%.3f",
+                    requestedOffset.x, targetX, rootScrollView.contentOffset.x);
+    return YES;
+}
+
+static void MRHookSetContentOffsetAnimated(id self, SEL selector, CGPoint offset,
+                                           BOOL animated)
+{
+    CGPoint replacement = offset;
+    if (MRGuardRootScrollOffset(self, offset, &replacement)) {
+        MROriginalSetContentOffsetAnimated(self, selector, replacement, NO);
+        return;
+    }
+    MROriginalSetContentOffsetAnimated(self, selector, offset, animated);
+}
+
+static void MRHookSetContentOffset(id self, SEL selector, CGPoint offset)
+{
+    CGPoint replacement = offset;
+    if (MRGuardRootScrollOffset(self, offset, &replacement)) {
+        MROriginalSetContentOffset(self, selector, replacement);
+        return;
+    }
+    MROriginalSetContentOffset(self, selector, offset);
 }
 
 static void MRArmHomePageGuard(long long pageIndex, NSString *bundleID,
@@ -1310,6 +1359,44 @@ static BOOL MRInstallHomePageSetterHooks(void)
     return MROriginalSetPageAnimated != NULL || MROriginalSetPage != NULL;
 }
 
+static BOOL MRInstallRootIconScrollHooks(void)
+{
+    Class cls = NSClassFromString(@"SBIconScrollView");
+    if (cls == Nil) return NO;
+
+    if (MROriginalSetContentOffsetAnimated == NULL) {
+        SEL selector = @selector(setContentOffset:animated:);
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method != NULL && method_getNumberOfArguments(method) == 4) {
+            IMP inheritedOrDirect = method_getImplementation(method);
+            const char *types = method_getTypeEncoding(method);
+            if (class_addMethod(cls, selector, (IMP)MRHookSetContentOffsetAnimated, types))
+                MROriginalSetContentOffsetAnimated = (MRSetContentOffsetAnimatedIMP)inheritedOrDirect;
+            else
+                MSHookMessageEx(cls, selector, (IMP)MRHookSetContentOffsetAnimated,
+                                (IMP *)&MROriginalSetContentOffsetAnimated);
+        }
+    }
+    if (MROriginalSetContentOffset == NULL) {
+        SEL selector = @selector(setContentOffset:);
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method != NULL && method_getNumberOfArguments(method) == 3) {
+            IMP inheritedOrDirect = method_getImplementation(method);
+            const char *types = method_getTypeEncoding(method);
+            if (class_addMethod(cls, selector, (IMP)MRHookSetContentOffset, types))
+                MROriginalSetContentOffset = (MRSetContentOffsetIMP)inheritedOrDirect;
+            else
+                MSHookMessageEx(cls, selector, (IMP)MRHookSetContentOffset,
+                                (IMP *)&MROriginalSetContentOffset);
+        }
+    }
+    MRHomePageTrace(@"INSTALL rootScroll animated=%d plain=%d",
+                    MROriginalSetContentOffsetAnimated != NULL,
+                    MROriginalSetContentOffset != NULL);
+    return MROriginalSetContentOffsetAnimated != NULL ||
+        MROriginalSetContentOffset != NULL;
+}
+
 static void MRInstallSwitcherRemoveHook(void)
 {
     Class cls = NSClassFromString(@"SBMainSwitcherViewController");
@@ -1391,6 +1478,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
             MRInstallSwitcherReconciliationHooks();
             MRInstallUserDeletionHook();
             MRInstallHomePageSetterHooks();
+            MRInstallRootIconScrollHooks();
             MRInstallMyrtleWhenReady(0);
         });
     }
