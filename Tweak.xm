@@ -22,6 +22,7 @@ static const CGFloat MRFixedPortraitKeyboardHeight = 360.0;
 static const CGFloat MRKeyboardHandleGap = 18.0;
 static const uintptr_t MRMyrtleReloadWindowIsOpenReturnOffset = 0xF77EC;
 static BOOL MRForegroundReloadInFlight = NO;
+static __strong NSString *MRForegroundReloadCandidateBundleID = nil;
 
 // Stable builds discard the complete diagnostic expression at preprocessing
 // time: no arguments, strings, filesystem access or log I/O reach SpringBoard.
@@ -307,7 +308,10 @@ static BOOL MRCallOriginatesFromMyrtleReloadWindowAction(void *returnAddress)
 static void MRReloadForegroundApplication(void)
 {
     if (MRForegroundReloadInFlight) return;
-    NSString *bundleID = [MRCurrentMainApplicationBundleID() copy];
+    NSString *bundleID = [MRForegroundReloadCandidateBundleID copy];
+    MRForegroundReloadCandidateBundleID = nil;
+    if (bundleID.length == 0)
+        bundleID = [MRCurrentMainApplicationBundleID() copy];
     if (bundleID.length == 0 || ![bundleID containsString:@"."] ||
         [bundleID isEqualToString:@"com.apple.springboard"]) return;
 
@@ -908,6 +912,10 @@ static void MRHookOpenSelectorAtPoint(id self, SEL selector, CGPoint centerPoint
     // radial menu's center before `setIsOverlayOpen:YES`.  Correct both the
     // live handle model and the incoming center before Myrtle creates/layouts
     // the selector, keeping the grip and radial items in one coordinate system.
+    if (![MRSafeValue(self, @"isWindowOpen") boolValue])
+        MRForegroundReloadCandidateBundleID = [MRCurrentMainApplicationBundleID() copy];
+    else
+        MRForegroundReloadCandidateBundleID = nil;
     MRInstallPinnedHandleCenterGuard(self);
     if (MRApplyFixedKeyboardHandlePosition(self, nil)) {
         UIView *movementView = MRSafeValue(self, @"handleHitView");
