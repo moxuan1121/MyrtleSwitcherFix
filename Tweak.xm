@@ -24,6 +24,16 @@ static BOOL MRForegroundReloadInFlight = NO;
 static __strong NSString *MRForegroundReloadCandidateBundleID = nil;
 static NSUInteger MRForegroundReloadCandidateGeneration = 0;
 static NSUInteger MRHomePageRestoreGeneration = 0;
+static BOOL MRHomePageGuardActive = NO;
+static long long MRHomePageGuardPageIndex = 0;
+static long long MRHomePageGuardMinimumIndex = 0;
+static NSTimeInterval MRHomePageGuardDeadline = 0;
+static __strong NSString *MRHomePageGuardBundleID = nil;
+
+typedef void (*MRSetPageAnimatedIMP)(id, SEL, long long, BOOL);
+static MRSetPageAnimatedIMP MROriginalSetPageAnimated = NULL;
+typedef void (*MRSetPageIMP)(id, SEL, long long);
+static MRSetPageIMP MROriginalSetPage = NULL;
 
 // Stable builds discard the complete diagnostic expression at preprocessing
 // time: no arguments, strings, filesystem access or log I/O reach SpringBoard.
@@ -348,6 +358,73 @@ static id MRRootFolderController(void)
 {
     id iconController = MRSendClassNoArgs(@"SBIconController", @"sharedInstance");
     return MRSafeValue(iconController, @"rootFolderController");
+}
+
+static BOOL MRShouldReplaceHomePageRequest(long long requestedPage,
+                                           long long *replacementPage)
+{
+    if (!MRHomePageGuardActive || requestedPage != MRHomePageGuardMinimumIndex ||
+        MRHomePageGuardPageIndex == MRHomePageGuardMinimumIndex ||
+        [NSDate timeIntervalSinceReferenceDate] > MRHomePageGuardDeadline) return NO;
+    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+    NSString *currentBundleID = MRSafeValue(manager, @"currentBundleID");
+    if (![currentBundleID isEqualToString:MRHomePageGuardBundleID]) return NO;
+    if (replacementPage != NULL) *replacementPage = MRHomePageGuardPageIndex;
+    return YES;
+}
+
+static void MRHookSetPageAnimated(id self, SEL selector, long long pageIndex, BOOL animated)
+{
+    long long replacement = pageIndex;
+    if (MRShouldReplaceHomePageRequest(pageIndex, &replacement)) {
+        MRHomePageTrace(@"INTERCEPT selector=%@ requested=%lld replacement=%lld animated=%d",
+                        NSStringFromSelector(selector), pageIndex, replacement, animated);
+        MROriginalSetPageAnimated(self, selector, replacement, NO);
+        return;
+    }
+    MROriginalSetPageAnimated(self, selector, pageIndex, animated);
+}
+
+static void MRHookSetPage(id self, SEL selector, long long pageIndex)
+{
+    long long replacement = pageIndex;
+    if (MRShouldReplaceHomePageRequest(pageIndex, &replacement)) {
+        MRHomePageTrace(@"INTERCEPT selector=%@ requested=%lld replacement=%lld",
+                        NSStringFromSelector(selector), pageIndex, replacement);
+        MROriginalSetPage(self, selector, replacement);
+        return;
+    }
+    MROriginalSetPage(self, selector, pageIndex);
+}
+
+static void MRArmHomePageGuard(long long pageIndex, NSString *bundleID,
+                               NSUInteger generation)
+{
+    id controller = MRRootFolderController();
+    long long minimumPageIndex = 0;
+    long long maximumPageIndex = 0;
+    if (!MRIntegerGetter(controller, @"minimumPageIndex", &minimumPageIndex) ||
+        !MRIntegerGetter(controller, @"maximumPageIndex", &maximumPageIndex) ||
+        pageIndex < minimumPageIndex || pageIndex > maximumPageIndex ||
+        pageIndex == minimumPageIndex || bundleID.length == 0) {
+        MRHomePageGuardActive = NO;
+        MRHomePageGuardBundleID = nil;
+        return;
+    }
+    MRHomePageGuardPageIndex = pageIndex;
+    MRHomePageGuardMinimumIndex = minimumPageIndex;
+    MRHomePageGuardBundleID = [bundleID copy];
+    MRHomePageGuardDeadline = [NSDate timeIntervalSinceReferenceDate] + 3.0;
+    MRHomePageGuardActive = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.05 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (generation == MRHomePageRestoreGeneration) {
+            MRHomePageTrace(@"EXPIRE guard generation=%lu bundle=%@",
+                            (unsigned long)generation, MRHomePageGuardBundleID);
+            MRHomePageGuardActive = NO;
+            MRHomePageGuardBundleID = nil;
+        }
+    });
 }
 
 static BOOL MRInvokePageSetter(id object, long long pageIndex)
@@ -705,9 +782,13 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
         MRHomePageTrace(@"PRESERVE page=%lld valid=%d generation=%lu",
                         preservedHomePage, hasPreservedHomePage,
                         (unsigned long)homePageGeneration);
+        if (hasPreservedHomePage)
+            MRArmHomePageGuard(preservedHomePage, bundleID, homePageGeneration);
         MRTraceHomePageSnapshot(@"before-original");
     } else if (bundleID.length == 0 && previousBundleID.length != 0) {
         MRHomePageRestoreGeneration++;
+        MRHomePageGuardActive = NO;
+        MRHomePageGuardBundleID = nil;
     }
     BOOL fullscreenTransition = bundleID.length == 0 && previousBundleID.length != 0 &&
         [MRMyrtleFullscreenIntentBundleID isEqualToString:previousBundleID];
@@ -720,20 +801,9 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
     if (meaningfulTransition) transitionGeneration = ++MRReturnToMainGeneration;
     MROriginalSetCurrentBundle(self, selector, bundleID);
     if (openingFirstMyrtleWindow) {
-        if (hasPreservedHomePage) {
-            NSString *restoreBundleID = [bundleID copy];
-            for (NSNumber *delay in @[@0.28, @0.38, @0.52, @0.75, @1.05]) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                             (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    MRRestoreHomePage(preservedHomePage, homePageGeneration,
-                                      restoreBundleID, delay.doubleValue);
-                });
-            }
-        }
         MRTraceHomePageSnapshot(@"after-original");
         NSString *diagnosticBundleID = [bundleID copy];
-        for (NSNumber *delay in @[@0.05, @0.2, @0.5, @1.0]) {
+        for (NSNumber *delay in @[@0.05, @0.2, @0.5, @1.0, @1.5, @2.5]) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                          (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
@@ -1276,6 +1346,32 @@ static BOOL MRInstallMyrtleActionDispatcherHook(void)
     return MROriginalActionDispatcher != NULL;
 }
 
+static BOOL MRInstallHomePageSetterHooks(void)
+{
+    Class cls = NSClassFromString(@"SBRootFolderController");
+    if (cls == Nil) return NO;
+
+    if (MROriginalSetPageAnimated == NULL) {
+        SEL selector = NSSelectorFromString(@"setCurrentPageIndex:animated:");
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method != NULL && method_getNumberOfArguments(method) == 4) {
+            MSHookMessageEx(cls, selector, (IMP)MRHookSetPageAnimated,
+                            (IMP *)&MROriginalSetPageAnimated);
+        }
+    }
+    if (MROriginalSetPage == NULL) {
+        SEL selector = NSSelectorFromString(@"setCurrentPageIndex:");
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method != NULL && method_getNumberOfArguments(method) == 3) {
+            MSHookMessageEx(cls, selector, (IMP)MRHookSetPage,
+                            (IMP *)&MROriginalSetPage);
+        }
+    }
+    MRHomePageTrace(@"INSTALL setters animated=%d plain=%d",
+                    MROriginalSetPageAnimated != NULL, MROriginalSetPage != NULL);
+    return MROriginalSetPageAnimated != NULL || MROriginalSetPage != NULL;
+}
+
 static void MRInstallSwitcherRemoveHook(void)
 {
     Class cls = NSClassFromString(@"SBMainSwitcherViewController");
@@ -1356,6 +1452,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
             MRInstallUserDeletionHook();
+            MRInstallHomePageSetterHooks();
             MRInstallMyrtleWhenReady(0);
         });
     }

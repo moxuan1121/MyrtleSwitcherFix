@@ -1,8 +1,8 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.5.3~beta2
+Version: 0.5.3~beta3
 Architecture: iphoneos-arm64e
-Description: iOS 15 test build that preserves the selected Home Screen page during Myrtle windowization.
+Description: iOS 15 test build that blocks the Home Screen page-reset request at its source during Myrtle windowization.
 Maintainer: Local
 Author: Local
 Section: Tweaks
