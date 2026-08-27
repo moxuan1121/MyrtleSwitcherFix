@@ -4,6 +4,11 @@
 #import <objc/runtime.h>
 #import <substrate.h>
 #import <dlfcn.h>
+#import <fcntl.h>
+#import <unistd.h>
+#import <os/lock.h>
+#import <stdarg.h>
+#import <string.h>
 #if __has_feature(ptrauth_calls)
 #import <ptrauth.h>
 #endif
@@ -27,6 +32,38 @@ static __strong NSString *MRForegroundReloadCandidateBundleID = nil;
 // Stable builds discard the complete diagnostic expression at preprocessing
 // time: no arguments, strings, filesystem access or log I/O reach SpringBoard.
 #define MRLog(...) do {} while (0)
+
+static const char *MRReloadDiagnosticPath =
+    "/var/mobile/Documents/com.moxuan.myrtleswitcherfix.reload.log";
+static os_unfair_lock MRReloadDiagnosticLock = OS_UNFAIR_LOCK_INIT;
+
+static void MRReloadDiagnostic(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+
+static void MRReloadDiagnostic(NSString *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments];
+    va_end(arguments);
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message];
+    const char *bytes = line.UTF8String;
+    if (bytes == NULL) return;
+
+    os_unfair_lock_lock(&MRReloadDiagnosticLock);
+    int descriptor = open(MRReloadDiagnosticPath,
+                          O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (descriptor >= 0) {
+        size_t remaining = strlen(bytes);
+        while (remaining > 0) {
+            ssize_t written = write(descriptor, bytes, remaining);
+            if (written <= 0) break;
+            bytes += written;
+            remaining -= (size_t)written;
+        }
+        close(descriptor);
+    }
+    os_unfair_lock_unlock(&MRReloadDiagnosticLock);
+}
 
 static id MRSafeValue(id object, NSString *key)
 {
@@ -298,22 +335,37 @@ static BOOL MRCallOriginatesFromMyrtleReloadWindowAction(void *returnAddress)
 #endif
     Dl_info info = {};
     if (returnAddress == NULL || dladdr(returnAddress, &info) == 0 ||
-        info.dli_fbase == NULL || info.dli_fname == NULL) return NO;
+        info.dli_fbase == NULL || info.dli_fname == NULL) {
+        MRReloadDiagnostic(@"origin unresolved return=%p", returnAddress);
+        return NO;
+    }
     NSString *imagePath = [NSString stringWithUTF8String:info.dli_fname];
-    if (![[imagePath lastPathComponent] isEqualToString:@"Myrtle.dylib"]) return NO;
     uintptr_t offset = (uintptr_t)returnAddress - (uintptr_t)info.dli_fbase;
-    return offset == MRMyrtleReloadWindowIsOpenReturnOffset;
+    BOOL imageMatches = [[imagePath lastPathComponent] isEqualToString:@"Myrtle.dylib"];
+    BOOL offsetMatches = offset == MRMyrtleReloadWindowIsOpenReturnOffset;
+    MRReloadDiagnostic(@"origin image=%@ base=%p return=%p offset=0x%llx imageMatch=%d offsetMatch=%d",
+                       imagePath, info.dli_fbase, returnAddress,
+                       (unsigned long long)offset, imageMatches, offsetMatches);
+    return imageMatches && offsetMatches;
 }
 
 static void MRReloadForegroundApplication(void)
 {
-    if (MRForegroundReloadInFlight) return;
+    if (MRForegroundReloadInFlight) {
+        MRReloadDiagnostic(@"fallback stopped: reload already in flight");
+        return;
+    }
     NSString *bundleID = [MRForegroundReloadCandidateBundleID copy];
     MRForegroundReloadCandidateBundleID = nil;
     if (bundleID.length == 0)
         bundleID = [MRCurrentMainApplicationBundleID() copy];
+    MRReloadDiagnostic(@"fallback candidate=%@ live=%@", bundleID,
+                       MRCurrentMainApplicationBundleID());
     if (bundleID.length == 0 || ![bundleID containsString:@"."] ||
-        [bundleID isEqualToString:@"com.apple.springboard"]) return;
+        [bundleID isEqualToString:@"com.apple.springboard"]) {
+        MRReloadDiagnostic(@"fallback stopped: invalid foreground bundle");
+        return;
+    }
 
     Class hostCore = NSClassFromString(@"MyrtleHostCore");
     SEL processSelector = NSSelectorFromString(@"MT_llIIIIIIIIllIlIIIlIl:");
@@ -322,19 +374,31 @@ static void MRReloadForegroundApplication(void)
     Method launchMethod = class_getClassMethod(hostCore, launchSelector);
     if (hostCore == Nil || processMethod == NULL || launchMethod == NULL ||
         method_getNumberOfArguments(processMethod) != 3 ||
-        method_getNumberOfArguments(launchMethod) != 3) return;
+        method_getNumberOfArguments(launchMethod) != 3) {
+        MRReloadDiagnostic(@"fallback stopped: HostCore interface process=%p launch=%p",
+                           processMethod, launchMethod);
+        return;
+    }
 
     id process = ((id (*)(id, SEL, id))objc_msgSend)(hostCore, processSelector, bundleID);
     SEL killSelector = NSSelectorFromString(@"killForReason:andReport:withDescription:");
     Method killMethod = process == nil ? NULL : class_getInstanceMethod([process class], killSelector);
-    if (killMethod == NULL || method_getNumberOfArguments(killMethod) != 5) return;
+    MRReloadDiagnostic(@"process bundle=%@ object=%@ class=%@ killMethod=%p",
+                       bundleID, process, process == nil ? @"(nil)" : NSStringFromClass([process class]),
+                       killMethod);
+    if (killMethod == NULL || method_getNumberOfArguments(killMethod) != 5) {
+        MRReloadDiagnostic(@"fallback stopped: invalid process/kill interface");
+        return;
+    }
 
     MRForegroundReloadInFlight = YES;
     ((void (*)(id, SEL, long long, BOOL, id))objc_msgSend)(
         process, killSelector, 1, NO, @"Myrtle reload foreground application");
+    MRReloadDiagnostic(@"kill sent bundle=%@", bundleID);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.40 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         ((void (*)(id, SEL, id))objc_msgSend)(hostCore, launchSelector, bundleID);
+        MRReloadDiagnostic(@"launch sent bundle=%@", bundleID);
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ MRForegroundReloadInFlight = NO; });
@@ -737,9 +801,13 @@ static MRIsWindowOpenIMP MROriginalIsWindowOpen = NULL;
 static BOOL MRHookIsWindowOpen(id self, SEL selector)
 {
     BOOL isOpen = MROriginalIsWindowOpen(self, selector);
-    if (!isOpen &&
-        MRCallOriginatesFromMyrtleReloadWindowAction(__builtin_return_address(0)))
-        MRReloadForegroundApplication();
+    if (!isOpen) {
+        BOOL reloadOrigin = MRCallOriginatesFromMyrtleReloadWindowAction(
+            __builtin_return_address(0));
+        MRReloadDiagnostic(@"isWindowOpen=0 reloadOrigin=%d cached=%@",
+                           reloadOrigin, MRForegroundReloadCandidateBundleID);
+        if (reloadOrigin) MRReloadForegroundApplication();
+    }
     return isOpen;
 }
 static const void *MRPinnedHandleControllerKey = &MRPinnedHandleControllerKey;
@@ -916,6 +984,9 @@ static void MRHookOpenSelectorAtPoint(id self, SEL selector, CGPoint centerPoint
         MRForegroundReloadCandidateBundleID = [MRCurrentMainApplicationBundleID() copy];
     else
         MRForegroundReloadCandidateBundleID = nil;
+    MRReloadDiagnostic(@"selector opening isWindowOpen=%d captured=%@",
+                       [MRSafeValue(self, @"isWindowOpen") boolValue],
+                       MRForegroundReloadCandidateBundleID);
     MRInstallPinnedHandleCenterGuard(self);
     if (MRApplyFixedKeyboardHandlePosition(self, nil)) {
         UIView *movementView = MRSafeValue(self, @"handleHitView");
@@ -1028,6 +1099,8 @@ static BOOL MRInstallMyrtleReloadFallbackHook(void)
     if (returnType[0] != 'B' && returnType[0] != 'c') return NO;
     MSHookMessageEx(cls, selector, (IMP)MRHookIsWindowOpen,
                     (IMP *)&MROriginalIsWindowOpen);
+    MRReloadDiagnostic(@"installed isWindowOpen hook method=%p original=%p replacement=%p",
+                       method, MROriginalIsWindowOpen, MRHookIsWindowOpen);
     return MROriginalIsWindowOpen != NULL;
 }
 

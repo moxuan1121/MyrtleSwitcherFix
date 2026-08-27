@@ -119,13 +119,14 @@ jobs:
             exit 1
           fi
 
-          # Every published branch is log-free. MRLog is a preprocessing no-op,
-          # so neither the old file path nor representative diagnostic format
-          # strings may survive in the optimized SpringBoard dylib.
-          if strings "$dylib" | grep -Eq \
-             'com\.(local|moxuan)\.myrtleswitcherfix.*\.log|desired front generation=|installed direct Myrtle'; then
-            echo "Diagnostic logging material survived in the production dylib" >&2
-            exit 1
+          # Production branches are log-free. The foreground-reload feature
+          # branch temporarily carries focused, action-triggered diagnostics.
+          if [[ "$GITHUB_REF" != "refs/heads/feature/reload-foreground-app" ]]; then
+            if strings "$dylib" | grep -Eq \
+               'com\.(local|moxuan)\.myrtleswitcherfix.*\.log|desired front generation=|installed direct Myrtle'; then
+              echo "Diagnostic logging material survived in the production dylib" >&2
+              exit 1
+            fi
           fi
 
           if [[ "$GITHUB_REF" == "refs/heads/performance/no-logging" ]]; then
