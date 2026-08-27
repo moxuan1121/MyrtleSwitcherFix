@@ -3,6 +3,9 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <substrate.h>
+#import <fcntl.h>
+#import <unistd.h>
+#import <string.h>
 
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
@@ -23,6 +26,28 @@ static NSUInteger MRForegroundReloadCandidateGeneration = 0;
 // Stable builds discard the complete diagnostic expression at preprocessing
 // time: no arguments, strings, filesystem access or log I/O reach SpringBoard.
 #define MRLog(...) do {} while (0)
+
+static void MRHomePageTrace(NSString *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments];
+    va_end(arguments);
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message];
+    const char *bytes = line.UTF8String;
+    if (bytes == NULL) return;
+    int fd = open("/var/mobile/Documents/com.moxuan.myrtleswitcherfix.homepage.log",
+                  O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    size_t remaining = strlen(bytes);
+    while (remaining > 0) {
+        ssize_t count = write(fd, bytes, remaining);
+        if (count <= 0) break;
+        bytes += count;
+        remaining -= (size_t)count;
+    }
+    close(fd);
+}
 
 static id MRSafeValue(id object, NSString *key)
 {
@@ -287,6 +312,90 @@ static NSString *MRCurrentMainApplicationBundleID(void)
     return MRDirectBundleIdentifier(application);
 }
 
+static NSString *MRScalarGetterValue(id object, NSString *selectorName)
+{
+    if (object == nil) return nil;
+    SEL selector = NSSelectorFromString(selectorName);
+    Method method = class_getInstanceMethod(object_getClass(object), selector);
+    if (method == NULL || method_getNumberOfArguments(method) != 2) return nil;
+    char returnType[32] = {};
+    method_getReturnType(method, returnType, sizeof(returnType));
+    @try {
+        switch (returnType[0]) {
+            case 'q': return [NSString stringWithFormat:@"%lld", ((long long (*)(id, SEL))objc_msgSend)(object, selector)];
+            case 'Q': return [NSString stringWithFormat:@"%llu", ((unsigned long long (*)(id, SEL))objc_msgSend)(object, selector)];
+            case 'i': return [NSString stringWithFormat:@"%d", ((int (*)(id, SEL))objc_msgSend)(object, selector)];
+            case 'I': return [NSString stringWithFormat:@"%u", ((unsigned int (*)(id, SEL))objc_msgSend)(object, selector)];
+            case 's': return [NSString stringWithFormat:@"%d", (int)((short (*)(id, SEL))objc_msgSend)(object, selector)];
+            case 'S': return [NSString stringWithFormat:@"%u", (unsigned int)((unsigned short (*)(id, SEL))objc_msgSend)(object, selector)];
+            case 'B': return ((BOOL (*)(id, SEL))objc_msgSend)(object, selector) ? @"1" : @"0";
+            default: return nil;
+        }
+    } @catch (__unused NSException *exception) { return nil; }
+}
+
+static void MRTraceHomePageSnapshot(NSString *stage)
+{
+    id iconController = MRSendClassNoArgs(@"SBIconController", @"sharedInstance");
+    MRHomePageTrace(@"SNAPSHOT %@ iconController=%@:%p", stage,
+                    iconController ? NSStringFromClass([iconController class]) : @"nil",
+                    (__bridge void *)iconController);
+    if (iconController == nil) return;
+
+    NSArray<NSString *> *relationshipKeys = @[
+        @"rootFolderController", @"rootFolderView", @"folderController", @"folderView",
+        @"iconManager", @"iconListView", @"currentIconListView", @"scrollView",
+        @"pagingScrollView", @"iconScrollView", @"contentView", @"view"
+    ];
+    NSArray<NSString *> *scalarSelectors = @[
+        @"currentPageIndex", @"currentIconListIndex", @"currentIconListViewIndex",
+        @"currentListIndex", @"pageIndex", @"selectedPageIndex", @"firstVisiblePageIndex",
+        @"minimumPageIndex", @"maximumPageIndex", @"numberOfPages"
+    ];
+    NSMutableArray<NSDictionary *> *queue = [NSMutableArray arrayWithObject:@{
+        @"object": iconController, @"path": @"SBIconController.sharedInstance", @"depth": @0
+    }];
+    NSHashTable *seen = [NSHashTable hashTableWithOptions:NSPointerFunctionsObjectPointerPersonality];
+    NSUInteger cursor = 0;
+    while (cursor < queue.count && cursor < 40) {
+        NSDictionary *entry = queue[cursor++];
+        id object = entry[@"object"];
+        NSString *path = entry[@"path"];
+        NSUInteger depth = [entry[@"depth"] unsignedIntegerValue];
+        if (object == nil || [seen containsObject:object]) continue;
+        [seen addObject:object];
+        NSString *geometry = @"";
+        if ([object isKindOfClass:[UIScrollView class]]) {
+            UIScrollView *scroll = object;
+            geometry = [NSString stringWithFormat:@" offset=%@ content=%@ bounds=%@ paging=%d",
+                        NSStringFromCGPoint(scroll.contentOffset), NSStringFromCGSize(scroll.contentSize),
+                        NSStringFromCGRect(scroll.bounds), scroll.pagingEnabled];
+        } else if ([object isKindOfClass:[UIView class]]) {
+            UIView *view = object;
+            geometry = [NSString stringWithFormat:@" frame=%@ bounds=%@",
+                        NSStringFromCGRect(view.frame), NSStringFromCGRect(view.bounds)];
+        }
+        NSMutableArray<NSString *> *scalars = [NSMutableArray array];
+        for (NSString *name in scalarSelectors) {
+            NSString *value = MRScalarGetterValue(object, name);
+            if (value != nil) [scalars addObject:[NSString stringWithFormat:@"%@=%@", name, value]];
+        }
+        MRHomePageTrace(@"NODE %@ class=%@:%p%@ scalars=[%@]", path,
+                        NSStringFromClass([object class]), (__bridge void *)object, geometry,
+                        [scalars componentsJoinedByString:@", "]);
+        if (depth >= 3) continue;
+        for (NSString *key in relationshipKeys) {
+            id child = MRSafeValue(object, key);
+            if (child == nil || child == object || [child isKindOfClass:[NSString class]] ||
+                [child isKindOfClass:[NSNumber class]]) continue;
+            [queue addObject:@{@"object": child,
+                               @"path": [path stringByAppendingFormat:@".%@", key],
+                               @"depth": @(depth + 1)}];
+        }
+    }
+    MRHomePageTrace(@"END SNAPSHOT %@ nodes=%lu", stage, (unsigned long)seen.count);
+}
+
 static void MRReloadForegroundApplication(void)
 {
     if (MRForegroundReloadInFlight) return;
@@ -505,6 +614,11 @@ static MRSetCurrentBundleIMP MROriginalSetCurrentBundle = NULL;
 static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
 {
     NSString *previousBundleID = [MRSafeValue(self, @"currentBundleID") copy];
+    BOOL openingFirstMyrtleWindow = bundleID.length != 0 && previousBundleID.length == 0;
+    if (openingFirstMyrtleWindow) {
+        MRHomePageTrace(@"BEGIN Myrtle windowization bundle=%@", bundleID);
+        MRTraceHomePageSnapshot(@"before-original");
+    }
     BOOL fullscreenTransition = bundleID.length == 0 && previousBundleID.length != 0 &&
         [MRMyrtleFullscreenIntentBundleID isEqualToString:previousBundleID];
     NSString *underlyingBeforeChange = nil;
@@ -515,6 +629,21 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
     NSUInteger transitionGeneration = MRReturnToMainGeneration;
     if (meaningfulTransition) transitionGeneration = ++MRReturnToMainGeneration;
     MROriginalSetCurrentBundle(self, selector, bundleID);
+    if (openingFirstMyrtleWindow) {
+        MRTraceHomePageSnapshot(@"after-original");
+        NSString *diagnosticBundleID = [bundleID copy];
+        for (NSNumber *delay in @[@0.05, @0.2, @0.5, @1.0]) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+                NSString *current = MRSafeValue(manager, @"currentBundleID");
+                MRHomePageTrace(@"DELAY %.2f expected=%@ current=%@",
+                                delay.doubleValue, diagnosticBundleID, current);
+                MRTraceHomePageSnapshot([NSString stringWithFormat:@"delay-%.2f", delay.doubleValue]);
+            });
+        }
+    }
     NSString *stableBundleID = [bundleID copy];
     if (stableBundleID.length != 0 && underlyingBeforeChange.length != 0 &&
         ![underlyingBeforeChange isEqualToString:stableBundleID]) {

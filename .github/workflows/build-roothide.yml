@@ -84,6 +84,7 @@ jobs:
 
           package="${packages[0]}"
           package_id="$(dpkg-deb -f "$package" Package)"
+          package_version="$(dpkg-deb -f "$package" Version)"
           if [[ "$package_id" != "com.moxuan.myrtleswitcherfix" ]]; then
             echo "Unexpected package identifier: $package_id" >&2
             exit 1
@@ -119,7 +120,7 @@ jobs:
             exit 1
           fi
 
-          if strings "$dylib" | grep -Eq \
+          if [[ "$package_version" != *"~beta"* ]] && strings "$dylib" | grep -Eq \
              'com\.(local|moxuan)\.myrtleswitcherfix.*\.log|desired front generation=|installed direct Myrtle'; then
             echo "Diagnostic logging material survived in the production dylib" >&2
             exit 1

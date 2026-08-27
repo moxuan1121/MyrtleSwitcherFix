@@ -1,8 +1,8 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.5.2.1
+Version: 0.5.3~beta1
 Architecture: iphoneos-arm64e
-Description: Stable log-free iOS 15 build with bounded foreground reload cache, Myrtle switcher cards, and fixed keyboard avoidance.
+Description: iOS 15 diagnostic build for preserving the selected Home Screen page during Myrtle windowization.
 Maintainer: Local
 Author: Local
 Section: Tweaks
