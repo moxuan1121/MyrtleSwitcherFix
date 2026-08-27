@@ -326,13 +326,15 @@ static void MRReloadForegroundApplication(void)
 
     Class hostCore = NSClassFromString(@"MyrtleHostCore");
     SEL processSelector = NSSelectorFromString(@"MT_llIIIIIIIIllIlIIIlIl:");
-    SEL launchSelector = NSSelectorFromString(@"MT_IllIlllIIllIllIIIIII:");
     Method processMethod = class_getClassMethod(hostCore, processSelector);
-    Method launchMethod = class_getClassMethod(hostCore, launchSelector);
-    if (hostCore == Nil || processMethod == NULL || launchMethod == NULL ||
+    id springBoard = [UIApplication sharedApplication];
+    SEL launchSelector = NSSelectorFromString(@"launchApplicationWithIdentifier:suspended:");
+    Method launchMethod = class_getInstanceMethod([springBoard class], launchSelector);
+    if (hostCore == Nil || processMethod == NULL ||
         method_getNumberOfArguments(processMethod) != 3 ||
-        method_getNumberOfArguments(launchMethod) != 3) {
-        MRReloadTrace([NSString stringWithFormat:@"stop: host interfaces process=%p launch=%p",
+        springBoard == nil || launchMethod == NULL ||
+        method_getNumberOfArguments(launchMethod) != 4) {
+        MRReloadTrace([NSString stringWithFormat:@"stop: interfaces process=%p foregroundLaunch=%p",
                        processMethod, launchMethod]);
         return;
     }
@@ -374,8 +376,9 @@ static void MRReloadForegroundApplication(void)
     MRReloadTrace(@"kill sent");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.40 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        ((void (*)(id, SEL, id))objc_msgSend)(hostCore, launchSelector, bundleID);
-        MRReloadTrace(@"launch sent");
+        ((void (*)(id, SEL, id, BOOL))objc_msgSend)(springBoard, launchSelector,
+                                                    bundleID, NO);
+        MRReloadTrace(@"foreground launch sent suspended=0");
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ MRForegroundReloadInFlight = NO; });
