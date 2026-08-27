@@ -947,6 +947,8 @@ static MRSelectorIndexForPointIMP MROriginalSelectorIndexForPointA = NULL;
 static MRSelectorIndexForPointIMP MROriginalSelectorIndexForPointB = NULL;
 typedef void (*MRSelectorPointerUpdateIMP)(id, SEL, CGPoint);
 static MRSelectorPointerUpdateIMP MROriginalSelectorPointerUpdate = NULL;
+typedef void (*MRSelectorDisplayLinkIMP)(id, SEL, CADisplayLink *);
+static MRSelectorDisplayLinkIMP MROriginalSelectorDisplayLink = NULL;
 
 static void MRHideDirectCenterView(UIView *view)
 {
@@ -1005,6 +1007,37 @@ static BOOL MRPointIsInsideDirectCenterSlot(id selectorView, CGPoint point)
     if (![centerSlot isKindOfClass:UIView.class] || centerSlot.superview == nil) return NO;
     CGPoint localPoint = [centerSlot convertPoint:point fromView:selectorView];
     return [centerSlot pointInside:localPoint withEvent:nil];
+}
+
+static BOOL MRControllerPointerIsInsideDirectCenterSlot(id controller)
+{
+    id selectorView = MRSafeValue(controller, @"selectorView");
+    NSArray *itemViews = MRSafeValue(selectorView, @"itemViews");
+    UIView *controllerView = MRSafeValue(controller, @"view");
+    NSValue *pointerValue = MRSafeValue(controller, @"selectorLastPointer");
+    if (![itemViews isKindOfClass:NSArray.class] || itemViews.count == 0 ||
+        ![controllerView isKindOfClass:UIView.class] ||
+        ![pointerValue isKindOfClass:NSValue.class]) return NO;
+
+    UIView *centerSlot = itemViews.firstObject;
+    if (![centerSlot isKindOfClass:UIView.class] || centerSlot.superview == nil) return NO;
+    CGPoint pointer = pointerValue.CGPointValue;
+    CGPoint localPoint = [centerSlot convertPoint:pointer fromView:controllerView];
+    return [centerSlot pointInside:localPoint withEvent:nil];
+}
+
+static void MRHookSelectorDisplayLink(id self, SEL selector, CADisplayLink *displayLink)
+{
+    // Myrtle samples selectorLastPointer on every display refresh and performs
+    // its haptic transition inside this callback. Reject the removed centre
+    // before that code runs; correcting the index afterwards is too late and
+    // caused a vibration on every refresh.
+    if (MRControllerPointerIsInsideDirectCenterSlot(self)) {
+        MRDisableDirectCenterHighlight(self);
+        return;
+    }
+    MROriginalSelectorDisplayLink(self, selector, displayLink);
+    MRDisableDirectCenterHighlight(self);
 }
 
 static void MRHookSelectorPointerUpdate(id self, SEL selector, CGPoint point)
@@ -1153,12 +1186,47 @@ static void MRHookSelectorGesture(id self, SEL selector, UIGestureRecognizer *ge
             gesture.state == UIGestureRecognizerStateFailed) {
             MRCancelDirectLongPress(self);
             if (gesture.state == UIGestureRecognizerStateEnded) {
-                // Let Myrtle perform its own one-shot app commit and, crucially,
-                // the remainder of its gesture cleanup that dismisses the
-                // selector. The guarded centre flag selects its fullscreen
-                // branch without re-enabling the old centre interaction.
-                MRSetDirectCenterState(self, YES);
-                MROriginalSelectorGesture(self, selector, gesture);
+                BOOL windowOpen = [MRSafeValue(self, @"isWindowOpen") boolValue];
+                if (windowOpen) {
+                    // With a hosted window Myrtle ignores centerHoldDetected
+                    // and treats an app commit as "replace window contents".
+                    // Resolve the armed app explicitly, switch the hosted app
+                    // when needed, dismiss the selector without a second
+                    // commit, then use Myrtle's dedicated window-fullscreen
+                    // operation.
+                    long long armedHighlighted = [objc_getAssociatedObject(self,
+                        MRDirectLongHighlightedKey) longLongValue];
+                    long long itemIndex = -1;
+                    NSDictionary *item = MRDirectItemForHighlightedIndex(self,
+                                                                         armedHighlighted,
+                                                                         &itemIndex);
+                    NSString *targetBundle = MRDirectItemIsApp(item) ? item[@"bundle"] : nil;
+                    NSString *currentBundle = MRSafeValue(self, @"currentWindowBundleID");
+                    if (targetBundle.length != 0 && itemIndex >= 0 &&
+                        ![targetBundle isEqualToString:currentBundle]) {
+                        MROriginalSelectorCommit(self,
+                            NSSelectorFromString(@"MT_lIIIllIllIlllIlIlIll:"), itemIndex);
+                    }
+                    id selectorView = MRSafeValue(self, @"selectorView");
+                    if ([selectorView respondsToSelector:NSSelectorFromString(@"setLastHighlightedIndex:")]) {
+                        ((void (*)(id, SEL, long long))objc_msgSend)(selectorView,
+                            NSSelectorFromString(@"setLastHighlightedIndex:"), -1);
+                    }
+                    MROriginalSelectorGesture(self, selector, gesture);
+                    if (targetBundle.length != 0 &&
+                        [self respondsToSelector:NSSelectorFromString(@"MT_llIIIlIIlIlllIlIIIII")]) {
+                        ((void (*)(id, SEL))objc_msgSend)(self,
+                            NSSelectorFromString(@"MT_llIIIlIIlIlllIlIIIII"));
+                    }
+                    MRDirectSelectorTrace(@"DIRECT-WINDOW-FULLSCREEN target=%@ previous=%@ index=%lld",
+                                          targetBundle, currentBundle, itemIndex);
+                } else {
+                    // Without an existing window Myrtle's normal commit path
+                    // correctly interprets the guarded centre state as a
+                    // direct fullscreen launch and also dismisses the selector.
+                    MRSetDirectCenterState(self, YES);
+                    MROriginalSelectorGesture(self, selector, gesture);
+                }
             }
             MRSetDirectCenterState(self, NO);
             objc_setAssociatedObject(self, MRDirectLongFiredKey, nil,
@@ -1581,6 +1649,13 @@ static BOOL MRInstallDirectSelectorDiagnosticHooks(void)
         MSHookMessageEx(cls, selector, (IMP)MRHookSelectorGesture,
                         (IMP *)&MROriginalSelectorGesture);
     }
+    if (MROriginalSelectorDisplayLink == NULL) {
+        SEL selector = NSSelectorFromString(@"MT_lIlIlIIlIIIlIllIlIll:");
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+        MSHookMessageEx(cls, selector, (IMP)MRHookSelectorDisplayLink,
+                        (IMP *)&MROriginalSelectorDisplayLink);
+    }
     if (MROriginalSetCenterHoldDetected == NULL) {
         SEL selector = NSSelectorFromString(@"setCenterHoldDetected:");
         Method method = class_getInstanceMethod(cls, selector);
@@ -1628,7 +1703,8 @@ static BOOL MRInstallDirectSelectorDiagnosticHooks(void)
            MROriginalSetCenterIconView != NULL &&
            MROriginalSelectorIndexForPointA != NULL &&
            MROriginalSelectorIndexForPointB != NULL &&
-           MROriginalSelectorPointerUpdate != NULL;
+           MROriginalSelectorPointerUpdate != NULL &&
+           MROriginalSelectorDisplayLink != NULL;
 }
 
 static BOOL MRInstallMyrtleActionDispatcherHook(void)
