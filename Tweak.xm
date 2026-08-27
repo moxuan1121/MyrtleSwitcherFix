@@ -936,6 +936,7 @@ static MRSelectorGestureIMP MROriginalSelectorGesture = NULL;
 static const void *MRSelectorTraceStateKey = &MRSelectorTraceStateKey;
 static const void *MRDirectLongGenerationKey = &MRDirectLongGenerationKey;
 static const void *MRDirectLongFiredKey = &MRDirectLongFiredKey;
+static const void *MRDirectLongHighlightedKey = &MRDirectLongHighlightedKey;
 static const void *MRDirectCenterWriteKey = &MRDirectCenterWriteKey;
 typedef void (*MRSetCenterHoldDetectedIMP)(id, SEL, BOOL);
 static MRSetCenterHoldDetectedIMP MROriginalSetCenterHoldDetected = NULL;
@@ -949,6 +950,28 @@ static void MRHideDirectCenterView(UIView *view)
     view.alpha = 0.0;
     view.userInteractionEnabled = NO;
     view.accessibilityElementsHidden = YES;
+}
+
+static void MRHideDirectCenterSlot(id controller)
+{
+    id selectorView = MRSafeValue(controller, @"selectorView");
+    MRHideDirectCenterView(MRSafeValue(selectorView, @"centerIconView"));
+    NSArray *itemViews = MRSafeValue(selectorView, @"itemViews");
+    if ([itemViews isKindOfClass:NSArray.class] && itemViews.count != 0) {
+        UIView *centerSlot = itemViews.firstObject;
+        MRHideDirectCenterView(centerSlot);
+        for (UIView *subview in centerSlot.subviews) MRHideDirectCenterView(subview);
+    }
+}
+
+static void MRDisableDirectCenterHighlight(id controller)
+{
+    id selectorView = MRSafeValue(controller, @"selectorView");
+    if ([MRSafeValue(selectorView, @"lastHighlightedIndex") longLongValue] == 0 &&
+        [selectorView respondsToSelector:NSSelectorFromString(@"setLastHighlightedIndex:")]) {
+        ((void (*)(id, SEL, long long))objc_msgSend)(selectorView,
+            NSSelectorFromString(@"setLastHighlightedIndex:"), -1);
+    }
 }
 
 static void MRHookSetCenterIconView(id self, SEL selector, UIView *view)
@@ -1037,6 +1060,8 @@ static void MRScheduleDirectLongPress(id controller, long long highlightedIndex)
 
         objc_setAssociatedObject(strongController, MRDirectLongFiredKey, @YES,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(strongController, MRDirectLongHighlightedKey,
+                                 @(highlightedIndex), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc]
                                                 initWithStyle:UIImpactFeedbackStyleMedium];
         [feedback impactOccurred];
@@ -1063,6 +1088,27 @@ static NSString *MRSelectorTraceState(id controller, UIGestureRecognizer *gestur
 static void MRHookSelectorGesture(id self, SEL selector, UIGestureRecognizer *gesture)
 {
     if ([objc_getAssociatedObject(self, MRDirectLongFiredKey) boolValue]) {
+        if (gesture.state == UIGestureRecognizerStateChanged) {
+            long long armedHighlighted = [objc_getAssociatedObject(self,
+                MRDirectLongHighlightedKey) longLongValue];
+            MRSetDirectCenterState(self, NO);
+            MROriginalSelectorGesture(self, selector, gesture);
+            MRSetDirectCenterState(self, NO);
+            MRDisableDirectCenterHighlight(self);
+            long long newHighlighted = [MRSafeValue(MRSafeValue(self, @"selectorView"),
+                                                     @"lastHighlightedIndex") longLongValue];
+            if (newHighlighted != armedHighlighted) {
+                MRCancelDirectLongPress(self);
+                objc_setAssociatedObject(self, MRDirectLongFiredKey, nil,
+                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(self, MRDirectLongHighlightedKey, nil,
+                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                MRScheduleDirectLongPress(self, newHighlighted);
+                MRDirectSelectorTrace(@"DIRECT-LONG-MOVED old=%lld new=%lld",
+                                      armedHighlighted, newHighlighted);
+            }
+            return;
+        }
         if (gesture.state == UIGestureRecognizerStateEnded ||
             gesture.state == UIGestureRecognizerStateCancelled ||
             gesture.state == UIGestureRecognizerStateFailed) {
@@ -1078,6 +1124,8 @@ static void MRHookSelectorGesture(id self, SEL selector, UIGestureRecognizer *ge
             MRSetDirectCenterState(self, NO);
             objc_setAssociatedObject(self, MRDirectLongFiredKey, nil,
                                      OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, MRDirectLongHighlightedKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
         return;
     }
@@ -1090,6 +1138,7 @@ static void MRHookSelectorGesture(id self, SEL selector, UIGestureRecognizer *ge
     // original handler. The setter hook rejects that write; keep an explicit
     // reset here as protection against direct ivar writes in this build.
     MRSetDirectCenterState(self, NO);
+    MRDisableDirectCenterHighlight(self);
     NSString *after = MRSelectorTraceState(self, gesture);
     long long highlightedAfter = [MRSafeValue(MRSafeValue(self, @"selectorView"),
                                                @"lastHighlightedIndex") longLongValue];
@@ -1102,6 +1151,8 @@ static void MRHookSelectorGesture(id self, SEL selector, UIGestureRecognizer *ge
         gesture.state == UIGestureRecognizerStateFailed) {
         MRCancelDirectLongPress(self);
         objc_setAssociatedObject(self, MRDirectLongFiredKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, MRDirectLongHighlightedKey, nil,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     NSString *last = objc_getAssociatedObject(self, MRSelectorTraceStateKey);
@@ -1365,13 +1416,11 @@ static void MRHookOpenSelectorAtPoint(id self, SEL selector, CGPoint centerPoint
         if ([movementView isKindOfClass:UIView.class]) centerPoint.y = movementView.center.y;
     }
     MROriginalOpenSelectorAtPoint(self, selector, centerPoint);
-    UIView *centerIcon = MRSafeValue(MRSafeValue(self, @"selectorView"), @"centerIconView");
-    MRHideDirectCenterView(centerIcon);
+    MRHideDirectCenterSlot(self);
     __weak id weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
         id strongSelf = weakSelf;
-        MRHideDirectCenterView(MRSafeValue(MRSafeValue(strongSelf, @"selectorView"),
-                                           @"centerIconView"));
+        MRHideDirectCenterSlot(strongSelf);
     });
 }
 
