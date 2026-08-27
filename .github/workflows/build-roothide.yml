@@ -119,12 +119,10 @@ jobs:
             exit 1
           fi
 
-          if [[ "$GITHUB_REF" != "refs/heads/feature/reload-foreground-app" ]]; then
-            if strings "$dylib" | grep -Eq \
-               'com\.(local|moxuan)\.myrtleswitcherfix.*\.log|desired front generation=|installed direct Myrtle'; then
-              echo "Diagnostic logging material survived in the production dylib" >&2
-              exit 1
-            fi
+          if strings "$dylib" | grep -Eq \
+             'com\.(local|moxuan)\.myrtleswitcherfix.*\.log|desired front generation=|installed direct Myrtle'; then
+            echo "Diagnostic logging material survived in the production dylib" >&2
+            exit 1
           fi
 
           if [[ "$GITHUB_REF" == "refs/heads/performance/no-logging" ]]; then
