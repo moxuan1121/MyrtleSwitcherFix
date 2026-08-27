@@ -959,6 +959,7 @@ static void MRHideDirectCenterView(UIView *view)
     view.alpha = 0.0;
     view.userInteractionEnabled = NO;
     view.accessibilityElementsHidden = YES;
+    [view removeFromSuperview];
 }
 
 static void MRHideDirectCenterSlot(id controller)
@@ -1200,36 +1201,34 @@ static void MRHookSelectorGesture(id self, SEL selector, UIGestureRecognizer *ge
             gesture.state == UIGestureRecognizerStateFailed) {
             MRCancelDirectLongPress(self);
             if (gesture.state == UIGestureRecognizerStateEnded) {
-                BOOL windowOpen = [MRSafeValue(self, @"isWindowOpen") boolValue];
-                if (windowOpen) {
-                    // Let Myrtle commit the armed app and dismiss the selector,
-                    // then invoke the exact action used by its built-in
-                    // switchFullscreenWindow radial item.  The lower-level
-                    // no-argument method alone lacks state after gesture
-                    // cleanup and did not reopen the app fullscreen.
-                    long long armedHighlighted = [objc_getAssociatedObject(self,
-                        MRDirectLongHighlightedKey) longLongValue];
-                    long long itemIndex = -1;
-                    NSDictionary *item = MRDirectItemForHighlightedIndex(self,
-                                                                         armedHighlighted,
-                                                                         &itemIndex);
-                    NSString *targetBundle = MRDirectItemIsApp(item) ? item[@"bundle"] : nil;
-                    NSString *currentBundle = MRSafeValue(self, @"currentWindowBundleID");
-                    MROriginalSelectorGesture(self, selector, gesture);
-                    if (targetBundle.length != 0 && MROriginalActionDispatcher != NULL) {
-                        MROriginalActionDispatcher(self,
-                            NSSelectorFromString(@"MT_IlIIllIIlIlllIIIIllI:::"),
-                            @"switchFullscreenWindow", nil, nil);
-                    }
-                    MRDirectSelectorTrace(@"DIRECT-WINDOW-FULLSCREEN target=%@ previous=%@ index=%lld",
-                                          targetBundle, currentBundle, itemIndex);
-                } else {
-                    // Without an existing window Myrtle's normal commit path
-                    // correctly interprets the guarded centre state as a
-                    // direct fullscreen launch and also dismisses the selector.
-                    MRSetDirectCenterState(self, YES);
-                    MROriginalSelectorGesture(self, selector, gesture);
+                long long armedHighlighted = [objc_getAssociatedObject(self,
+                    MRDirectLongHighlightedKey) longLongValue];
+                long long itemIndex = -1;
+                NSDictionary *item = MRDirectItemForHighlightedIndex(self,
+                                                                     armedHighlighted,
+                                                                     &itemIndex);
+                NSString *targetBundle = MRDirectItemIsApp(item) ? [item[@"bundle"] copy] : nil;
+
+                // Original gesture end is retained only for Myrtle's selector
+                // dismissal.  MRHookSelectorCommit sees LongFired and blocks
+                // the implicit window commit generated during that cleanup.
+                MRSetDirectCenterState(self, NO);
+                MROriginalSelectorGesture(self, selector, gesture);
+
+                // One universal rule for every foreground state: a completed
+                // long press launches the selected bundle through Myrtle's
+                // own fullscreen host-core entry.  No centre/window state is
+                // consulted, so desktop and in-app behaviour cannot diverge.
+                Class hostCore = NSClassFromString(@"MyrtleHostCore");
+                SEL launchSelector = NSSelectorFromString(@"MT_IllIlllIIllIllIIIIII:");
+                if (targetBundle.length != 0 &&
+                    [hostCore respondsToSelector:launchSelector]) {
+                    ((void (*)(id, SEL, NSString *))objc_msgSend)(hostCore,
+                                                                 launchSelector,
+                                                                 targetBundle);
                 }
+                MRDirectSelectorTrace(@"DIRECT-FULLSCREEN target=%@ index=%lld",
+                                      targetBundle, itemIndex);
             }
             MRSetDirectCenterState(self, NO);
             objc_setAssociatedObject(self, MRDirectLongFiredKey, nil,
@@ -1303,6 +1302,11 @@ static void MRHookSelectorCommit(id self, SEL selector, long long index)
                           MRSelectorObjectSummary(MRSafeValue(self, @"selectorLongPressCandidateActionId")),
                           MRSelectorObjectSummary(MRSafeValue(self, @"selectorLongPressTriggered")),
                           MRSelectorObjectSummary(MRSafeValue(self, @"centerHoldDetected")));
+    if ([objc_getAssociatedObject(self, MRDirectLongFiredKey) boolValue]) {
+        MRDirectSelectorTrace(@"ITEM-BLOCKED-LONG index=%lld item=%@",
+                              index, MRSelectorObjectSummary(item));
+        return;
+    }
     MROriginalSelectorCommit(self, selector, index);
     MRDirectSelectorTrace(@"ITEM-AFTER index=%lld windowOpen=%d current=%@ candidateIndex=%@ candidateAction=%@ longTriggered=%@",
                           index, [MRSafeValue(self, @"isWindowOpen") boolValue],
