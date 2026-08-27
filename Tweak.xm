@@ -154,7 +154,9 @@ static void MRHookFBSystemOpen(id self, SEL selector, id application, id options
                completion ? NSStringFromClass([completion class]) : @"nil",
                MRBlockSignature(completion));
     MRFBSystemCompletion originalCompletion = completion;
-    MRFBSystemCompletion wrappedCompletion = originalCompletion == nil ? nil :
+    MRFBSystemCompletion wrappedCompletion = nil;
+    if (originalCompletion != nil) {
+        wrappedCompletion =
         ^(id a1, id a2, id a3, id a4, id a5, id a6, id a7, id a8, id a9, id a10) {
             MRURLTrace(@"FBSystemService COMPLETE app=%@ args=[1:{%@} 2:{%@} 3:{%@} 4:{%@} 5:{%@} 6:{%@} 7:{%@} 8:{%@} 9:{%@} 10:{%@}]",
                        application, MRURLObjectSummary(a1), MRURLObjectSummary(a2),
@@ -164,6 +166,7 @@ static void MRHookFBSystemOpen(id self, SEL selector, id application, id options
                        MRURLObjectSummary(a9), MRURLObjectSummary(a10));
             originalCompletion(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10);
         };
+    }
     MROriginalFBSystemOpen(self, selector, application, options, originator,
                            requestID, wrappedCompletion);
     NSString *target = [application isKindOfClass:NSString.class] ? application : nil;
