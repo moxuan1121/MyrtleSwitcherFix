@@ -3,6 +3,9 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <substrate.h>
+#import <fcntl.h>
+#import <unistd.h>
+#import <string.h>
 
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
@@ -22,6 +25,24 @@ static __strong NSString *MRForegroundReloadCandidateBundleID = nil;
 // Stable builds discard the complete diagnostic expression at preprocessing
 // time: no arguments, strings, filesystem access or log I/O reach SpringBoard.
 #define MRLog(...) do {} while (0)
+
+static void MRReloadTrace(NSString *message)
+{
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message];
+    const char *bytes = line.UTF8String;
+    if (bytes == NULL) return;
+    int fd = open("/var/mobile/Documents/com.moxuan.myrtleswitcherfix.reload-stage.log",
+                  O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    size_t remaining = strlen(bytes);
+    while (remaining > 0) {
+        ssize_t count = write(fd, bytes, remaining);
+        if (count <= 0) break;
+        bytes += count;
+        remaining -= (size_t)count;
+    }
+    close(fd);
+}
 
 static id MRSafeValue(id object, NSString *key)
 {
@@ -288,13 +309,20 @@ static NSString *MRCurrentMainApplicationBundleID(void)
 
 static void MRReloadForegroundApplication(void)
 {
-    if (MRForegroundReloadInFlight) return;
+    if (MRForegroundReloadInFlight) {
+        MRReloadTrace(@"stop: already in flight");
+        return;
+    }
     NSString *bundleID = [MRForegroundReloadCandidateBundleID copy];
     MRForegroundReloadCandidateBundleID = nil;
     if (bundleID.length == 0)
         bundleID = [MRCurrentMainApplicationBundleID() copy];
+    MRReloadTrace([NSString stringWithFormat:@"start bundle=%@", bundleID]);
     if (bundleID.length == 0 || ![bundleID containsString:@"."] ||
-        [bundleID isEqualToString:@"com.apple.springboard"]) return;
+        [bundleID isEqualToString:@"com.apple.springboard"]) {
+        MRReloadTrace(@"stop: invalid bundle");
+        return;
+    }
 
     Class hostCore = NSClassFromString(@"MyrtleHostCore");
     SEL processSelector = NSSelectorFromString(@"MT_llIIIIIIIIllIlIIIlIl:");
@@ -303,19 +331,31 @@ static void MRReloadForegroundApplication(void)
     Method launchMethod = class_getClassMethod(hostCore, launchSelector);
     if (hostCore == Nil || processMethod == NULL || launchMethod == NULL ||
         method_getNumberOfArguments(processMethod) != 3 ||
-        method_getNumberOfArguments(launchMethod) != 3) return;
+        method_getNumberOfArguments(launchMethod) != 3) {
+        MRReloadTrace([NSString stringWithFormat:@"stop: host interfaces process=%p launch=%p",
+                       processMethod, launchMethod]);
+        return;
+    }
 
     id process = ((id (*)(id, SEL, id))objc_msgSend)(hostCore, processSelector, bundleID);
     SEL killSelector = NSSelectorFromString(@"killForReason:andReport:withDescription:");
     Method killMethod = process == nil ? NULL : class_getInstanceMethod([process class], killSelector);
-    if (killMethod == NULL || method_getNumberOfArguments(killMethod) != 5) return;
+    MRReloadTrace([NSString stringWithFormat:@"process=%@ class=%@ kill=%p args=%u",
+                   process, process == nil ? @"nil" : NSStringFromClass([process class]),
+                   killMethod, killMethod == NULL ? 0 : method_getNumberOfArguments(killMethod)]);
+    if (killMethod == NULL || method_getNumberOfArguments(killMethod) != 5) {
+        MRReloadTrace(@"stop: invalid process kill interface");
+        return;
+    }
 
     MRForegroundReloadInFlight = YES;
     ((void (*)(id, SEL, long long, BOOL, id))objc_msgSend)(
         process, killSelector, 1, NO, @"Myrtle reload foreground application");
+    MRReloadTrace(@"kill sent");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.40 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         ((void (*)(id, SEL, id))objc_msgSend)(hostCore, launchSelector, bundleID);
+        MRReloadTrace(@"launch sent");
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ MRForegroundReloadInFlight = NO; });
@@ -721,7 +761,11 @@ static void MRHookActionDispatcher(id self, SEL selector, id argument1,
     BOOL isReloadAction = [argument1 isKindOfClass:NSString.class] &&
         [(NSString *)argument1 isEqualToString:@"reloadApp"];
     BOOL isWindowOpen = [MRSafeValue(self, @"isWindowOpen") boolValue];
-    if (isReloadAction && !isWindowOpen) MRReloadForegroundApplication();
+    if (isReloadAction && !isWindowOpen) {
+        MRReloadTrace([NSString stringWithFormat:@"dispatcher reloadApp cached=%@",
+                       MRForegroundReloadCandidateBundleID]);
+        MRReloadForegroundApplication();
+    }
     MROriginalActionDispatcher(self, selector, argument1, argument2, argument3);
 }
 static const void *MRPinnedHandleControllerKey = &MRPinnedHandleControllerKey;
