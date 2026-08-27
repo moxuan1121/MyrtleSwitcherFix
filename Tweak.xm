@@ -75,6 +75,34 @@ static MRFBSystemOpenIMP MROriginalFBSystemOpen = NULL;
 typedef void (*MRFBSOpenServiceIMP)(id, SEL, id, id, id);
 static MRFBSOpenServiceIMP MROriginalFBSOpenService = NULL;
 static id MRSafeValue(id object, NSString *key);
+static id MRSendClassNoArgs(NSString *className, NSString *selectorName);
+
+enum {
+    MRBlockHasCopyDispose = (1 << 25),
+    MRBlockHasSignature = (1 << 30),
+};
+
+struct MRBlockLiteral {
+    void *isa;
+    int flags;
+    int reserved;
+    void (*invoke)(void *, ...);
+    struct MRBlockDescriptor *descriptor;
+};
+
+static NSString *MRBlockSignature(id block)
+{
+    if (block == nil) return @"nil";
+    struct MRBlockLiteral *literal = (__bridge struct MRBlockLiteral *)block;
+    if ((literal->flags & MRBlockHasSignature) == 0 || literal->descriptor == NULL)
+        return @"unavailable";
+    uint8_t *cursor = (uint8_t *)literal->descriptor;
+    cursor += sizeof(unsigned long int) * 2;
+    if ((literal->flags & MRBlockHasCopyDispose) != 0)
+        cursor += sizeof(void *) * 2;
+    const char *signature = (*(const char **)cursor);
+    return signature == NULL ? @"null" : [NSString stringWithUTF8String:signature];
+}
 
 static NSString *MRURLObjectSummary(id object)
 {
@@ -119,12 +147,25 @@ static void MRHookSBHandleOpenRequest(id self, SEL selector, id application,
 static void MRHookFBSystemOpen(id self, SEL selector, id application, id options,
                                id originator, id requestID, id completion)
 {
-    MRURLTrace(@"FBSystemService open app={%@} options={%@} originator={%@} requestID={%@} completion=%@",
+    MRURLTrace(@"FBSystemService open app={%@} options={%@} originator={%@} requestID={%@} completion=%@ signature=%@",
                MRURLObjectSummary(application), MRURLObjectSummary(options),
                MRURLObjectSummary(originator), requestID,
-               completion ? NSStringFromClass([completion class]) : @"nil");
+               completion ? NSStringFromClass([completion class]) : @"nil",
+               MRBlockSignature(completion));
     MROriginalFBSystemOpen(self, selector, application, options, originator,
                            requestID, completion);
+    NSString *target = [application isKindOfClass:NSString.class] ? application : nil;
+    if ([target isEqualToString:@"com.apple.Preferences"]) {
+        for (NSNumber *delay in @[@0.0, @0.1, @0.3]) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+                MRURLTrace(@"FBSystemService POST delay=%.1f currentMyrtle=%@",
+                           delay.doubleValue, MRSafeValue(manager, @"currentBundleID"));
+            });
+        }
+    }
 }
 
 static void MRHookFBSOpenService(id self, SEL selector, id application, id options,
