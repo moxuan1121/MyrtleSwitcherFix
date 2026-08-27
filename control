@@ -1,8 +1,8 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.5.3~beta4
+Version: 0.5.3~beta5
 Architecture: iphoneos-arm64e
-Description: iOS 15 test build that guards the root icon scroll offset during Myrtle windowization.
+Description: iOS 15 test build that guards the root icon scroll offset throughout Myrtle window open and close transitions.
 Maintainer: Local
 Author: Local
 Section: Tweaks

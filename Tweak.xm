@@ -27,6 +27,7 @@ static BOOL MRHomePageGuardActive = NO;
 static long long MRHomePageGuardPageIndex = 0;
 static long long MRHomePageGuardMinimumIndex = 0;
 static NSTimeInterval MRHomePageGuardDeadline = 0;
+static BOOL MRHomePageGuardClosing = NO;
 static __strong NSString *MRHomePageGuardBundleID = nil;
 
 typedef void (*MRSetPageAnimatedIMP)(id, SEL, long long, BOOL);
@@ -368,10 +369,12 @@ static BOOL MRShouldReplaceHomePageRequest(long long requestedPage,
 {
     if (!MRHomePageGuardActive || requestedPage != MRHomePageGuardMinimumIndex ||
         MRHomePageGuardPageIndex == MRHomePageGuardMinimumIndex ||
-        [NSDate timeIntervalSinceReferenceDate] > MRHomePageGuardDeadline) return NO;
+        (MRHomePageGuardDeadline > 0 &&
+         [NSDate timeIntervalSinceReferenceDate] > MRHomePageGuardDeadline)) return NO;
     id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
     NSString *currentBundleID = MRSafeValue(manager, @"currentBundleID");
-    if (![currentBundleID isEqualToString:MRHomePageGuardBundleID]) return NO;
+    if (![currentBundleID isEqualToString:MRHomePageGuardBundleID] &&
+        !(MRHomePageGuardClosing && currentBundleID.length == 0)) return NO;
     if (replacementPage != NULL) *replacementPage = MRHomePageGuardPageIndex;
     return YES;
 }
@@ -404,16 +407,28 @@ static BOOL MRGuardRootScrollOffset(id scrollView, CGPoint requestedOffset,
                                     CGPoint *replacementOffset)
 {
     if (!MRHomePageGuardActive ||
-        [NSDate timeIntervalSinceReferenceDate] > MRHomePageGuardDeadline) return NO;
+        (MRHomePageGuardDeadline > 0 &&
+         [NSDate timeIntervalSinceReferenceDate] > MRHomePageGuardDeadline)) return NO;
     id controller = MRRootFolderController();
     id rootFolderView = MRSafeValue(controller, @"rootFolderView");
     id currentRootScrollView = MRSafeValue(rootFolderView, @"scrollView");
     if (scrollView != currentRootScrollView ||
         ![scrollView isKindOfClass:[UIScrollView class]]) return NO;
+    UIScrollView *rootScrollView = scrollView;
+    if (rootScrollView.tracking || rootScrollView.dragging ||
+        rootScrollView.decelerating) {
+        MRHomePageTrace(@"CANCEL guard for user scroll tracking=%d dragging=%d decelerating=%d",
+                        rootScrollView.tracking, rootScrollView.dragging,
+                        rootScrollView.decelerating);
+        MRHomePageGuardActive = NO;
+        MRHomePageGuardClosing = NO;
+        MRHomePageGuardBundleID = nil;
+        return NO;
+    }
     id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
     NSString *currentBundleID = MRSafeValue(manager, @"currentBundleID");
-    if (![currentBundleID isEqualToString:MRHomePageGuardBundleID]) return NO;
-    UIScrollView *rootScrollView = scrollView;
+    if (![currentBundleID isEqualToString:MRHomePageGuardBundleID] &&
+        !(MRHomePageGuardClosing && currentBundleID.length == 0)) return NO;
     CGFloat targetX = (CGFloat)(MRHomePageGuardPageIndex - MRHomePageGuardMinimumIndex) *
         rootScrollView.bounds.size.width;
     if (requestedOffset.x >= targetX - 0.5) return NO;
@@ -462,17 +477,10 @@ static void MRArmHomePageGuard(long long pageIndex, NSString *bundleID,
     MRHomePageGuardPageIndex = pageIndex;
     MRHomePageGuardMinimumIndex = minimumPageIndex;
     MRHomePageGuardBundleID = [bundleID copy];
-    MRHomePageGuardDeadline = [NSDate timeIntervalSinceReferenceDate] + 3.0;
+    MRHomePageGuardDeadline = 0;
+    MRHomePageGuardClosing = NO;
     MRHomePageGuardActive = YES;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.05 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (generation == MRHomePageRestoreGeneration) {
-            MRHomePageTrace(@"EXPIRE guard generation=%lu bundle=%@",
-                            (unsigned long)generation, MRHomePageGuardBundleID);
-            MRHomePageGuardActive = NO;
-            MRHomePageGuardBundleID = nil;
-        }
-    });
+    (void)generation;
 }
 
 static void MRTraceHomePageSnapshot(NSString *stage)
@@ -773,9 +781,31 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
             MRArmHomePageGuard(preservedHomePage, bundleID, homePageGeneration);
         MRTraceHomePageSnapshot(@"before-original");
     } else if (bundleID.length == 0 && previousBundleID.length != 0) {
-        MRHomePageRestoreGeneration++;
-        MRHomePageGuardActive = NO;
-        MRHomePageGuardBundleID = nil;
+        NSUInteger closingGeneration = ++MRHomePageRestoreGeneration;
+        if (MRHomePageGuardActive &&
+            [MRHomePageGuardBundleID isEqualToString:previousBundleID]) {
+            MRHomePageGuardClosing = YES;
+            MRHomePageGuardDeadline = [NSDate timeIntervalSinceReferenceDate] + 2.0;
+            MRHomePageTrace(@"BEGIN closing guard bundle=%@ generation=%lu",
+                            previousBundleID, (unsigned long)closingGeneration);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(2.05 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (closingGeneration == MRHomePageRestoreGeneration &&
+                    MRHomePageGuardClosing) {
+                    MRHomePageTrace(@"EXPIRE closing guard generation=%lu bundle=%@",
+                                    (unsigned long)closingGeneration,
+                                    MRHomePageGuardBundleID);
+                    MRHomePageGuardActive = NO;
+                    MRHomePageGuardClosing = NO;
+                    MRHomePageGuardBundleID = nil;
+                }
+            });
+        } else {
+            MRHomePageGuardActive = NO;
+            MRHomePageGuardClosing = NO;
+            MRHomePageGuardBundleID = nil;
+        }
     }
     BOOL fullscreenTransition = bundleID.length == 0 && previousBundleID.length != 0 &&
         [MRMyrtleFullscreenIntentBundleID isEqualToString:previousBundleID];
