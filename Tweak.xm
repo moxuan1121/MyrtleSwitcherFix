@@ -3,6 +3,9 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <substrate.h>
+#import <fcntl.h>
+#import <unistd.h>
+#import <string.h>
 
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
@@ -35,6 +38,103 @@ static MRSetContentOffsetIMP MROriginalSetContentOffset = NULL;
 // Production builds discard the complete diagnostic expression at preprocessing
 // time: no arguments or diagnostic strings reach SpringBoard.
 #define MRLog(...) do {} while (0)
+
+static void MRURLTrace(NSString *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments];
+    va_end(arguments);
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message];
+    const char *bytes = line.UTF8String;
+    if (bytes == NULL) return;
+    int fd = open("/var/mobile/Documents/com.moxuan.myrtleswitcherfix.url.log",
+                  O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    size_t remaining = strlen(bytes);
+    while (remaining > 0) {
+        ssize_t count = write(fd, bytes, remaining);
+        if (count <= 0) break;
+        bytes += count;
+        remaining -= (size_t)count;
+    }
+    close(fd);
+}
+
+typedef BOOL (*MRCanOpenURLIMP)(id, SEL, NSURL *);
+static MRCanOpenURLIMP MROriginalCanOpenURL = NULL;
+typedef void (^MROpenURLCompletion)(BOOL success);
+typedef void (*MROpenURLIMP)(id, SEL, NSURL *, NSDictionary *, MROpenURLCompletion);
+static MROpenURLIMP MROriginalOpenURL = NULL;
+
+static BOOL MRHookCanOpenURL(id self, SEL selector, NSURL *URL)
+{
+    BOOL result = MROriginalCanOpenURL(self, selector, URL);
+    MRURLTrace(@"UIApplication canOpenURL url=%@ scheme=%@ result=%d",
+               URL.absoluteString, URL.scheme, result);
+    return result;
+}
+
+static void MRHookOpenURL(id self, SEL selector, NSURL *URL,
+                          NSDictionary *options, MROpenURLCompletion completion)
+{
+    MRURLTrace(@"UIApplication open BEGIN url=%@ scheme=%@ options=%@ completion=%d",
+               URL.absoluteString, URL.scheme, options, completion != nil);
+    MROpenURLCompletion wrapped = ^(BOOL success) {
+        MRURLTrace(@"UIApplication open COMPLETE url=%@ scheme=%@ success=%d",
+                   URL.absoluteString, URL.scheme, success);
+        if (completion != nil) completion(success);
+    };
+    MROriginalOpenURL(self, selector, URL, options, wrapped);
+}
+
+static void MRTraceURLMethodsForClass(NSString *className)
+{
+    Class cls = NSClassFromString(className);
+    if (cls == Nil) {
+        MRURLTrace(@"CLASS %@ unavailable", className);
+        return;
+    }
+    for (NSUInteger pass = 0; pass < 2; pass++) {
+        Class target = pass == 0 ? cls : object_getClass(cls);
+        unsigned int count = 0;
+        Method *methods = class_copyMethodList(target, &count);
+        for (unsigned int index = 0; index < count; index++) {
+            SEL selector = method_getName(methods[index]);
+            NSString *name = NSStringFromSelector(selector);
+            if ([name rangeOfString:@"URL" options:NSCaseInsensitiveSearch].location == NSNotFound &&
+                [name rangeOfString:@"open" options:NSCaseInsensitiveSearch].location == NSNotFound)
+                continue;
+            MRURLTrace(@"METHOD %@ %@ selector=%@ args=%u types=%s",
+                       className, pass == 0 ? @"instance" : @"class", name,
+                       method_getNumberOfArguments(methods[index]),
+                       method_getTypeEncoding(methods[index]));
+        }
+        free(methods);
+    }
+}
+
+static void MRInstallURLDiagnostics(void)
+{
+    Class applicationClass = [UIApplication class];
+    Method canMethod = class_getInstanceMethod(applicationClass, @selector(canOpenURL:));
+    if (canMethod != NULL && method_getNumberOfArguments(canMethod) == 3)
+        MSHookMessageEx(applicationClass, @selector(canOpenURL:), (IMP)MRHookCanOpenURL,
+                        (IMP *)&MROriginalCanOpenURL);
+
+    SEL openSelector = @selector(openURL:options:completionHandler:);
+    Method openMethod = class_getInstanceMethod(applicationClass, openSelector);
+    if (openMethod != NULL && method_getNumberOfArguments(openMethod) == 5)
+        MSHookMessageEx(applicationClass, openSelector, (IMP)MRHookOpenURL,
+                        (IMP *)&MROriginalOpenURL);
+
+    MRURLTrace(@"INSTALL UIApplication can=%d open=%d",
+               MROriginalCanOpenURL != NULL, MROriginalOpenURL != NULL);
+    for (NSString *className in @[@"UIApplication", @"LSApplicationWorkspace",
+                                   @"SBMainWorkspace", @"SBApplicationController",
+                                   @"FBSystemService", @"FBSOpenApplicationService"])
+        MRTraceURLMethodsForClass(className);
+}
 
 static id MRSafeValue(id object, NSString *key)
 {
@@ -1306,6 +1406,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
+            MRInstallURLDiagnostics();
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
             MRInstallUserDeletionHook();
