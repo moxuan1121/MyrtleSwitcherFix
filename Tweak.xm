@@ -797,6 +797,20 @@ typedef void (*MROpenSelectorAtPointIMP)(id, SEL, CGPoint);
 static MROpenSelectorAtPointIMP MROriginalOpenSelectorAtPoint = NULL;
 typedef BOOL (*MRIsWindowOpenIMP)(id, SEL);
 static MRIsWindowOpenIMP MROriginalIsWindowOpen = NULL;
+typedef void (*MRActionDispatcherIMP)(id, SEL, id, id, id);
+static MRActionDispatcherIMP MROriginalActionDispatcher = NULL;
+
+static void MRHookActionDispatcher(id self, SEL selector, id argument1,
+                                   id argument2, id argument3)
+{
+    MRReloadDiagnostic(@"ACTION dispatcher arg1=<%@:%@> arg2=<%@:%@> arg3=<%@:%@> isWindowOpen=%d cached=%@",
+                       argument1 == nil ? @"nil" : NSStringFromClass([argument1 class]), argument1,
+                       argument2 == nil ? @"nil" : NSStringFromClass([argument2 class]), argument2,
+                       argument3 == nil ? @"nil" : NSStringFromClass([argument3 class]), argument3,
+                       [MRSafeValue(self, @"isWindowOpen") boolValue],
+                       MRForegroundReloadCandidateBundleID);
+    MROriginalActionDispatcher(self, selector, argument1, argument2, argument3);
+}
 
 static BOOL MRHookIsWindowOpen(id self, SEL selector)
 {
@@ -1104,6 +1118,23 @@ static BOOL MRInstallMyrtleReloadFallbackHook(void)
     return MROriginalIsWindowOpen != NULL;
 }
 
+static BOOL MRInstallMyrtleActionDispatcherDiagnosticHook(void)
+{
+    if (MROriginalActionDispatcher != NULL) return YES;
+    Class cls = NSClassFromString(@"MyrtleViewController");
+    SEL selector = NSSelectorFromString(@"MT_IlIIllIIlIlllIIIIllI:::");
+    Method method = class_getInstanceMethod(cls, selector);
+    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 5) return NO;
+    char returnType[16] = {};
+    method_getReturnType(method, returnType, sizeof(returnType));
+    if (returnType[0] != 'v') return NO;
+    MSHookMessageEx(cls, selector, (IMP)MRHookActionDispatcher,
+                    (IMP *)&MROriginalActionDispatcher);
+    MRReloadDiagnostic(@"installed action dispatcher hook method=%p original=%p replacement=%p",
+                       method, MROriginalActionDispatcher, MRHookActionDispatcher);
+    return MROriginalActionDispatcher != NULL;
+}
+
 static void MRInstallSwitcherRemoveHook(void)
 {
     Class cls = NSClassFromString(@"SBMainSwitcherViewController");
@@ -1164,9 +1195,10 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL keyboardAvoidanceInstalled = MRInstallMyrtleKeyboardAvoidanceHook();
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
     BOOL reloadFallbackInstalled = MRInstallMyrtleReloadFallbackHook();
+    BOOL actionDispatcherInstalled = MRInstallMyrtleActionDispatcherDiagnosticHook();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
         keyboardAvoidanceInstalled && selectorCenterInstalled &&
-        reloadFallbackInstalled) return;
+        reloadFallbackInstalled && actionDispatcherInstalled) return;
     if (attempt >= 60) {
         MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d selectorCenter=%d",
               managerInstalled, fullscreenInstalled, hostCoreLaunchInstalled,

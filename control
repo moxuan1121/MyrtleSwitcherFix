@@ -1,6 +1,6 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.5.2~beta3
+Version: 0.5.2~beta4
 Architecture: iphoneos-arm64e
 Description: Focused diagnostic build for the Myrtle foreground reload fallback.
 Maintainer: Local
