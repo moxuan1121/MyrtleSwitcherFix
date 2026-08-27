@@ -949,6 +949,8 @@ typedef void (*MRSelectorPointerUpdateIMP)(id, SEL, CGPoint);
 static MRSelectorPointerUpdateIMP MROriginalSelectorPointerUpdate = NULL;
 typedef void (*MRSelectorDisplayLinkIMP)(id, SEL, CADisplayLink *);
 static MRSelectorDisplayLinkIMP MROriginalSelectorDisplayLink = NULL;
+typedef id (*MRSelectorImpactGeneratorIMP)(id, SEL);
+static MRSelectorImpactGeneratorIMP MROriginalSelectorImpactGenerator = NULL;
 
 static void MRHideDirectCenterView(UIView *view)
 {
@@ -1050,6 +1052,18 @@ static void MRHookSelectorPointerUpdate(id self, SEL selector, CGPoint point)
         return;
     }
     MROriginalSelectorPointerUpdate(self, selector, point);
+}
+
+static id MRHookSelectorImpactGenerator(id self, SEL selector)
+{
+    (void)self;
+    (void)selector;
+    // The only selector-view xref to this getter is Myrtle's pointer-update
+    // routine immediately before impactOccurred.  Direct mode intentionally
+    // has an empty centre; suppressing this local generator prevents the
+    // -1/item boundary from producing a vibration every display refresh.
+    // The explicit long-press confirmation uses its own generator and remains.
+    return nil;
 }
 
 static void MRHookSetCenterHoldDetected(id self, SEL selector, BOOL detected)
@@ -1691,6 +1705,13 @@ static BOOL MRInstallDirectSelectorDiagnosticHooks(void)
         MSHookMessageEx(selectorViewClass, selector, (IMP)MRHookSelectorPointerUpdate,
                         (IMP *)&MROriginalSelectorPointerUpdate);
     }
+    if (MROriginalSelectorImpactGenerator == NULL) {
+        SEL selector = NSSelectorFromString(@"impactGenerator");
+        Method method = class_getInstanceMethod(selectorViewClass, selector);
+        if (method == NULL || method_getNumberOfArguments(method) != 2) return NO;
+        MSHookMessageEx(selectorViewClass, selector, (IMP)MRHookSelectorImpactGenerator,
+                        (IMP *)&MROriginalSelectorImpactGenerator);
+    }
     MRDirectSelectorTrace(@"INSTALLED item=%p center=%p gesture=%p",
                           MROriginalSelectorCommit, MROriginalCenterCommit,
                           MROriginalSelectorGesture);
@@ -1700,7 +1721,8 @@ static BOOL MRInstallDirectSelectorDiagnosticHooks(void)
            MROriginalSelectorIndexForPointA != NULL &&
            MROriginalSelectorIndexForPointB != NULL &&
            MROriginalSelectorPointerUpdate != NULL &&
-           MROriginalSelectorDisplayLink != NULL;
+           MROriginalSelectorDisplayLink != NULL &&
+           MROriginalSelectorImpactGenerator != NULL;
 }
 
 static BOOL MRInstallMyrtleActionDispatcherHook(void)
