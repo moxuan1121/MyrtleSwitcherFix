@@ -337,10 +337,30 @@ static void MRReloadForegroundApplication(void)
         return;
     }
 
-    id process = ((id (*)(id, SEL, id))objc_msgSend)(hostCore, processSelector, bundleID);
+    id application = ((id (*)(id, SEL, id))objc_msgSend)(hostCore, processSelector, bundleID);
     SEL killSelector = NSSelectorFromString(@"killForReason:andReport:withDescription:");
+    id process = nil;
+    for (NSString *key in @[@"mainProcess", @"applicationProcess", @"process"]) {
+        id candidate = MRSafeValue(application, key);
+        if (candidate != nil) {
+            process = candidate;
+            break;
+        }
+    }
+    if (process == nil) {
+        id processManager = MRSendClassNoArgs(@"FBProcessManager", @"sharedInstance");
+        for (NSString *name in @[@"applicationProcessForBundleIdentifier:",
+                                  @"processForBundleIdentifier:"]) {
+            SEL lookup = NSSelectorFromString(name);
+            if (processManager != nil && [processManager respondsToSelector:lookup]) {
+                process = ((id (*)(id, SEL, id))objc_msgSend)(processManager, lookup, bundleID);
+                if (process != nil) break;
+            }
+        }
+    }
     Method killMethod = process == nil ? NULL : class_getInstanceMethod([process class], killSelector);
-    MRReloadTrace([NSString stringWithFormat:@"process=%@ class=%@ kill=%p args=%u",
+    MRReloadTrace([NSString stringWithFormat:@"application=%@ appClass=%@ process=%@ processClass=%@ kill=%p args=%u",
+                   application, application == nil ? @"nil" : NSStringFromClass([application class]),
                    process, process == nil ? @"nil" : NSStringFromClass([process class]),
                    killMethod, killMethod == NULL ? 0 : method_getNumberOfArguments(killMethod)]);
     if (killMethod == NULL || method_getNumberOfArguments(killMethod) != 5) {
