@@ -6,6 +6,7 @@
 #import <fcntl.h>
 #import <unistd.h>
 #import <string.h>
+#import <math.h>
 
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
@@ -22,6 +23,7 @@ static const CGFloat MRKeyboardHandleGap = 18.0;
 static BOOL MRForegroundReloadInFlight = NO;
 static __strong NSString *MRForegroundReloadCandidateBundleID = nil;
 static NSUInteger MRForegroundReloadCandidateGeneration = 0;
+static NSUInteger MRHomePageRestoreGeneration = 0;
 
 // Stable builds discard the complete diagnostic expression at preprocessing
 // time: no arguments, strings, filesystem access or log I/O reach SpringBoard.
@@ -334,6 +336,81 @@ static NSString *MRScalarGetterValue(id object, NSString *selectorName)
     } @catch (__unused NSException *exception) { return nil; }
 }
 
+static BOOL MRIntegerGetter(id object, NSString *selectorName, long long *value)
+{
+    NSString *text = MRScalarGetterValue(object, selectorName);
+    if (text == nil) return NO;
+    if (value != NULL) *value = text.longLongValue;
+    return YES;
+}
+
+static id MRRootFolderController(void)
+{
+    id iconController = MRSendClassNoArgs(@"SBIconController", @"sharedInstance");
+    return MRSafeValue(iconController, @"rootFolderController");
+}
+
+static BOOL MRInvokePageSetter(id object, long long pageIndex)
+{
+    if (object == nil) return NO;
+    for (NSString *name in @[@"setCurrentPageIndex:animated:",
+                              @"setCurrentIconListIndex:animated:"]) {
+        SEL selector = NSSelectorFromString(name);
+        Method method = class_getInstanceMethod([object class], selector);
+        if (method != NULL && method_getNumberOfArguments(method) == 4) {
+            ((void (*)(id, SEL, long long, BOOL))objc_msgSend)(object, selector,
+                                                               pageIndex, NO);
+            return YES;
+        }
+    }
+    for (NSString *name in @[@"setCurrentPageIndex:", @"setCurrentIconListIndex:"]) {
+        SEL selector = NSSelectorFromString(name);
+        Method method = class_getInstanceMethod([object class], selector);
+        if (method != NULL && method_getNumberOfArguments(method) == 3) {
+            ((void (*)(id, SEL, long long))objc_msgSend)(object, selector, pageIndex);
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static BOOL MRRestoreHomePage(long long pageIndex, NSUInteger generation,
+                              NSString *bundleID, NSTimeInterval delay)
+{
+    if (generation != MRHomePageRestoreGeneration) return NO;
+    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+    NSString *currentBundleID = MRSafeValue(manager, @"currentBundleID");
+    if (![currentBundleID isEqualToString:bundleID]) return NO;
+
+    id controller = MRRootFolderController();
+    id rootFolderView = MRSafeValue(controller, @"rootFolderView");
+    UIScrollView *scrollView = MRSafeValue(rootFolderView, @"scrollView");
+    long long minimumPageIndex = 0;
+    long long maximumPageIndex = 0;
+    long long currentPageIndex = 0;
+    if (![scrollView isKindOfClass:[UIScrollView class]] ||
+        !MRIntegerGetter(controller, @"minimumPageIndex", &minimumPageIndex) ||
+        !MRIntegerGetter(controller, @"maximumPageIndex", &maximumPageIndex) ||
+        pageIndex < minimumPageIndex || pageIndex > maximumPageIndex) return NO;
+
+    CGFloat targetX = (CGFloat)(pageIndex - minimumPageIndex) * scrollView.bounds.size.width;
+    BOOL pageChanged = MRIntegerGetter(controller, @"currentPageIndex", &currentPageIndex) &&
+        currentPageIndex != pageIndex;
+    BOOL offsetChanged = fabs(scrollView.contentOffset.x - targetX) > 0.5;
+    if (!pageChanged && !offsetChanged) return YES;
+
+    BOOL usedSemanticSetter = MRInvokePageSetter(controller, pageIndex);
+    if (!usedSemanticSetter) usedSemanticSetter = MRInvokePageSetter(rootFolderView, pageIndex);
+    // Cancels the in-flight reset animation as well as synchronizing the
+    // visible offset. UIScrollView's delegate then updates SpringBoard's page
+    // model; the private setter above is used when iOS 15 exposes it.
+    [scrollView setContentOffset:CGPointMake(targetX, scrollView.contentOffset.y) animated:NO];
+    MRHomePageTrace(@"RESTORE delay=%.2f page=%lld range=%lld...%lld oldPage=%lld targetX=%.2f setter=%d",
+                    delay, pageIndex, minimumPageIndex, maximumPageIndex,
+                    currentPageIndex, targetX, usedSemanticSetter);
+    return YES;
+}
+
 static void MRTraceHomePageSnapshot(NSString *stage)
 {
     id iconController = MRSendClassNoArgs(@"SBIconController", @"sharedInstance");
@@ -615,9 +692,22 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
 {
     NSString *previousBundleID = [MRSafeValue(self, @"currentBundleID") copy];
     BOOL openingFirstMyrtleWindow = bundleID.length != 0 && previousBundleID.length == 0;
+    long long preservedHomePage = 0;
+    BOOL hasPreservedHomePage = NO;
+    NSUInteger homePageGeneration = MRHomePageRestoreGeneration;
     if (openingFirstMyrtleWindow) {
+        id rootFolderController = MRRootFolderController();
+        hasPreservedHomePage = MRIntegerGetter(rootFolderController,
+                                               @"currentPageIndex",
+                                               &preservedHomePage);
+        homePageGeneration = ++MRHomePageRestoreGeneration;
         MRHomePageTrace(@"BEGIN Myrtle windowization bundle=%@", bundleID);
+        MRHomePageTrace(@"PRESERVE page=%lld valid=%d generation=%lu",
+                        preservedHomePage, hasPreservedHomePage,
+                        (unsigned long)homePageGeneration);
         MRTraceHomePageSnapshot(@"before-original");
+    } else if (bundleID.length == 0 && previousBundleID.length != 0) {
+        MRHomePageRestoreGeneration++;
     }
     BOOL fullscreenTransition = bundleID.length == 0 && previousBundleID.length != 0 &&
         [MRMyrtleFullscreenIntentBundleID isEqualToString:previousBundleID];
@@ -630,6 +720,17 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
     if (meaningfulTransition) transitionGeneration = ++MRReturnToMainGeneration;
     MROriginalSetCurrentBundle(self, selector, bundleID);
     if (openingFirstMyrtleWindow) {
+        if (hasPreservedHomePage) {
+            NSString *restoreBundleID = [bundleID copy];
+            for (NSNumber *delay in @[@0.28, @0.38, @0.52, @0.75, @1.05]) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                             (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    MRRestoreHomePage(preservedHomePage, homePageGeneration,
+                                      restoreBundleID, delay.doubleValue);
+                });
+            }
+        }
         MRTraceHomePageSnapshot(@"after-original");
         NSString *diagnosticBundleID = [bundleID copy];
         for (NSNumber *delay in @[@0.05, @0.2, @0.5, @1.0]) {
