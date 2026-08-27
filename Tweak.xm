@@ -6,7 +6,6 @@
 #import <fcntl.h>
 #import <unistd.h>
 #import <string.h>
-#import <math.h>
 
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
@@ -425,67 +424,6 @@ static void MRArmHomePageGuard(long long pageIndex, NSString *bundleID,
             MRHomePageGuardBundleID = nil;
         }
     });
-}
-
-static BOOL MRInvokePageSetter(id object, long long pageIndex)
-{
-    if (object == nil) return NO;
-    for (NSString *name in @[@"setCurrentPageIndex:animated:",
-                              @"setCurrentIconListIndex:animated:"]) {
-        SEL selector = NSSelectorFromString(name);
-        Method method = class_getInstanceMethod([object class], selector);
-        if (method != NULL && method_getNumberOfArguments(method) == 4) {
-            ((void (*)(id, SEL, long long, BOOL))objc_msgSend)(object, selector,
-                                                               pageIndex, NO);
-            return YES;
-        }
-    }
-    for (NSString *name in @[@"setCurrentPageIndex:", @"setCurrentIconListIndex:"]) {
-        SEL selector = NSSelectorFromString(name);
-        Method method = class_getInstanceMethod([object class], selector);
-        if (method != NULL && method_getNumberOfArguments(method) == 3) {
-            ((void (*)(id, SEL, long long))objc_msgSend)(object, selector, pageIndex);
-            return YES;
-        }
-    }
-    return NO;
-}
-
-static BOOL MRRestoreHomePage(long long pageIndex, NSUInteger generation,
-                              NSString *bundleID, NSTimeInterval delay)
-{
-    if (generation != MRHomePageRestoreGeneration) return NO;
-    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
-    NSString *currentBundleID = MRSafeValue(manager, @"currentBundleID");
-    if (![currentBundleID isEqualToString:bundleID]) return NO;
-
-    id controller = MRRootFolderController();
-    id rootFolderView = MRSafeValue(controller, @"rootFolderView");
-    UIScrollView *scrollView = MRSafeValue(rootFolderView, @"scrollView");
-    long long minimumPageIndex = 0;
-    long long maximumPageIndex = 0;
-    long long currentPageIndex = 0;
-    if (![scrollView isKindOfClass:[UIScrollView class]] ||
-        !MRIntegerGetter(controller, @"minimumPageIndex", &minimumPageIndex) ||
-        !MRIntegerGetter(controller, @"maximumPageIndex", &maximumPageIndex) ||
-        pageIndex < minimumPageIndex || pageIndex > maximumPageIndex) return NO;
-
-    CGFloat targetX = (CGFloat)(pageIndex - minimumPageIndex) * scrollView.bounds.size.width;
-    BOOL pageChanged = MRIntegerGetter(controller, @"currentPageIndex", &currentPageIndex) &&
-        currentPageIndex != pageIndex;
-    BOOL offsetChanged = fabs(scrollView.contentOffset.x - targetX) > 0.5;
-    if (!pageChanged && !offsetChanged) return YES;
-
-    BOOL usedSemanticSetter = MRInvokePageSetter(controller, pageIndex);
-    if (!usedSemanticSetter) usedSemanticSetter = MRInvokePageSetter(rootFolderView, pageIndex);
-    // Cancels the in-flight reset animation as well as synchronizing the
-    // visible offset. UIScrollView's delegate then updates SpringBoard's page
-    // model; the private setter above is used when iOS 15 exposes it.
-    [scrollView setContentOffset:CGPointMake(targetX, scrollView.contentOffset.y) animated:NO];
-    MRHomePageTrace(@"RESTORE delay=%.2f page=%lld range=%lld...%lld oldPage=%lld targetX=%.2f setter=%d",
-                    delay, pageIndex, minimumPageIndex, maximumPageIndex,
-                    currentPageIndex, targetX, usedSemanticSetter);
-    return YES;
 }
 
 static void MRTraceHomePageSnapshot(NSString *stage)
