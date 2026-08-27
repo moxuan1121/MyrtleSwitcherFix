@@ -66,6 +66,75 @@ static MRCanOpenURLIMP MROriginalCanOpenURL = NULL;
 typedef void (^MROpenURLCompletion)(BOOL success);
 typedef void (*MROpenURLIMP)(id, SEL, NSURL *, NSDictionary *, MROpenURLCompletion);
 static MROpenURLIMP MROriginalOpenURL = NULL;
+typedef void (*MRSBWorkspaceOpenRequestIMP)(id, SEL, id, id, id);
+static MRSBWorkspaceOpenRequestIMP MROriginalSBWorkspaceOpenRequest = NULL;
+typedef void (*MRSBHandleOpenRequestIMP)(id, SEL, id, id, id, id, id);
+static MRSBHandleOpenRequestIMP MROriginalSBHandleOpenRequest = NULL;
+typedef void (*MRFBSystemOpenIMP)(id, SEL, id, id, id, id, id);
+static MRFBSystemOpenIMP MROriginalFBSystemOpen = NULL;
+typedef void (*MRFBSOpenServiceIMP)(id, SEL, id, id, id);
+static MRFBSOpenServiceIMP MROriginalFBSOpenService = NULL;
+static id MRSafeValue(id object, NSString *key);
+
+static NSString *MRURLObjectSummary(id object)
+{
+    if (object == nil) return @"(null)";
+    NSMutableArray<NSString *> *fields = [NSMutableArray array];
+    for (NSString *key in @[@"URL", @"url", @"bundleIdentifier", @"bundleID",
+                              @"applicationIdentifier", @"options", @"payload"]) {
+        id value = MRSafeValue(object, key);
+        if (value != nil)
+            [fields addObject:[NSString stringWithFormat:@"%@=%@", key, value]];
+    }
+    NSString *description = nil;
+    @try { description = [object description]; }
+    @catch (__unused NSException *exception) { description = @"<description threw>"; }
+    if (description.length > 1000) description = [description substringToIndex:1000];
+    return [NSString stringWithFormat:@"class=%@ fields={%@} desc=%@",
+            NSStringFromClass([object class]), [fields componentsJoinedByString:@", "],
+            description];
+}
+
+static void MRHookSBWorkspaceOpenRequest(id self, SEL selector, id service,
+                                         id request, id completion)
+{
+    MRURLTrace(@"SBMainWorkspace systemService request={%@} service={%@} completion=%@",
+               MRURLObjectSummary(request), MRURLObjectSummary(service),
+               completion ? NSStringFromClass([completion class]) : @"nil");
+    MROriginalSBWorkspaceOpenRequest(self, selector, service, request, completion);
+}
+
+static void MRHookSBHandleOpenRequest(id self, SEL selector, id application,
+                                      id options, id activationSettings, id origin,
+                                      id result)
+{
+    MRURLTrace(@"SBMainWorkspace handle selector=%@ app={%@} options={%@} activation={%@} origin={%@} resultBlock=%@",
+               NSStringFromSelector(selector), MRURLObjectSummary(application),
+               MRURLObjectSummary(options), MRURLObjectSummary(activationSettings),
+               MRURLObjectSummary(origin), result ? NSStringFromClass([result class]) : @"nil");
+    MROriginalSBHandleOpenRequest(self, selector, application, options,
+                                  activationSettings, origin, result);
+}
+
+static void MRHookFBSystemOpen(id self, SEL selector, id application, id options,
+                               id originator, id requestID, id completion)
+{
+    MRURLTrace(@"FBSystemService open app={%@} options={%@} originator={%@} requestID={%@} completion=%@",
+               MRURLObjectSummary(application), MRURLObjectSummary(options),
+               MRURLObjectSummary(originator), requestID,
+               completion ? NSStringFromClass([completion class]) : @"nil");
+    MROriginalFBSystemOpen(self, selector, application, options, originator,
+                           requestID, completion);
+}
+
+static void MRHookFBSOpenService(id self, SEL selector, id application, id options,
+                                 id completion)
+{
+    MRURLTrace(@"FBSOpenApplicationService open app={%@} options={%@} completion=%@",
+               MRURLObjectSummary(application), MRURLObjectSummary(options),
+               completion ? NSStringFromClass([completion class]) : @"nil");
+    MROriginalFBSOpenService(self, selector, application, options, completion);
+}
 
 static BOOL MRHookCanOpenURL(id self, SEL selector, NSURL *URL)
 {
@@ -128,8 +197,38 @@ static void MRInstallURLDiagnostics(void)
         MSHookMessageEx(applicationClass, openSelector, (IMP)MRHookOpenURL,
                         (IMP *)&MROriginalOpenURL);
 
-    MRURLTrace(@"INSTALL UIApplication can=%d open=%d",
-               MROriginalCanOpenURL != NULL, MROriginalOpenURL != NULL);
+    Class workspaceClass = NSClassFromString(@"SBMainWorkspace");
+    SEL workspaceSelector = NSSelectorFromString(@"systemService:handleOpenApplicationRequest:withCompletion:");
+    Method workspaceMethod = class_getInstanceMethod(workspaceClass, workspaceSelector);
+    if (workspaceMethod != NULL && method_getNumberOfArguments(workspaceMethod) == 5)
+        MSHookMessageEx(workspaceClass, workspaceSelector, (IMP)MRHookSBWorkspaceOpenRequest,
+                        (IMP *)&MROriginalSBWorkspaceOpenRequest);
+
+    SEL handleSelector = NSSelectorFromString(@"_handleOpenApplicationRequest:options:activationSettings:origin:withResult:");
+    Method handleMethod = class_getInstanceMethod(workspaceClass, handleSelector);
+    if (handleMethod != NULL && method_getNumberOfArguments(handleMethod) == 7)
+        MSHookMessageEx(workspaceClass, handleSelector, (IMP)MRHookSBHandleOpenRequest,
+                        (IMP *)&MROriginalSBHandleOpenRequest);
+
+    Class systemServiceClass = NSClassFromString(@"FBSystemService");
+    SEL systemOpenSelector = NSSelectorFromString(@"openApplication:withOptions:originator:requestID:completion:");
+    Method systemOpenMethod = class_getInstanceMethod(systemServiceClass, systemOpenSelector);
+    if (systemOpenMethod != NULL && method_getNumberOfArguments(systemOpenMethod) == 7)
+        MSHookMessageEx(systemServiceClass, systemOpenSelector, (IMP)MRHookFBSystemOpen,
+                        (IMP *)&MROriginalFBSystemOpen);
+
+    Class openServiceClass = NSClassFromString(@"FBSOpenApplicationService");
+    SEL serviceOpenSelector = NSSelectorFromString(@"openApplication:withOptions:completion:");
+    Method serviceOpenMethod = class_getInstanceMethod(openServiceClass, serviceOpenSelector);
+    if (serviceOpenMethod != NULL && method_getNumberOfArguments(serviceOpenMethod) == 5)
+        MSHookMessageEx(openServiceClass, serviceOpenSelector, (IMP)MRHookFBSOpenService,
+                        (IMP *)&MROriginalFBSOpenService);
+
+    MRURLTrace(@"INSTALL UIApplication can=%d open=%d SBWorkspace=%d SBHandle=%d FBSystem=%d FBSService=%d",
+               MROriginalCanOpenURL != NULL, MROriginalOpenURL != NULL,
+               MROriginalSBWorkspaceOpenRequest != NULL,
+               MROriginalSBHandleOpenRequest != NULL,
+               MROriginalFBSystemOpen != NULL, MROriginalFBSOpenService != NULL);
     for (NSString *className in @[@"UIApplication", @"LSApplicationWorkspace",
                                    @"SBMainWorkspace", @"SBApplicationController",
                                    @"FBSystemService", @"FBSOpenApplicationService"])
