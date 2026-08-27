@@ -1188,12 +1188,11 @@ static void MRHookSelectorGesture(id self, SEL selector, UIGestureRecognizer *ge
             if (gesture.state == UIGestureRecognizerStateEnded) {
                 BOOL windowOpen = [MRSafeValue(self, @"isWindowOpen") boolValue];
                 if (windowOpen) {
-                    // With a hosted window Myrtle ignores centerHoldDetected
-                    // and treats an app commit as "replace window contents".
-                    // Resolve the armed app explicitly, switch the hosted app
-                    // when needed, dismiss the selector without a second
-                    // commit, then use Myrtle's dedicated window-fullscreen
-                    // operation.
+                    // Let Myrtle commit the armed app and dismiss the selector,
+                    // then invoke the exact action used by its built-in
+                    // switchFullscreenWindow radial item.  The lower-level
+                    // no-argument method alone lacks state after gesture
+                    // cleanup and did not reopen the app fullscreen.
                     long long armedHighlighted = [objc_getAssociatedObject(self,
                         MRDirectLongHighlightedKey) longLongValue];
                     long long itemIndex = -1;
@@ -1202,21 +1201,11 @@ static void MRHookSelectorGesture(id self, SEL selector, UIGestureRecognizer *ge
                                                                          &itemIndex);
                     NSString *targetBundle = MRDirectItemIsApp(item) ? item[@"bundle"] : nil;
                     NSString *currentBundle = MRSafeValue(self, @"currentWindowBundleID");
-                    if (targetBundle.length != 0 && itemIndex >= 0 &&
-                        ![targetBundle isEqualToString:currentBundle]) {
-                        MROriginalSelectorCommit(self,
-                            NSSelectorFromString(@"MT_lIIIllIllIlllIlIlIll:"), itemIndex);
-                    }
-                    id selectorView = MRSafeValue(self, @"selectorView");
-                    if ([selectorView respondsToSelector:NSSelectorFromString(@"setLastHighlightedIndex:")]) {
-                        ((void (*)(id, SEL, long long))objc_msgSend)(selectorView,
-                            NSSelectorFromString(@"setLastHighlightedIndex:"), -1);
-                    }
                     MROriginalSelectorGesture(self, selector, gesture);
-                    if (targetBundle.length != 0 &&
-                        [self respondsToSelector:NSSelectorFromString(@"MT_llIIIlIIlIlllIlIIIII")]) {
-                        ((void (*)(id, SEL))objc_msgSend)(self,
-                            NSSelectorFromString(@"MT_llIIIlIIlIlllIlIIIII"));
+                    if (targetBundle.length != 0 && MROriginalActionDispatcher != NULL) {
+                        MROriginalActionDispatcher(self,
+                            NSSelectorFromString(@"MT_IlIIllIIlIlllIIIIllI:::"),
+                            @"switchFullscreenWindow", nil, nil);
                     }
                     MRDirectSelectorTrace(@"DIRECT-WINDOW-FULLSCREEN target=%@ previous=%@ index=%lld",
                                           targetBundle, currentBundle, itemIndex);
@@ -1318,15 +1307,21 @@ static void MRHookCenterCommit(id self, SEL selector, long long index, BOOL held
                           index, held, MRSelectorObjectSummary(item),
                           [MRSafeValue(self, @"isWindowOpen") boolValue],
                           MRSelectorObjectSummary(MRSafeValue(self, @"currentWindowBundleID")));
-    MROriginalCenterCommit(self, selector, index, held);
-    MRDirectSelectorTrace(@"CENTER-AFTER index=%lld held=%d windowOpen=%d current=%@",
-                          index, held, [MRSafeValue(self, @"isWindowOpen") boolValue],
-                          MRSelectorObjectSummary(MRSafeValue(self, @"currentWindowBundleID")));
+    // Direct selector mode has no centre control.  This method is a separate
+    // activation path from visual highlighting and was still firing against
+    // the hidden slot, including Myrtle's repeated haptic feedback.
+    MRDirectSelectorTrace(@"CENTER-BLOCKED index=%lld held=%d", index, held);
 }
 
 static void MRHookActionDispatcher(id self, SEL selector, id argument1,
                                    id argument2, id argument3)
 {
+    MRDirectSelectorTrace(@"ACTION-DISPATCH a1=%@ a2=%@ a3=%@ windowOpen=%d current=%@",
+                          MRSelectorObjectSummary(argument1),
+                          MRSelectorObjectSummary(argument2),
+                          MRSelectorObjectSummary(argument3),
+                          [MRSafeValue(self, @"isWindowOpen") boolValue],
+                          MRSelectorObjectSummary(MRSafeValue(self, @"currentWindowBundleID")));
     BOOL isReloadAction = [argument1 isKindOfClass:NSString.class] &&
         [(NSString *)argument1 isEqualToString:@"reloadApp"];
     BOOL isWindowOpen = [MRSafeValue(self, @"isWindowOpen") boolValue];
