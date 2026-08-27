@@ -18,6 +18,7 @@ static const CGFloat MRFixedPortraitKeyboardHeight = 360.0;
 static const CGFloat MRKeyboardHandleGap = 18.0;
 static BOOL MRForegroundReloadInFlight = NO;
 static __strong NSString *MRForegroundReloadCandidateBundleID = nil;
+static NSUInteger MRForegroundReloadCandidateGeneration = 0;
 
 // Stable builds discard the complete diagnostic expression at preprocessing
 // time: no arguments, strings, filesystem access or log I/O reach SpringBoard.
@@ -745,6 +746,8 @@ static void MRHookActionDispatcher(id self, SEL selector, id argument1,
     BOOL isWindowOpen = [MRSafeValue(self, @"isWindowOpen") boolValue];
     if (isReloadAction && !isWindowOpen) MRReloadForegroundApplication();
     MROriginalActionDispatcher(self, selector, argument1, argument2, argument3);
+    MRForegroundReloadCandidateBundleID = nil;
+    MRForegroundReloadCandidateGeneration++;
 }
 static const void *MRPinnedHandleControllerKey = &MRPinnedHandleControllerKey;
 static const void *MRPinnedHandleInstalledKey = &MRPinnedHandleInstalledKey;
@@ -920,6 +923,14 @@ static void MRHookOpenSelectorAtPoint(id self, SEL selector, CGPoint centerPoint
         MRForegroundReloadCandidateBundleID = [MRCurrentMainApplicationBundleID() copy];
     else
         MRForegroundReloadCandidateBundleID = nil;
+    NSUInteger candidateGeneration = ++MRForegroundReloadCandidateGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (candidateGeneration == MRForegroundReloadCandidateGeneration) {
+            MRForegroundReloadCandidateBundleID = nil;
+            MRForegroundReloadCandidateGeneration++;
+        }
+    });
     MRInstallPinnedHandleCenterGuard(self);
     if (MRApplyFixedKeyboardHandlePosition(self, nil)) {
         UIView *movementView = MRSafeValue(self, @"handleHitView");
