@@ -3,6 +3,9 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <substrate.h>
+#import <fcntl.h>
+#import <unistd.h>
+#import <string.h>
 
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
@@ -35,6 +38,45 @@ static MRSetContentOffsetIMP MROriginalSetContentOffset = NULL;
 // Production builds discard the complete diagnostic expression at preprocessing
 // time: no arguments or diagnostic strings reach SpringBoard.
 #define MRLog(...) do {} while (0)
+
+// Temporary, event-driven diagnostic for the direct selector mode. It writes
+// only when the user commits a selector item or presses its centre control;
+// there is no timer, polling or background sampling.
+static void MRDirectSelectorTrace(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+static void MRDirectSelectorTrace(NSString *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments];
+    va_end(arguments);
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message];
+    const char *bytes = line.UTF8String;
+    if (bytes == NULL) return;
+    int descriptor = open("/var/mobile/Documents/com.moxuan.myrtleswitcherfix.selector.log",
+                          O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (descriptor < 0) return;
+    size_t remaining = strlen(bytes);
+    while (remaining != 0) {
+        ssize_t written = write(descriptor, bytes, remaining);
+        if (written <= 0) break;
+        bytes += written;
+        remaining -= (size_t)written;
+    }
+    close(descriptor);
+}
+
+static NSString *MRSelectorObjectSummary(id object)
+{
+    if (object == nil) return @"<nil>";
+    NSString *description = nil;
+    @try { description = [object description]; }
+    @catch (__unused NSException *exception) { description = @"<description threw>"; }
+    description = [description stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+    if (description.length > 1600) description = [[description substringToIndex:1600]
+                                                   stringByAppendingString:@"…"];
+    return [NSString stringWithFormat:@"<%@:%@>", NSStringFromClass([object class]),
+                                      description ?: @"(null)"];
+}
 
 static id MRSafeValue(id object, NSString *key)
 {
@@ -885,6 +927,48 @@ typedef void (*MROpenSelectorAtPointIMP)(id, SEL, CGPoint);
 static MROpenSelectorAtPointIMP MROriginalOpenSelectorAtPoint = NULL;
 typedef void (*MRActionDispatcherIMP)(id, SEL, id, id, id);
 static MRActionDispatcherIMP MROriginalActionDispatcher = NULL;
+typedef void (*MRSelectorCommitIMP)(id, SEL, long long);
+static MRSelectorCommitIMP MROriginalSelectorCommit = NULL;
+typedef void (*MRCenterCommitIMP)(id, SEL, long long, BOOL);
+static MRCenterCommitIMP MROriginalCenterCommit = NULL;
+
+static void MRHookSelectorCommit(id self, SEL selector, long long index)
+{
+    NSArray *items = MRSafeValue(self, @"selectorItems");
+    id item = ([items isKindOfClass:NSArray.class] && index >= 0 &&
+               (NSUInteger)index < items.count) ? items[(NSUInteger)index] : nil;
+    MRDirectSelectorTrace(@"ITEM-COMMIT index=%lld count=%lu item=%@ windowOpen=%d current=%@ candidateIndex=%@ candidateAction=%@ longTriggered=%@ centerDetected=%@",
+                          index, (unsigned long)([items isKindOfClass:NSArray.class] ? items.count : 0),
+                          MRSelectorObjectSummary(item),
+                          [MRSafeValue(self, @"isWindowOpen") boolValue],
+                          MRSelectorObjectSummary(MRSafeValue(self, @"currentWindowBundleID")),
+                          MRSelectorObjectSummary(MRSafeValue(self, @"selectorLongPressCandidateIndex")),
+                          MRSelectorObjectSummary(MRSafeValue(self, @"selectorLongPressCandidateActionId")),
+                          MRSelectorObjectSummary(MRSafeValue(self, @"selectorLongPressTriggered")),
+                          MRSelectorObjectSummary(MRSafeValue(self, @"centerHoldDetected")));
+    MROriginalSelectorCommit(self, selector, index);
+    MRDirectSelectorTrace(@"ITEM-AFTER index=%lld windowOpen=%d current=%@ candidateIndex=%@ candidateAction=%@ longTriggered=%@",
+                          index, [MRSafeValue(self, @"isWindowOpen") boolValue],
+                          MRSelectorObjectSummary(MRSafeValue(self, @"currentWindowBundleID")),
+                          MRSelectorObjectSummary(MRSafeValue(self, @"selectorLongPressCandidateIndex")),
+                          MRSelectorObjectSummary(MRSafeValue(self, @"selectorLongPressCandidateActionId")),
+                          MRSelectorObjectSummary(MRSafeValue(self, @"selectorLongPressTriggered")));
+}
+
+static void MRHookCenterCommit(id self, SEL selector, long long index, BOOL held)
+{
+    NSArray *items = MRSafeValue(self, @"selectorItems");
+    id item = ([items isKindOfClass:NSArray.class] && index >= 0 &&
+               (NSUInteger)index < items.count) ? items[(NSUInteger)index] : nil;
+    MRDirectSelectorTrace(@"CENTER-COMMIT index=%lld held=%d item=%@ windowOpen=%d current=%@",
+                          index, held, MRSelectorObjectSummary(item),
+                          [MRSafeValue(self, @"isWindowOpen") boolValue],
+                          MRSelectorObjectSummary(MRSafeValue(self, @"currentWindowBundleID")));
+    MROriginalCenterCommit(self, selector, index, held);
+    MRDirectSelectorTrace(@"CENTER-AFTER index=%lld held=%d windowOpen=%d current=%@",
+                          index, held, [MRSafeValue(self, @"isWindowOpen") boolValue],
+                          MRSelectorObjectSummary(MRSafeValue(self, @"currentWindowBundleID")));
+}
 
 static void MRHookActionDispatcher(id self, SEL selector, id argument1,
                                    id argument2, id argument3)
@@ -1179,6 +1263,30 @@ static BOOL MRInstallMyrtleSelectorCenterHook(void)
     return MROriginalOpenSelectorAtPoint != NULL;
 }
 
+static BOOL MRInstallDirectSelectorDiagnosticHooks(void)
+{
+    Class cls = NSClassFromString(@"MyrtleViewController");
+    if (cls == Nil) return NO;
+
+    if (MROriginalSelectorCommit == NULL) {
+        SEL selector = NSSelectorFromString(@"MT_lIIIllIllIlllIlIlIll:");
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+        MSHookMessageEx(cls, selector, (IMP)MRHookSelectorCommit,
+                        (IMP *)&MROriginalSelectorCommit);
+    }
+    if (MROriginalCenterCommit == NULL) {
+        SEL selector = NSSelectorFromString(@"MT_llIllllIlIlIIIlIlIll::");
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method == NULL || method_getNumberOfArguments(method) != 4) return NO;
+        MSHookMessageEx(cls, selector, (IMP)MRHookCenterCommit,
+                        (IMP *)&MROriginalCenterCommit);
+    }
+    MRDirectSelectorTrace(@"INSTALLED item=%p center=%p",
+                          MROriginalSelectorCommit, MROriginalCenterCommit);
+    return MROriginalSelectorCommit != NULL && MROriginalCenterCommit != NULL;
+}
+
 static BOOL MRInstallMyrtleActionDispatcherHook(void)
 {
     if (MROriginalActionDispatcher != NULL) return YES;
@@ -1289,9 +1397,10 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL keyboardAvoidanceInstalled = MRInstallMyrtleKeyboardAvoidanceHook();
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
     BOOL actionDispatcherInstalled = MRInstallMyrtleActionDispatcherHook();
+    BOOL directSelectorDiagnosticInstalled = MRInstallDirectSelectorDiagnosticHooks();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
         keyboardAvoidanceInstalled && selectorCenterInstalled &&
-        actionDispatcherInstalled) return;
+        actionDispatcherInstalled && directSelectorDiagnosticInstalled) return;
     if (attempt >= 60) {
         MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d selectorCenter=%d",
               managerInstalled, fullscreenInstalled, hostCoreLaunchInstalled,

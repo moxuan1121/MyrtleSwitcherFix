@@ -9,6 +9,7 @@ on:
       - feature/fixed-keyboard-avoidance
       - feature/reload-foreground-app
       - feature/preserve-home-page
+      - feature/direct-selector-mode
     paths:
       - "Makefile"
       - "control"
