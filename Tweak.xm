@@ -1300,6 +1300,7 @@ static void MRHookSelectorCommit(id self, SEL selector, long long index)
 
 static void MRHookCenterCommit(id self, SEL selector, long long index, BOOL held)
 {
+    (void)selector;
     NSArray *items = MRSafeValue(self, @"selectorItems");
     id item = ([items isKindOfClass:NSArray.class] && index >= 0 &&
                (NSUInteger)index < items.count) ? items[(NSUInteger)index] : nil;
