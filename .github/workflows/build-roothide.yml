@@ -7,6 +7,7 @@ on:
       - main
       - performance/no-logging
       - feature/fixed-keyboard-avoidance
+      - feature/reload-foreground-app
     paths:
       - "Makefile"
       - "control"

@@ -3,6 +3,10 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <substrate.h>
+#import <dlfcn.h>
+#if __has_feature(ptrauth_calls)
+#import <ptrauth.h>
+#endif
 
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
@@ -16,6 +20,8 @@ static NSUInteger MRMyrtleFullscreenIntentGeneration = 0;
 static NSTimeInterval MRRecentlyClosedMyrtleTime = 0;
 static const CGFloat MRFixedPortraitKeyboardHeight = 360.0;
 static const CGFloat MRKeyboardHandleGap = 18.0;
+static const uintptr_t MRMyrtleReloadWindowIsOpenReturnOffset = 0xF77EC;
+static BOOL MRForegroundReloadInFlight = NO;
 
 // Stable builds discard the complete diagnostic expression at preprocessing
 // time: no arguments, strings, filesystem access or log I/O reach SpringBoard.
@@ -282,6 +288,52 @@ static NSString *MRCurrentMainApplicationBundleID(void)
     if ([springBoard respondsToSelector:frontSelector])
         application = ((id (*)(id, SEL))objc_msgSend)(springBoard, frontSelector);
     return MRDirectBundleIdentifier(application);
+}
+
+static BOOL MRCallOriginatesFromMyrtleReloadWindowAction(void *returnAddress)
+{
+#if __has_feature(ptrauth_calls)
+    returnAddress = ptrauth_strip(returnAddress, ptrauth_key_return_address);
+#endif
+    Dl_info info = {};
+    if (returnAddress == NULL || dladdr(returnAddress, &info) == 0 ||
+        info.dli_fbase == NULL || info.dli_fname == NULL) return NO;
+    NSString *imagePath = [NSString stringWithUTF8String:info.dli_fname];
+    if (![[imagePath lastPathComponent] isEqualToString:@"Myrtle.dylib"]) return NO;
+    uintptr_t offset = (uintptr_t)returnAddress - (uintptr_t)info.dli_fbase;
+    return offset == MRMyrtleReloadWindowIsOpenReturnOffset;
+}
+
+static void MRReloadForegroundApplication(void)
+{
+    if (MRForegroundReloadInFlight) return;
+    NSString *bundleID = [MRCurrentMainApplicationBundleID() copy];
+    if (bundleID.length == 0 || ![bundleID containsString:@"."] ||
+        [bundleID isEqualToString:@"com.apple.springboard"]) return;
+
+    Class hostCore = NSClassFromString(@"MyrtleHostCore");
+    SEL processSelector = NSSelectorFromString(@"MT_llIIIIIIIIllIlIIIlIl:");
+    SEL launchSelector = NSSelectorFromString(@"MT_IllIlllIIllIllIIIIII:");
+    Method processMethod = class_getClassMethod(hostCore, processSelector);
+    Method launchMethod = class_getClassMethod(hostCore, launchSelector);
+    if (hostCore == Nil || processMethod == NULL || launchMethod == NULL ||
+        method_getNumberOfArguments(processMethod) != 3 ||
+        method_getNumberOfArguments(launchMethod) != 3) return;
+
+    id process = ((id (*)(id, SEL, id))objc_msgSend)(hostCore, processSelector, bundleID);
+    SEL killSelector = NSSelectorFromString(@"killForReason:andReport:withDescription:");
+    Method killMethod = process == nil ? NULL : class_getInstanceMethod([process class], killSelector);
+    if (killMethod == NULL || method_getNumberOfArguments(killMethod) != 5) return;
+
+    MRForegroundReloadInFlight = YES;
+    ((void (*)(id, SEL, long long, BOOL, id))objc_msgSend)(
+        process, killSelector, 1, NO, @"Myrtle reload foreground application");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.40 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        ((void (*)(id, SEL, id))objc_msgSend)(hostCore, launchSelector, bundleID);
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ MRForegroundReloadInFlight = NO; });
 }
 
 static void MRPromoteExistingCard(NSString *bundleID)
@@ -675,6 +727,17 @@ typedef void (*MRKeyboardWillHideIMP)(id, SEL, NSNotification *);
 static MRKeyboardWillHideIMP MROriginalKeyboardWillHide = NULL;
 typedef void (*MROpenSelectorAtPointIMP)(id, SEL, CGPoint);
 static MROpenSelectorAtPointIMP MROriginalOpenSelectorAtPoint = NULL;
+typedef BOOL (*MRIsWindowOpenIMP)(id, SEL);
+static MRIsWindowOpenIMP MROriginalIsWindowOpen = NULL;
+
+static BOOL MRHookIsWindowOpen(id self, SEL selector)
+{
+    BOOL isOpen = MROriginalIsWindowOpen(self, selector);
+    if (!isOpen &&
+        MRCallOriginatesFromMyrtleReloadWindowAction(__builtin_return_address(0)))
+        MRReloadForegroundApplication();
+    return isOpen;
+}
 static const void *MRPinnedHandleControllerKey = &MRPinnedHandleControllerKey;
 static const void *MRPinnedHandleInstalledKey = &MRPinnedHandleInstalledKey;
 static const void *MRPinnedHandleBypassKey = &MRPinnedHandleBypassKey;
@@ -945,6 +1008,21 @@ static BOOL MRInstallMyrtleSelectorCenterHook(void)
     return MROriginalOpenSelectorAtPoint != NULL;
 }
 
+static BOOL MRInstallMyrtleReloadFallbackHook(void)
+{
+    if (MROriginalIsWindowOpen != NULL) return YES;
+    Class cls = NSClassFromString(@"MyrtleViewController");
+    SEL selector = @selector(isWindowOpen);
+    Method method = class_getInstanceMethod(cls, selector);
+    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 2) return NO;
+    char returnType[16] = {};
+    method_getReturnType(method, returnType, sizeof(returnType));
+    if (returnType[0] != 'B' && returnType[0] != 'c') return NO;
+    MSHookMessageEx(cls, selector, (IMP)MRHookIsWindowOpen,
+                    (IMP *)&MROriginalIsWindowOpen);
+    return MROriginalIsWindowOpen != NULL;
+}
+
 static void MRInstallSwitcherRemoveHook(void)
 {
     Class cls = NSClassFromString(@"SBMainSwitcherViewController");
@@ -1004,8 +1082,10 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL hostCoreLaunchInstalled = MRInstallMyrtleHostCoreLaunchHook();
     BOOL keyboardAvoidanceInstalled = MRInstallMyrtleKeyboardAvoidanceHook();
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
+    BOOL reloadFallbackInstalled = MRInstallMyrtleReloadFallbackHook();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
-        keyboardAvoidanceInstalled && selectorCenterInstalled) return;
+        keyboardAvoidanceInstalled && selectorCenterInstalled &&
+        reloadFallbackInstalled) return;
     if (attempt >= 60) {
         MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d selectorCenter=%d",
               managerInstalled, fullscreenInstalled, hostCoreLaunchInstalled,

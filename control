@@ -1,8 +1,8 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.5.1
+Version: 0.5.2~beta1
 Architecture: iphoneos-arm64e
-Description: Stable log-free build with reliable Myrtle switcher cards and fixed-height in-app keyboard avoidance.
+Description: Test build adding a foreground-app fallback to Myrtle's reload-window action when no split window exists.
 Maintainer: Local
 Author: Local
 Section: Tweaks
