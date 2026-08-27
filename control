@@ -1,6 +1,6 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.5.4~beta3
+Version: 0.5.4~beta4
 Architecture: iphoneos-arm64e
 Description: iOS 15 diagnostic build tracing Myrtle URL handling and completion results.
 Maintainer: Local

@@ -72,6 +72,7 @@ typedef void (*MRSBHandleOpenRequestIMP)(id, SEL, id, id, id, id, id);
 static MRSBHandleOpenRequestIMP MROriginalSBHandleOpenRequest = NULL;
 typedef void (*MRFBSystemOpenIMP)(id, SEL, id, id, id, id, id);
 static MRFBSystemOpenIMP MROriginalFBSystemOpen = NULL;
+typedef void (^MRFBSystemCompletion)(id, id, id, id, id, id, id, id, id, id);
 typedef void (*MRFBSOpenServiceIMP)(id, SEL, id, id, id);
 static MRFBSOpenServiceIMP MROriginalFBSOpenService = NULL;
 static id MRSafeValue(id object, NSString *key);
@@ -152,8 +153,19 @@ static void MRHookFBSystemOpen(id self, SEL selector, id application, id options
                MRURLObjectSummary(originator), requestID,
                completion ? NSStringFromClass([completion class]) : @"nil",
                MRBlockSignature(completion));
+    MRFBSystemCompletion originalCompletion = completion;
+    MRFBSystemCompletion wrappedCompletion = originalCompletion == nil ? nil :
+        ^(id a1, id a2, id a3, id a4, id a5, id a6, id a7, id a8, id a9, id a10) {
+            MRURLTrace(@"FBSystemService COMPLETE app=%@ args=[1:{%@} 2:{%@} 3:{%@} 4:{%@} 5:{%@} 6:{%@} 7:{%@} 8:{%@} 9:{%@} 10:{%@}]",
+                       application, MRURLObjectSummary(a1), MRURLObjectSummary(a2),
+                       MRURLObjectSummary(a3), MRURLObjectSummary(a4),
+                       MRURLObjectSummary(a5), MRURLObjectSummary(a6),
+                       MRURLObjectSummary(a7), MRURLObjectSummary(a8),
+                       MRURLObjectSummary(a9), MRURLObjectSummary(a10));
+            originalCompletion(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10);
+        };
     MROriginalFBSystemOpen(self, selector, application, options, originator,
-                           requestID, completion);
+                           requestID, wrappedCompletion);
     NSString *target = [application isKindOfClass:NSString.class] ? application : nil;
     if ([target isEqualToString:@"com.apple.Preferences"]) {
         for (NSNumber *delay in @[@0.0, @0.1, @0.3]) {
