@@ -931,6 +931,53 @@ typedef void (*MRSelectorCommitIMP)(id, SEL, long long);
 static MRSelectorCommitIMP MROriginalSelectorCommit = NULL;
 typedef void (*MRCenterCommitIMP)(id, SEL, long long, BOOL);
 static MRCenterCommitIMP MROriginalCenterCommit = NULL;
+typedef void (*MRSelectorGestureIMP)(id, SEL, UIGestureRecognizer *);
+static MRSelectorGestureIMP MROriginalSelectorGesture = NULL;
+static const void *MRSelectorTraceStateKey = &MRSelectorTraceStateKey;
+
+static NSString *MRSelectorTraceState(id controller, UIGestureRecognizer *gesture)
+{
+    id selectorView = MRSafeValue(controller, @"selectorView");
+    id highlighted = MRSafeValue(selectorView, @"lastHighlightedIndex");
+    id candidate = MRSafeValue(controller, @"selectorLongPressCandidateIndex");
+    id candidateAction = MRSafeValue(controller, @"selectorLongPressCandidateActionId");
+    id triggered = MRSafeValue(controller, @"selectorLongPressTriggered");
+    id center = MRSafeValue(controller, @"centerHoldDetected");
+    return [NSString stringWithFormat:@"state=%ld highlighted=%@ candidate=%@ candidateAction=%@ longTriggered=%@ centerDetected=%@",
+            (long)gesture.state,
+            MRSelectorObjectSummary(highlighted), MRSelectorObjectSummary(candidate),
+            MRSelectorObjectSummary(candidateAction), MRSelectorObjectSummary(triggered),
+            MRSelectorObjectSummary(center)];
+}
+
+static void MRHookSelectorGesture(id self, SEL selector, UIGestureRecognizer *gesture)
+{
+    NSString *before = MRSelectorTraceState(self, gesture);
+    MROriginalSelectorGesture(self, selector, gesture);
+    NSString *after = MRSelectorTraceState(self, gesture);
+    NSString *last = objc_getAssociatedObject(self, MRSelectorTraceStateKey);
+    BOOL boundary = gesture.state == UIGestureRecognizerStateBegan ||
+                    gesture.state == UIGestureRecognizerStateEnded ||
+                    gesture.state == UIGestureRecognizerStateCancelled ||
+                    gesture.state == UIGestureRecognizerStateFailed;
+    if (boundary || ![after isEqualToString:last]) {
+        CGPoint point = CGPointZero;
+        UIView *view = MRSafeValue(self, @"view");
+        if ([gesture isKindOfClass:UIGestureRecognizer.class] && [view isKindOfClass:UIView.class])
+            point = [gesture locationInView:view];
+        NSArray *items = MRSafeValue(self, @"selectorItems");
+        long long highlightedIndex = [MRSafeValue(MRSafeValue(self, @"selectorView"),
+                                                   @"lastHighlightedIndex") longLongValue];
+        id highlightedItem = ([items isKindOfClass:NSArray.class] && highlightedIndex >= 0 &&
+                              (NSUInteger)highlightedIndex < items.count)
+            ? items[(NSUInteger)highlightedIndex] : nil;
+        MRDirectSelectorTrace(@"GESTURE point=(%.1f,%.1f) before={%@} after={%@} highlightedItem=%@",
+                              point.x, point.y, before, after,
+                              MRSelectorObjectSummary(highlightedItem));
+        objc_setAssociatedObject(self, MRSelectorTraceStateKey, after,
+                                 OBJC_ASSOCIATION_COPY_NONATOMIC);
+    }
+}
 
 static void MRHookSelectorCommit(id self, SEL selector, long long index)
 {
@@ -1282,9 +1329,18 @@ static BOOL MRInstallDirectSelectorDiagnosticHooks(void)
         MSHookMessageEx(cls, selector, (IMP)MRHookCenterCommit,
                         (IMP *)&MROriginalCenterCommit);
     }
-    MRDirectSelectorTrace(@"INSTALLED item=%p center=%p",
-                          MROriginalSelectorCommit, MROriginalCenterCommit);
-    return MROriginalSelectorCommit != NULL && MROriginalCenterCommit != NULL;
+    if (MROriginalSelectorGesture == NULL) {
+        SEL selector = NSSelectorFromString(@"MT_lIIIIllIIIllllllIlIl:");
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+        MSHookMessageEx(cls, selector, (IMP)MRHookSelectorGesture,
+                        (IMP *)&MROriginalSelectorGesture);
+    }
+    MRDirectSelectorTrace(@"INSTALLED item=%p center=%p gesture=%p",
+                          MROriginalSelectorCommit, MROriginalCenterCommit,
+                          MROriginalSelectorGesture);
+    return MROriginalSelectorCommit != NULL && MROriginalCenterCommit != NULL &&
+           MROriginalSelectorGesture != NULL;
 }
 
 static BOOL MRInstallMyrtleActionDispatcherHook(void)

@@ -1,6 +1,6 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.6.0~beta1
+Version: 0.6.0~beta2
 Architecture: iphoneos-arm64e
 Description: iOS 15 RootHide diagnostic for a direct Myrtle selector mode.
 Maintainer: Local
