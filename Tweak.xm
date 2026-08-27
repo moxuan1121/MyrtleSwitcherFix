@@ -942,6 +942,11 @@ typedef void (*MRSetCenterHoldDetectedIMP)(id, SEL, BOOL);
 static MRSetCenterHoldDetectedIMP MROriginalSetCenterHoldDetected = NULL;
 typedef void (*MRSetCenterIconViewIMP)(id, SEL, UIView *);
 static MRSetCenterIconViewIMP MROriginalSetCenterIconView = NULL;
+typedef long long (*MRSelectorIndexForPointIMP)(id, SEL, CGPoint);
+static MRSelectorIndexForPointIMP MROriginalSelectorIndexForPointA = NULL;
+static MRSelectorIndexForPointIMP MROriginalSelectorIndexForPointB = NULL;
+typedef void (*MRSelectorPointerUpdateIMP)(id, SEL, CGPoint);
+static MRSelectorPointerUpdateIMP MROriginalSelectorPointerUpdate = NULL;
 
 static void MRHideDirectCenterView(UIView *view)
 {
@@ -978,6 +983,40 @@ static void MRHookSetCenterIconView(id self, SEL selector, UIView *view)
 {
     MROriginalSetCenterIconView(self, selector, view);
     MRHideDirectCenterView(view);
+}
+
+static long long MRHookSelectorIndexForPointA(id self, SEL selector, CGPoint point)
+{
+    long long index = MROriginalSelectorIndexForPointA(self, selector, point);
+    return index == 0 ? -1 : index;
+}
+
+static long long MRHookSelectorIndexForPointB(id self, SEL selector, CGPoint point)
+{
+    long long index = MROriginalSelectorIndexForPointB(self, selector, point);
+    return index == 0 ? -1 : index;
+}
+
+static BOOL MRPointIsInsideDirectCenterSlot(id selectorView, CGPoint point)
+{
+    NSArray *itemViews = MRSafeValue(selectorView, @"itemViews");
+    if (![itemViews isKindOfClass:NSArray.class] || itemViews.count == 0) return NO;
+    UIView *centerSlot = itemViews.firstObject;
+    if (![centerSlot isKindOfClass:UIView.class] || centerSlot.superview == nil) return NO;
+    CGPoint localPoint = [centerSlot convertPoint:point fromView:selectorView];
+    return [centerSlot pointInside:localPoint withEvent:nil];
+}
+
+static void MRHookSelectorPointerUpdate(id self, SEL selector, CGPoint point)
+{
+    if (MRPointIsInsideDirectCenterSlot(self, point)) {
+        if ([self respondsToSelector:NSSelectorFromString(@"setLastHighlightedIndex:")]) {
+            ((void (*)(id, SEL, long long))objc_msgSend)(self,
+                NSSelectorFromString(@"setLastHighlightedIndex:"), -1);
+        }
+        return;
+    }
+    MROriginalSelectorPointerUpdate(self, selector, point);
 }
 
 static void MRHookSetCenterHoldDetected(id self, SEL selector, BOOL detected)
@@ -1558,12 +1597,38 @@ static BOOL MRInstallDirectSelectorDiagnosticHooks(void)
         MSHookMessageEx(selectorViewClass, selector, (IMP)MRHookSetCenterIconView,
                         (IMP *)&MROriginalSetCenterIconView);
     }
+    Class selectorViewClass = NSClassFromString(@"MyrtleSelectorView");
+    if (selectorViewClass == Nil) return NO;
+    if (MROriginalSelectorIndexForPointA == NULL) {
+        SEL selector = NSSelectorFromString(@"MT_llIlIIIlIIIIlllIIIIl:");
+        Method method = class_getInstanceMethod(selectorViewClass, selector);
+        if (method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+        MSHookMessageEx(selectorViewClass, selector, (IMP)MRHookSelectorIndexForPointA,
+                        (IMP *)&MROriginalSelectorIndexForPointA);
+    }
+    if (MROriginalSelectorIndexForPointB == NULL) {
+        SEL selector = NSSelectorFromString(@"MT_lIlllllllIIIllIlllII:");
+        Method method = class_getInstanceMethod(selectorViewClass, selector);
+        if (method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+        MSHookMessageEx(selectorViewClass, selector, (IMP)MRHookSelectorIndexForPointB,
+                        (IMP *)&MROriginalSelectorIndexForPointB);
+    }
+    if (MROriginalSelectorPointerUpdate == NULL) {
+        SEL selector = NSSelectorFromString(@"MT_IIIIlllllIllllIlIIll:");
+        Method method = class_getInstanceMethod(selectorViewClass, selector);
+        if (method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+        MSHookMessageEx(selectorViewClass, selector, (IMP)MRHookSelectorPointerUpdate,
+                        (IMP *)&MROriginalSelectorPointerUpdate);
+    }
     MRDirectSelectorTrace(@"INSTALLED item=%p center=%p gesture=%p",
                           MROriginalSelectorCommit, MROriginalCenterCommit,
                           MROriginalSelectorGesture);
     return MROriginalSelectorCommit != NULL && MROriginalCenterCommit != NULL &&
            MROriginalSelectorGesture != NULL && MROriginalSetCenterHoldDetected != NULL &&
-           MROriginalSetCenterIconView != NULL;
+           MROriginalSetCenterIconView != NULL &&
+           MROriginalSelectorIndexForPointA != NULL &&
+           MROriginalSelectorIndexForPointB != NULL &&
+           MROriginalSelectorPointerUpdate != NULL;
 }
 
 static BOOL MRInstallMyrtleActionDispatcherHook(void)
