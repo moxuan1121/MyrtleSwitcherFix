@@ -8,6 +8,7 @@ on:
       - performance/no-logging
       - feature/fixed-keyboard-avoidance
       - feature/reload-foreground-app
+      - feature/preserve-home-page
     paths:
       - "Makefile"
       - "control"

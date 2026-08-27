@@ -3,9 +3,6 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <substrate.h>
-#import <fcntl.h>
-#import <unistd.h>
-#import <string.h>
 
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
@@ -26,44 +23,18 @@ static NSUInteger MRHomePageRestoreGeneration = 0;
 static BOOL MRHomePageGuardActive = NO;
 static long long MRHomePageGuardPageIndex = 0;
 static long long MRHomePageGuardMinimumIndex = 0;
-static NSTimeInterval MRHomePageGuardDeadline = 0;
 static BOOL MRHomePageGuardClosing = NO;
 static __strong NSString *MRHomePageGuardBundleID = nil;
+static __weak UIScrollView *MRHomePageGuardScrollView = nil;
 
-typedef void (*MRSetPageAnimatedIMP)(id, SEL, long long, BOOL);
-static MRSetPageAnimatedIMP MROriginalSetPageAnimated = NULL;
-typedef void (*MRSetPageIMP)(id, SEL, long long);
-static MRSetPageIMP MROriginalSetPage = NULL;
 typedef void (*MRSetContentOffsetAnimatedIMP)(id, SEL, CGPoint, BOOL);
 static MRSetContentOffsetAnimatedIMP MROriginalSetContentOffsetAnimated = NULL;
 typedef void (*MRSetContentOffsetIMP)(id, SEL, CGPoint);
 static MRSetContentOffsetIMP MROriginalSetContentOffset = NULL;
 
-// Stable builds discard the complete diagnostic expression at preprocessing
-// time: no arguments, strings, filesystem access or log I/O reach SpringBoard.
+// Production builds discard the complete diagnostic expression at preprocessing
+// time: no arguments or diagnostic strings reach SpringBoard.
 #define MRLog(...) do {} while (0)
-
-static void MRHomePageTrace(NSString *format, ...)
-{
-    va_list arguments;
-    va_start(arguments, format);
-    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments];
-    va_end(arguments);
-    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message];
-    const char *bytes = line.UTF8String;
-    if (bytes == NULL) return;
-    int fd = open("/var/mobile/Documents/com.moxuan.myrtleswitcherfix.homepage.log",
-                  O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-    if (fd < 0) return;
-    size_t remaining = strlen(bytes);
-    while (remaining > 0) {
-        ssize_t count = write(fd, bytes, remaining);
-        if (count <= 0) break;
-        bytes += count;
-        remaining -= (size_t)count;
-    }
-    close(fd);
-}
 
 static id MRSafeValue(id object, NSString *key)
 {
@@ -364,78 +335,29 @@ static id MRRootFolderController(void)
     return MRSafeValue(iconController, @"rootFolderController");
 }
 
-static BOOL MRShouldReplaceHomePageRequest(long long requestedPage,
-                                           long long *replacementPage)
+static void MRClearHomePageGuard(void)
 {
-    if (!MRHomePageGuardActive || requestedPage != MRHomePageGuardMinimumIndex ||
-        MRHomePageGuardPageIndex == MRHomePageGuardMinimumIndex ||
-        (MRHomePageGuardDeadline > 0 &&
-         [NSDate timeIntervalSinceReferenceDate] > MRHomePageGuardDeadline)) return NO;
-    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
-    NSString *currentBundleID = MRSafeValue(manager, @"currentBundleID");
-    if (![currentBundleID isEqualToString:MRHomePageGuardBundleID] &&
-        !(MRHomePageGuardClosing && currentBundleID.length == 0)) return NO;
-    if (replacementPage != NULL) *replacementPage = MRHomePageGuardPageIndex;
-    return YES;
-}
-
-static void MRHookSetPageAnimated(id self, SEL selector, long long pageIndex, BOOL animated)
-{
-    long long replacement = pageIndex;
-    if (MRShouldReplaceHomePageRequest(pageIndex, &replacement)) {
-        MRHomePageTrace(@"INTERCEPT selector=%@ requested=%lld replacement=%lld animated=%d",
-                        NSStringFromSelector(selector), pageIndex, replacement, animated);
-        MROriginalSetPageAnimated(self, selector, replacement, NO);
-        return;
-    }
-    MROriginalSetPageAnimated(self, selector, pageIndex, animated);
-}
-
-static void MRHookSetPage(id self, SEL selector, long long pageIndex)
-{
-    long long replacement = pageIndex;
-    if (MRShouldReplaceHomePageRequest(pageIndex, &replacement)) {
-        MRHomePageTrace(@"INTERCEPT selector=%@ requested=%lld replacement=%lld",
-                        NSStringFromSelector(selector), pageIndex, replacement);
-        MROriginalSetPage(self, selector, replacement);
-        return;
-    }
-    MROriginalSetPage(self, selector, pageIndex);
+    MRHomePageGuardActive = NO;
+    MRHomePageGuardClosing = NO;
+    MRHomePageGuardBundleID = nil;
+    MRHomePageGuardScrollView = nil;
 }
 
 static BOOL MRGuardRootScrollOffset(id scrollView, CGPoint requestedOffset,
                                     CGPoint *replacementOffset)
 {
-    if (!MRHomePageGuardActive ||
-        (MRHomePageGuardDeadline > 0 &&
-         [NSDate timeIntervalSinceReferenceDate] > MRHomePageGuardDeadline)) return NO;
-    id controller = MRRootFolderController();
-    id rootFolderView = MRSafeValue(controller, @"rootFolderView");
-    id currentRootScrollView = MRSafeValue(rootFolderView, @"scrollView");
-    if (scrollView != currentRootScrollView ||
-        ![scrollView isKindOfClass:[UIScrollView class]]) return NO;
+    if (!MRHomePageGuardActive || scrollView != MRHomePageGuardScrollView) return NO;
     UIScrollView *rootScrollView = scrollView;
     if (rootScrollView.tracking || rootScrollView.dragging ||
         rootScrollView.decelerating) {
-        MRHomePageTrace(@"CANCEL guard for user scroll tracking=%d dragging=%d decelerating=%d",
-                        rootScrollView.tracking, rootScrollView.dragging,
-                        rootScrollView.decelerating);
-        MRHomePageGuardActive = NO;
-        MRHomePageGuardClosing = NO;
-        MRHomePageGuardBundleID = nil;
+        MRClearHomePageGuard();
         return NO;
     }
-    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
-    NSString *currentBundleID = MRSafeValue(manager, @"currentBundleID");
-    if (![currentBundleID isEqualToString:MRHomePageGuardBundleID] &&
-        !(MRHomePageGuardClosing && currentBundleID.length == 0)) return NO;
     CGFloat targetX = (CGFloat)(MRHomePageGuardPageIndex - MRHomePageGuardMinimumIndex) *
         rootScrollView.bounds.size.width;
     if (requestedOffset.x >= targetX - 0.5) return NO;
     if (replacementOffset != NULL)
         *replacementOffset = CGPointMake(targetX, requestedOffset.y);
-    MRHomePageTrace(@"INTERCEPT scroll requestedX=%.3f replacementX=%.3f currentX=%.3f",
-                    requestedOffset.x, targetX, rootScrollView.contentOffset.x);
     return YES;
 }
 
@@ -460,89 +382,27 @@ static void MRHookSetContentOffset(id self, SEL selector, CGPoint offset)
     MROriginalSetContentOffset(self, selector, offset);
 }
 
-static void MRArmHomePageGuard(long long pageIndex, NSString *bundleID,
-                               NSUInteger generation)
+static void MRArmHomePageGuard(long long pageIndex, NSString *bundleID)
 {
     id controller = MRRootFolderController();
+    id rootFolderView = MRSafeValue(controller, @"rootFolderView");
+    id rootScrollView = MRSafeValue(rootFolderView, @"scrollView");
     long long minimumPageIndex = 0;
     long long maximumPageIndex = 0;
     if (!MRIntegerGetter(controller, @"minimumPageIndex", &minimumPageIndex) ||
         !MRIntegerGetter(controller, @"maximumPageIndex", &maximumPageIndex) ||
         pageIndex < minimumPageIndex || pageIndex > maximumPageIndex ||
-        pageIndex == minimumPageIndex || bundleID.length == 0) {
-        MRHomePageGuardActive = NO;
-        MRHomePageGuardBundleID = nil;
+        pageIndex == minimumPageIndex || bundleID.length == 0 ||
+        ![rootScrollView isKindOfClass:[UIScrollView class]]) {
+        MRClearHomePageGuard();
         return;
     }
     MRHomePageGuardPageIndex = pageIndex;
     MRHomePageGuardMinimumIndex = minimumPageIndex;
     MRHomePageGuardBundleID = [bundleID copy];
-    MRHomePageGuardDeadline = 0;
+    MRHomePageGuardScrollView = rootScrollView;
     MRHomePageGuardClosing = NO;
     MRHomePageGuardActive = YES;
-    (void)generation;
-}
-
-static void MRTraceHomePageSnapshot(NSString *stage)
-{
-    id iconController = MRSendClassNoArgs(@"SBIconController", @"sharedInstance");
-    MRHomePageTrace(@"SNAPSHOT %@ iconController=%@:%p", stage,
-                    iconController ? NSStringFromClass([iconController class]) : @"nil",
-                    (__bridge void *)iconController);
-    if (iconController == nil) return;
-
-    NSArray<NSString *> *relationshipKeys = @[
-        @"rootFolderController", @"rootFolderView", @"folderController", @"folderView",
-        @"iconManager", @"iconListView", @"currentIconListView", @"scrollView",
-        @"pagingScrollView", @"iconScrollView", @"contentView", @"view"
-    ];
-    NSArray<NSString *> *scalarSelectors = @[
-        @"currentPageIndex", @"currentIconListIndex", @"currentIconListViewIndex",
-        @"currentListIndex", @"pageIndex", @"selectedPageIndex", @"firstVisiblePageIndex",
-        @"minimumPageIndex", @"maximumPageIndex", @"numberOfPages"
-    ];
-    NSMutableArray<NSDictionary *> *queue = [NSMutableArray arrayWithObject:@{
-        @"object": iconController, @"path": @"SBIconController.sharedInstance", @"depth": @0
-    }];
-    NSHashTable *seen = [NSHashTable hashTableWithOptions:NSPointerFunctionsObjectPointerPersonality];
-    NSUInteger cursor = 0;
-    while (cursor < queue.count && cursor < 40) {
-        NSDictionary *entry = queue[cursor++];
-        id object = entry[@"object"];
-        NSString *path = entry[@"path"];
-        NSUInteger depth = [entry[@"depth"] unsignedIntegerValue];
-        if (object == nil || [seen containsObject:object]) continue;
-        [seen addObject:object];
-        NSString *geometry = @"";
-        if ([object isKindOfClass:[UIScrollView class]]) {
-            UIScrollView *scroll = object;
-            geometry = [NSString stringWithFormat:@" offset=%@ content=%@ bounds=%@ paging=%d",
-                        NSStringFromCGPoint(scroll.contentOffset), NSStringFromCGSize(scroll.contentSize),
-                        NSStringFromCGRect(scroll.bounds), scroll.pagingEnabled];
-        } else if ([object isKindOfClass:[UIView class]]) {
-            UIView *view = object;
-            geometry = [NSString stringWithFormat:@" frame=%@ bounds=%@",
-                        NSStringFromCGRect(view.frame), NSStringFromCGRect(view.bounds)];
-        }
-        NSMutableArray<NSString *> *scalars = [NSMutableArray array];
-        for (NSString *name in scalarSelectors) {
-            NSString *value = MRScalarGetterValue(object, name);
-            if (value != nil) [scalars addObject:[NSString stringWithFormat:@"%@=%@", name, value]];
-        }
-        MRHomePageTrace(@"NODE %@ class=%@:%p%@ scalars=[%@]", path,
-                        NSStringFromClass([object class]), (__bridge void *)object, geometry,
-                        [scalars componentsJoinedByString:@", "]);
-        if (depth >= 3) continue;
-        for (NSString *key in relationshipKeys) {
-            id child = MRSafeValue(object, key);
-            if (child == nil || child == object || [child isKindOfClass:[NSString class]] ||
-                [child isKindOfClass:[NSNumber class]]) continue;
-            [queue addObject:@{@"object": child,
-                               @"path": [path stringByAppendingFormat:@".%@", key],
-                               @"depth": @(depth + 1)}];
-        }
-    }
-    MRHomePageTrace(@"END SNAPSHOT %@ nodes=%lu", stage, (unsigned long)seen.count);
 }
 
 static void MRReloadForegroundApplication(void)
@@ -766,45 +626,31 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
     BOOL openingFirstMyrtleWindow = bundleID.length != 0 && previousBundleID.length == 0;
     long long preservedHomePage = 0;
     BOOL hasPreservedHomePage = NO;
-    NSUInteger homePageGeneration = MRHomePageRestoreGeneration;
     if (openingFirstMyrtleWindow) {
         id rootFolderController = MRRootFolderController();
         hasPreservedHomePage = MRIntegerGetter(rootFolderController,
                                                @"currentPageIndex",
                                                &preservedHomePage);
-        homePageGeneration = ++MRHomePageRestoreGeneration;
-        MRHomePageTrace(@"BEGIN Myrtle windowization bundle=%@", bundleID);
-        MRHomePageTrace(@"PRESERVE page=%lld valid=%d generation=%lu",
-                        preservedHomePage, hasPreservedHomePage,
-                        (unsigned long)homePageGeneration);
+        ++MRHomePageRestoreGeneration;
         if (hasPreservedHomePage)
-            MRArmHomePageGuard(preservedHomePage, bundleID, homePageGeneration);
-        MRTraceHomePageSnapshot(@"before-original");
+            MRArmHomePageGuard(preservedHomePage, bundleID);
+        else
+            MRClearHomePageGuard();
     } else if (bundleID.length == 0 && previousBundleID.length != 0) {
         NSUInteger closingGeneration = ++MRHomePageRestoreGeneration;
         if (MRHomePageGuardActive &&
             [MRHomePageGuardBundleID isEqualToString:previousBundleID]) {
             MRHomePageGuardClosing = YES;
-            MRHomePageGuardDeadline = [NSDate timeIntervalSinceReferenceDate] + 2.0;
-            MRHomePageTrace(@"BEGIN closing guard bundle=%@ generation=%lu",
-                            previousBundleID, (unsigned long)closingGeneration);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                          (int64_t)(2.05 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 if (closingGeneration == MRHomePageRestoreGeneration &&
                     MRHomePageGuardClosing) {
-                    MRHomePageTrace(@"EXPIRE closing guard generation=%lu bundle=%@",
-                                    (unsigned long)closingGeneration,
-                                    MRHomePageGuardBundleID);
-                    MRHomePageGuardActive = NO;
-                    MRHomePageGuardClosing = NO;
-                    MRHomePageGuardBundleID = nil;
+                    MRClearHomePageGuard();
                 }
             });
         } else {
-            MRHomePageGuardActive = NO;
-            MRHomePageGuardClosing = NO;
-            MRHomePageGuardBundleID = nil;
+            MRClearHomePageGuard();
         }
     }
     BOOL fullscreenTransition = bundleID.length == 0 && previousBundleID.length != 0 &&
@@ -817,21 +663,6 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
     NSUInteger transitionGeneration = MRReturnToMainGeneration;
     if (meaningfulTransition) transitionGeneration = ++MRReturnToMainGeneration;
     MROriginalSetCurrentBundle(self, selector, bundleID);
-    if (openingFirstMyrtleWindow) {
-        MRTraceHomePageSnapshot(@"after-original");
-        NSString *diagnosticBundleID = [bundleID copy];
-        for (NSNumber *delay in @[@0.05, @0.2, @0.5, @1.0, @1.5, @2.5]) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                         (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
-                NSString *current = MRSafeValue(manager, @"currentBundleID");
-                MRHomePageTrace(@"DELAY %.2f expected=%@ current=%@",
-                                delay.doubleValue, diagnosticBundleID, current);
-                MRTraceHomePageSnapshot([NSString stringWithFormat:@"delay-%.2f", delay.doubleValue]);
-            });
-        }
-    }
     NSString *stableBundleID = [bundleID copy];
     if (stableBundleID.length != 0 && underlyingBeforeChange.length != 0 &&
         ![underlyingBeforeChange isEqualToString:stableBundleID]) {
@@ -1363,32 +1194,6 @@ static BOOL MRInstallMyrtleActionDispatcherHook(void)
     return MROriginalActionDispatcher != NULL;
 }
 
-static BOOL MRInstallHomePageSetterHooks(void)
-{
-    Class cls = NSClassFromString(@"SBRootFolderController");
-    if (cls == Nil) return NO;
-
-    if (MROriginalSetPageAnimated == NULL) {
-        SEL selector = NSSelectorFromString(@"setCurrentPageIndex:animated:");
-        Method method = class_getInstanceMethod(cls, selector);
-        if (method != NULL && method_getNumberOfArguments(method) == 4) {
-            MSHookMessageEx(cls, selector, (IMP)MRHookSetPageAnimated,
-                            (IMP *)&MROriginalSetPageAnimated);
-        }
-    }
-    if (MROriginalSetPage == NULL) {
-        SEL selector = NSSelectorFromString(@"setCurrentPageIndex:");
-        Method method = class_getInstanceMethod(cls, selector);
-        if (method != NULL && method_getNumberOfArguments(method) == 3) {
-            MSHookMessageEx(cls, selector, (IMP)MRHookSetPage,
-                            (IMP *)&MROriginalSetPage);
-        }
-    }
-    MRHomePageTrace(@"INSTALL setters animated=%d plain=%d",
-                    MROriginalSetPageAnimated != NULL, MROriginalSetPage != NULL);
-    return MROriginalSetPageAnimated != NULL || MROriginalSetPage != NULL;
-}
-
 static BOOL MRInstallRootIconScrollHooks(void)
 {
     Class cls = NSClassFromString(@"SBIconScrollView");
@@ -1420,9 +1225,6 @@ static BOOL MRInstallRootIconScrollHooks(void)
                                 (IMP *)&MROriginalSetContentOffset);
         }
     }
-    MRHomePageTrace(@"INSTALL rootScroll animated=%d plain=%d",
-                    MROriginalSetContentOffsetAnimated != NULL,
-                    MROriginalSetContentOffset != NULL);
     return MROriginalSetContentOffsetAnimated != NULL ||
         MROriginalSetContentOffset != NULL;
 }
@@ -1507,7 +1309,6 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
             MRInstallUserDeletionHook();
-            MRInstallHomePageSetterHooks();
             MRInstallRootIconScrollHooks();
             MRInstallMyrtleWhenReady(0);
         });
