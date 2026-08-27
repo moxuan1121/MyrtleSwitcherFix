@@ -72,7 +72,9 @@ typedef void (*MRSBHandleOpenRequestIMP)(id, SEL, id, id, id, id, id);
 static MRSBHandleOpenRequestIMP MROriginalSBHandleOpenRequest = NULL;
 typedef void (*MRFBSystemOpenIMP)(id, SEL, id, id, id, id, id);
 static MRFBSystemOpenIMP MROriginalFBSystemOpen = NULL;
-typedef void (^MRFBSystemCompletion)(id, id, id, id, id, id, id, id, id, id);
+typedef void (^MRFBSystemRawCompletion)(uintptr_t, uintptr_t, uintptr_t, uintptr_t,
+                                        uintptr_t, uintptr_t, uintptr_t, uintptr_t,
+                                        uintptr_t, uintptr_t);
 typedef void (*MRFBSOpenServiceIMP)(id, SEL, id, id, id);
 static MRFBSOpenServiceIMP MROriginalFBSOpenService = NULL;
 static id MRSafeValue(id object, NSString *key);
@@ -153,17 +155,18 @@ static void MRHookFBSystemOpen(id self, SEL selector, id application, id options
                MRURLObjectSummary(originator), requestID,
                completion ? NSStringFromClass([completion class]) : @"nil",
                MRBlockSignature(completion));
-    MRFBSystemCompletion originalCompletion = completion;
-    MRFBSystemCompletion wrappedCompletion = nil;
+    MRFBSystemRawCompletion originalCompletion = completion;
+    MRFBSystemRawCompletion wrappedCompletion = nil;
     if (originalCompletion != nil) {
         wrappedCompletion =
-        ^(id a1, id a2, id a3, id a4, id a5, id a6, id a7, id a8, id a9, id a10) {
-            MRURLTrace(@"FBSystemService COMPLETE app=%@ args=[1:{%@} 2:{%@} 3:{%@} 4:{%@} 5:{%@} 6:{%@} 7:{%@} 8:{%@} 9:{%@} 10:{%@}]",
-                       application, MRURLObjectSummary(a1), MRURLObjectSummary(a2),
-                       MRURLObjectSummary(a3), MRURLObjectSummary(a4),
-                       MRURLObjectSummary(a5), MRURLObjectSummary(a6),
-                       MRURLObjectSummary(a7), MRURLObjectSummary(a8),
-                       MRURLObjectSummary(a9), MRURLObjectSummary(a10));
+        ^(uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5,
+          uintptr_t a6, uintptr_t a7, uintptr_t a8, uintptr_t a9, uintptr_t a10) {
+            MRURLTrace(@"FBSystemService COMPLETE-RAW app=%@ args=[0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx]",
+                       application, (unsigned long long)a1, (unsigned long long)a2,
+                       (unsigned long long)a3, (unsigned long long)a4,
+                       (unsigned long long)a5, (unsigned long long)a6,
+                       (unsigned long long)a7, (unsigned long long)a8,
+                       (unsigned long long)a9, (unsigned long long)a10);
             originalCompletion(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10);
         };
     }
