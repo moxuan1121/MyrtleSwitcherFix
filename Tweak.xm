@@ -3,6 +3,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <substrate.h>
+#import <math.h>
 
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
@@ -30,6 +31,7 @@ static long long MRHomePageGuardMinimumIndex = 0;
 static BOOL MRHomePageGuardClosing = NO;
 static __strong NSString *MRHomePageGuardBundleID = nil;
 static __weak UIScrollView *MRHomePageGuardScrollView = nil;
+static __strong UIControl *MROutsideKeyboardTapCatcher = nil;
 
 typedef void (*MRSetContentOffsetAnimatedIMP)(id, SEL, CGPoint, BOOL);
 static MRSetContentOffsetAnimatedIMP MROriginalSetContentOffsetAnimated = NULL;
@@ -53,6 +55,174 @@ static id MRSendClassNoArgs(NSString *className, NSString *selectorName)
     SEL selector = NSSelectorFromString(selectorName);
     if (cls == Nil || ![cls respondsToSelector:selector]) return nil;
     return ((id (*)(id, SEL))objc_msgSend)(cls, selector);
+}
+
+static void MRDeactivateOutsideKeyboardTapCatcher(void);
+
+static BOOL MRUsableProtectedHostRect(CGRect rect, CGRect screenBounds)
+{
+    if (CGRectIsNull(rect) || CGRectIsInfinite(rect) || CGRectIsEmpty(rect)) return NO;
+    if (!isfinite(rect.origin.x) || !isfinite(rect.origin.y) ||
+        !isfinite(rect.size.width) || !isfinite(rect.size.height)) return NO;
+    if (rect.size.width < 44.0 || rect.size.height < 44.0) return NO;
+    CGRect visible = CGRectIntersection(rect, screenBounds);
+    if (CGRectIsNull(visible) || CGRectIsEmpty(visible)) return NO;
+
+    // A full-screen ancestor is Myrtle's transparent routing view, not the
+    // visible application card.  It must never become the protected rect or
+    // there would be no tappable outside area.
+    CGFloat screenArea = CGRectGetWidth(screenBounds) * CGRectGetHeight(screenBounds);
+    CGFloat visibleArea = CGRectGetWidth(visible) * CGRectGetHeight(visible);
+    return screenArea > 0.0 && visibleArea < screenArea * 0.96;
+}
+
+static CGRect MRProtectedMyrtleHostRectInScreen(void)
+{
+    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+    UIView *hostView = MRSafeValue(manager, @"hostView");
+    if (![hostView isKindOfClass:UIView.class] || hostView.window == nil)
+        return CGRectNull;
+
+    CGRect screenBounds = UIScreen.mainScreen.bounds;
+    CGRect bestRect = CGRectNull;
+    CGFloat bestArea = 0.0;
+
+    // Walk from Myrtle's rendered host surface towards its host window.  The
+    // largest non-full-screen ancestor includes the title/controls around the
+    // application surface while excluding the transparent screen-sized root.
+    for (UIView *candidate = hostView;
+         [candidate isKindOfClass:UIView.class] && ![candidate isKindOfClass:UIWindow.class];
+         candidate = candidate.superview) {
+        CGRect rect = [candidate convertRect:candidate.bounds toView:nil];
+        if (!MRUsableProtectedHostRect(rect, screenBounds)) continue;
+        CGFloat area = CGRectGetWidth(rect) * CGRectGetHeight(rect);
+        if (area > bestArea) {
+            bestRect = rect;
+            bestArea = area;
+        }
+    }
+
+    UIWindow *hostWindow = MRSafeValue(manager, @"hostWindow");
+    if ([hostWindow isKindOfClass:UIWindow.class]) {
+        CGRect rect = [hostWindow convertRect:hostWindow.bounds toWindow:nil];
+        if (MRUsableProtectedHostRect(rect, screenBounds)) {
+            CGFloat area = CGRectGetWidth(rect) * CGRectGetHeight(rect);
+            if (area > bestArea) bestRect = rect;
+        }
+    }
+
+    // Include the shadow/rounded-edge tolerance so a tap directly on the card
+    // perimeter remains an application-window tap rather than a close action.
+    return CGRectIsNull(bestRect) ? CGRectNull : CGRectInset(bestRect, -6.0, -6.0);
+}
+
+@interface MROutsideKeyboardTapControl : UIControl
+@property (nonatomic, weak) id myrtleController;
+@property (nonatomic, assign) CGFloat keyboardTopInScreen;
+@end
+
+@implementation MROutsideKeyboardTapControl
+
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event
+{
+    if (![super pointInside:point withEvent:event] || self.hidden || !self.enabled)
+        return NO;
+
+    id controller = self.myrtleController;
+    if (controller == nil || ![MRSafeValue(controller, @"isWindowOpen") boolValue] ||
+        ![MRSafeValue(controller, @"handleWasMovedForKeyboard") boolValue])
+        return NO;
+
+    // Preserve every radial selector and launcher interaction.  Outside-tap
+    // closing is available only while the plain split window is on screen.
+    if ([MRSafeValue(controller, @"isOverlayOpen") boolValue] ||
+        [MRSafeValue(controller, @"isAppLauncherOpen") boolValue] ||
+        [MRSafeValue(controller, @"isAlphaAppLauncherOpen") boolValue])
+        return NO;
+
+    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+    NSString *bundleID = MRSafeValue(manager, @"currentBundleID");
+    if (![bundleID isKindOfClass:NSString.class] || bundleID.length == 0) return NO;
+
+    CGPoint screenPoint = [self convertPoint:point toView:nil];
+    if (!isfinite(screenPoint.x) || !isfinite(screenPoint.y) ||
+        self.keyboardTopInScreen <= 0.0 || screenPoint.y >= self.keyboardTopInScreen)
+        return NO;
+
+    CGRect protectedRect = MRProtectedMyrtleHostRectInScreen();
+    if (CGRectIsNull(protectedRect)) return NO;
+    return !CGRectContainsPoint(protectedRect, screenPoint);
+}
+
+- (void)mr_closeMyrtleWindowFromOutsideTap:(__unused id)sender
+{
+    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+    NSString *bundleID = MRSafeValue(manager, @"currentBundleID");
+    SEL closeSelector = NSSelectorFromString(MRCloseSelector);
+    Method closeMethod = manager == nil ? NULL :
+        class_getInstanceMethod([manager class], closeSelector);
+    if (bundleID.length == 0 || closeMethod == NULL ||
+        method_getNumberOfArguments(closeMethod) != 4) return;
+
+    // Disable first so the same physical tap cannot fall through and launch a
+    // Home Screen icon while Myrtle performs its close animation.
+    MRDeactivateOutsideKeyboardTapCatcher();
+    ((void (*)(id, SEL, BOOL, id))objc_msgSend)(manager, closeSelector, YES, nil);
+}
+
+@end
+
+
+static void MRActivateOutsideKeyboardTapCatcher(id controller, CGRect keyboardFrame)
+{
+    if (controller == nil || ![MRSafeValue(controller, @"isWindowOpen") boolValue] ||
+        ![MRSafeValue(controller, @"handleWasMovedForKeyboard") boolValue]) {
+        MRDeactivateOutsideKeyboardTapCatcher();
+        return;
+    }
+
+    UIView *rootView = MRSafeValue(controller, @"view");
+    if (![rootView isKindOfClass:UIView.class] || rootView.window == nil) {
+        MRDeactivateOutsideKeyboardTapCatcher();
+        return;
+    }
+
+    MROutsideKeyboardTapControl *catcher =
+        [MROutsideKeyboardTapCatcher isKindOfClass:MROutsideKeyboardTapControl.class]
+            ? (MROutsideKeyboardTapControl *)MROutsideKeyboardTapCatcher
+            : nil;
+    if (catcher == nil) {
+        catcher = [[MROutsideKeyboardTapControl alloc] initWithFrame:rootView.bounds];
+        catcher.backgroundColor = UIColor.clearColor;
+        catcher.opaque = NO;
+        catcher.exclusiveTouch = YES;
+        catcher.accessibilityElementsHidden = YES;
+        [catcher addTarget:catcher
+                    action:@selector(mr_closeMyrtleWindowFromOutsideTap:)
+          forControlEvents:UIControlEventTouchUpInside];
+        MROutsideKeyboardTapCatcher = catcher;
+    }
+
+    [catcher removeFromSuperview];
+    catcher.myrtleController = controller;
+    catcher.keyboardTopInScreen = CGRectGetMinY(keyboardFrame);
+    catcher.frame = rootView.bounds;
+    catcher.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    catcher.hidden = NO;
+    catcher.enabled = YES;
+    [rootView insertSubview:catcher atIndex:0];
+}
+
+static void MRDeactivateOutsideKeyboardTapCatcher(void)
+{
+    MROutsideKeyboardTapControl *catcher =
+        [MROutsideKeyboardTapCatcher isKindOfClass:MROutsideKeyboardTapControl.class]
+            ? (MROutsideKeyboardTapControl *)MROutsideKeyboardTapCatcher
+            : nil;
+    catcher.enabled = NO;
+    catcher.hidden = YES;
+    catcher.myrtleController = nil;
+    [catcher removeFromSuperview];
 }
 
 static id MRMainSwitcher(void)
@@ -1094,10 +1264,12 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
     if (CGRectGetWidth(keyboardFrame) <= 0.0 || CGRectGetHeight(keyboardFrame) <= 0.0) return;
     MRInstallPinnedHandleCenterGuard(self);
     MRApplyFixedKeyboardHandlePosition(self, userInfo);
+    MRActivateOutsideKeyboardTapCatcher(self, keyboardFrame);
 }
 
 static void MRHookKeyboardWillHide(id self, SEL selector, NSNotification *notification)
 {
+    MRDeactivateOutsideKeyboardTapCatcher();
     UIView *movementView = MRSafeValue(self, @"handleHitView");
     BOOL guarded = [movementView isKindOfClass:UIView.class] &&
         [objc_getAssociatedObject(movementView, MRPinnedHandleInstalledKey) boolValue];
