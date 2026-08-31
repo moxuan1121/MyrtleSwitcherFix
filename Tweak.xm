@@ -1885,6 +1885,10 @@ typedef void (*MRMyrtleViewDidLoadIMP)(id, SEL);
 static MRMyrtleViewDidLoadIMP MROriginalMyrtleViewDidLoad = NULL;
 typedef void (*MRMyrtleHandlePanIMP)(id, SEL, id);
 static MRMyrtleHandlePanIMP MROriginalMyrtleHandlePan = NULL;
+typedef void (*MRAddChildViewControllerIMP)(id, SEL, UIViewController *);
+static MRAddChildViewControllerIMP MROriginalMyrtleAddChildViewController = NULL;
+typedef void (*MRSetAlphaLauncherOpenIMP)(id, SEL, BOOL);
+static MRSetAlphaLauncherOpenIMP MROriginalSetAlphaLauncherOpen = NULL;
 
 static id MRFindEmbeddedAlphaLauncher(id parent, NSString **childSummary)
 {
@@ -1919,6 +1923,47 @@ static void MRApplyEmbeddedAlphaLauncherLayout(id parent, NSString *stage)
     [view setNeedsLayout];
     [view layoutIfNeeded];
     MRLayoutStandaloneAlphaLauncher(launcher, stage);
+}
+
+static BOOL MRIsAlphaLauncherController(id controller)
+{
+    Class cls = NSClassFromString(@"MyrtleAlphaAppLauncherViewController");
+    return cls != Nil && [controller isKindOfClass:cls];
+}
+
+static void MRHookMyrtleAddChildViewController(id self, SEL selector,
+                                                UIViewController *child)
+{
+    MROriginalMyrtleAddChildViewController(self, selector, child);
+    MRAlphaLauncherDiagnostic([NSString stringWithFormat:
+        @"addChild parent=%@ child=%@ alpha=%d",
+        NSStringFromClass([self class]), NSStringFromClass([child class]),
+        MRIsAlphaLauncherController(child)]);
+    if (!MRIsAlphaLauncherController(child)) return;
+
+    MRLayoutStandaloneAlphaLauncher(child, @"addChildImmediate");
+    __weak id weakParent = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id parent = weakParent;
+        if (parent != nil)
+            MRApplyEmbeddedAlphaLauncherLayout(parent, @"addChildNextRunLoop");
+    });
+}
+
+static void MRHookSetAlphaLauncherOpen(id self, SEL selector, BOOL open)
+{
+    MROriginalSetAlphaLauncherOpen(self, selector, open);
+    MRAlphaLauncherDiagnostic([NSString stringWithFormat:
+        @"setIsAlphaAppLauncherOpen=%d parent=%@", open, NSStringFromClass([self class])]);
+    if (!open) return;
+
+    MRApplyEmbeddedAlphaLauncherLayout(self, @"alphaStateImmediate");
+    __weak id weakParent = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id parent = weakParent;
+        if (parent != nil)
+            MRApplyEmbeddedAlphaLauncherLayout(parent, @"alphaStateNextRunLoop");
+    });
 }
 
 static void MRHookActionDispatcher(id self, SEL selector, id argument1,
@@ -2583,6 +2628,49 @@ static BOOL MRInstallMyrtleActionDispatcherHook(void)
     return MROriginalActionDispatcher != NULL;
 }
 
+static BOOL MRInstallAlphaLauncherContainmentHooks(void)
+{
+    Class cls = NSClassFromString(@"MyrtleViewController");
+    if (cls == Nil) return NO;
+
+    if (MROriginalMyrtleAddChildViewController == NULL) {
+        SEL selector = @selector(addChildViewController:);
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+        IMP inheritedImplementation = method_getImplementation(method);
+        const char *types = method_getTypeEncoding(method);
+        if (class_addMethod(cls, selector, (IMP)MRHookMyrtleAddChildViewController, types)) {
+            MROriginalMyrtleAddChildViewController =
+                (MRAddChildViewControllerIMP)inheritedImplementation;
+        } else {
+            MSHookMessageEx(cls, selector, (IMP)MRHookMyrtleAddChildViewController,
+                            (IMP *)&MROriginalMyrtleAddChildViewController);
+        }
+    }
+
+    if (MROriginalSetAlphaLauncherOpen == NULL) {
+        SEL selector = NSSelectorFromString(@"setIsAlphaAppLauncherOpen:");
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+        char returnType[16] = {};
+        char argumentType[16] = {};
+        method_getReturnType(method, returnType, sizeof(returnType));
+        method_getArgumentType(method, 2, argumentType, sizeof(argumentType));
+        if (returnType[0] != 'v' || (argumentType[0] != 'B' && argumentType[0] != 'c'))
+            return NO;
+        MSHookMessageEx(cls, selector, (IMP)MRHookSetAlphaLauncherOpen,
+                        (IMP *)&MROriginalSetAlphaLauncherOpen);
+    }
+
+    BOOL installed = MROriginalMyrtleAddChildViewController != NULL &&
+        MROriginalSetAlphaLauncherOpen != NULL;
+    MRAlphaLauncherDiagnostic([NSString stringWithFormat:
+        @"containment install addChild=%d alphaSetter=%d result=%d",
+        MROriginalMyrtleAddChildViewController != NULL,
+        MROriginalSetAlphaLauncherOpen != NULL, installed]);
+    return installed;
+}
+
 static BOOL MRInstallRootIconScrollHooks(void)
 {
     Class cls = NSClassFromString(@"SBIconScrollView");
@@ -2685,11 +2773,12 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL handleBoundaryInstalled = MRInstallMyrtleHandleBoundaryHooks();
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
     BOOL actionDispatcherInstalled = MRInstallMyrtleActionDispatcherHook();
+    BOOL alphaContainmentInstalled = MRInstallAlphaLauncherContainmentHooks();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
         keyboardAvoidanceInstalled && outsideActionGateInstalled && hostPassThroughInstalled &&
         hostGeometryInstalled && hostGestureInstalled && hostSnapInstalled &&
         standaloneAlphaLauncherInstalled && handleBoundaryInstalled &&
-        selectorCenterInstalled && actionDispatcherInstalled) {
+        selectorCenterInstalled && actionDispatcherInstalled && alphaContainmentInstalled) {
         return;
     }
     if (attempt >= 60) {
@@ -2709,7 +2798,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
         [[NSFileManager defaultManager] removeItemAtPath:
             @"/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.alpha-launcher.log"
                                                    error:nil];
-        MRAlphaLauncherDiagnostic(@"0.5.5 beta5 cached-instance diagnostic start");
+        MRAlphaLauncherDiagnostic(@"0.5.5 beta6 containment diagnostic start");
         dispatch_async(dispatch_get_main_queue(), ^{
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
