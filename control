@@ -1,8 +1,8 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.5.3.8~beta4
+Version: 0.5.3.8~diag5
 Architecture: iphoneos-arm64e
-Description: iOS 15 RootHide fix for Myrtle app-switcher, keyboard avoidance, native keyboard-only outside-tap closing with exact native no-keyboard pass-through, foreground reload, Home Screen page preservation, and handle bottom boundary.
+Description: Diagnostic iOS 15 RootHide build tracing Myrtle native no-keyboard pass-through call-site matching and keyboard-state transitions.
 Maintainer: Local
 Author: Local
 Section: Tweaks

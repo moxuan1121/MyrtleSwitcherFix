@@ -4,8 +4,12 @@
 #import <objc/runtime.h>
 #import <substrate.h>
 #import <dlfcn.h>
+#import <fcntl.h>
 #import <math.h>
+#import <stdarg.h>
 #import <stdlib.h>
+#import <string.h>
+#import <unistd.h>
 #if __has_include(<ptrauth.h>)
 #import <ptrauth.h>
 #endif
@@ -57,11 +61,51 @@ typedef struct {
 static MRNSNumberIntegerValueHookRecord MRNSNumberIntegerValueHooks[8] = {};
 static NSUInteger MRNSNumberIntegerValueHookCount = 0;
 static uintptr_t MRMyrtleTapOutsideIntegerValueReturnAddress = 0;
+static uintptr_t MRMyrtleImageBase = 0;
 static BOOL MRMyrtleTapOutsidePreferenceOverrideInstalled = NO;
+static __thread NSUInteger MRMyrtleHostHitTestDepth = 0;
+static __thread NSUInteger MRMyrtleHostHitTestIntegerCalls = 0;
+static __thread NSUInteger MRMyrtleHostHitTestExactMatches = 0;
+static __thread uintptr_t MRMyrtleHostHitTestLastIntegerCaller = 0;
+static NSUInteger MRMyrtleNativeTraceCount = 0;
 
 // Production builds discard the complete diagnostic expression at preprocessing
 // time: no arguments or diagnostic strings reach SpringBoard.
 #define MRLog(...) do {} while (0)
+
+// Event-driven beta trace. It records only Myrtle preference routing,
+// keyboard-state transitions and outside-card hit tests; there is no timer,
+// polling or global touch dump. The stable build removes this function.
+static void MRNativePassThroughTrace(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+static void MRNativePassThroughTrace(NSString *format, ...)
+{
+    if (MRMyrtleNativeTraceCount >= 256) return;
+    MRMyrtleNativeTraceCount++;
+    va_list arguments;
+    va_start(arguments, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments];
+    va_end(arguments);
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message];
+    const char *bytes = line.UTF8String;
+    if (bytes == NULL) return;
+    const char *path = "/var/mobile/Documents/com.moxuan.myrtleswitcherfix.native-pass-through.log";
+    int descriptor = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (descriptor < 0) return;
+    off_t size = lseek(descriptor, 0, SEEK_END);
+    if (size > 512 * 1024) {
+        close(descriptor);
+        descriptor = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (descriptor < 0) return;
+    }
+    size_t remaining = strlen(bytes);
+    while (remaining != 0) {
+        ssize_t written = write(descriptor, bytes, remaining);
+        if (written <= 0) break;
+        bytes += written;
+        remaining -= (size_t)written;
+    }
+    close(descriptor);
+}
 
 static uintptr_t MRStripCodePointer(const void *pointer)
 {
@@ -86,9 +130,14 @@ static MRNSNumberIntegerValueIMP MROriginalIntegerValueForObject(id object)
 static NSInteger MRHookNSNumberIntegerValue(id self, SEL selector)
 {
     uintptr_t caller = MRStripCodePointer(__builtin_return_address(0));
+    if (MRMyrtleHostHitTestDepth != 0) {
+        MRMyrtleHostHitTestIntegerCalls++;
+        MRMyrtleHostHitTestLastIntegerCaller = caller;
+    }
     if (!MRMyrtleHostedKeyboardVisible &&
         MRMyrtleTapOutsideIntegerValueReturnAddress != 0 &&
         caller == MRMyrtleTapOutsideIntegerValueReturnAddress) {
+        if (MRMyrtleHostHitTestDepth != 0) MRMyrtleHostHitTestExactMatches++;
         return 0;
     }
 
@@ -154,6 +203,8 @@ static BOOL MRInstallTargetedNSNumberIntegerValueHooks(void)
             record->ownerClass = Nil;
             return NO;
         }
+        MRNativePassThroughTrace(@"integer hook class=%s original=%p",
+                                 class_getName(owner), (void *)record->original);
         MRNSNumberIntegerValueHookCount++;
     }
     return MRNSNumberIntegerValueHookCount != 0;
@@ -175,14 +226,24 @@ static BOOL MRConfigureMyrtleTapOutsidePreferenceOverride(IMP hostWindowHitTestI
     // their TapOutsideAction integerValue call.
     if (methodOffset == 0x198fbc) callerOffset = 0x19afa8;
     else if (methodOffset == 0x1a49c0) callerOffset = 0x1aab5c;
-    else return NO;
+    else {
+        MRNativePassThroughTrace(@"configure rejected method=%p image=%p offset=0x%llx",
+                                 (void *)methodAddress, imageInfo.dli_fbase,
+                                 (unsigned long long)methodOffset);
+        return NO;
+    }
 
+    MRMyrtleImageBase = imageBase;
     MRMyrtleTapOutsideIntegerValueReturnAddress = imageBase + callerOffset;
     if (!MRInstallTargetedNSNumberIntegerValueHooks()) {
         MRMyrtleTapOutsideIntegerValueReturnAddress = 0;
         return NO;
     }
     MRMyrtleTapOutsidePreferenceOverrideInstalled = YES;
+    MRNativePassThroughTrace(@"configure accepted methodOffset=0x%llx callerOffset=0x%llx hooks=%lu",
+                             (unsigned long long)methodOffset,
+                             (unsigned long long)callerOffset,
+                             (unsigned long)MRNSNumberIntegerValueHookCount);
     return YES;
 }
 
@@ -299,7 +360,35 @@ static CGRect MRVisibleMyrtleHostRectInScreen(UIView *hostView)
 static UIView *MRHookMyrtleHostWindowHitTest(id self, SEL selector,
                                              CGPoint point, UIEvent *event)
 {
+    BOOL rootHitTest = MRMyrtleHostHitTestDepth == 0;
+    if (rootHitTest) {
+        MRMyrtleHostHitTestIntegerCalls = 0;
+        MRMyrtleHostHitTestExactMatches = 0;
+        MRMyrtleHostHitTestLastIntegerCaller = 0;
+    }
+    MRMyrtleHostHitTestDepth++;
     UIView *result = MROriginalMyrtleHostWindowHitTest(self, selector, point, event);
+    MRMyrtleHostHitTestDepth--;
+
+    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+    UIView *hostView = MRSafeValue(manager, @"hostView");
+    CGRect hostRect = MRVisibleMyrtleHostRectInScreen(hostView);
+    CGPoint screenPoint = [(UIView *)self convertPoint:point toView:nil];
+    BOOL outsideHost = CGRectIsNull(hostRect) || !CGRectContainsPoint(hostRect, screenPoint);
+    if (rootHitTest && outsideHost) {
+        uintptr_t callerOffset = MRMyrtleImageBase != 0 &&
+            MRMyrtleHostHitTestLastIntegerCaller >= MRMyrtleImageBase
+            ? MRMyrtleHostHitTestLastIntegerCaller - MRMyrtleImageBase : 0;
+        MRNativePassThroughTrace(@"outside point=(%.1f,%.1f) keyboard=%d override=%d result=%@ integerCalls=%lu exact=%lu lastCallerOffset=0x%llx hostRect=%@",
+                                 screenPoint.x, screenPoint.y,
+                                 MRMyrtleHostedKeyboardVisible,
+                                 MRMyrtleTapOutsidePreferenceOverrideInstalled,
+                                 result ? NSStringFromClass(result.class) : @"nil",
+                                 (unsigned long)MRMyrtleHostHitTestIntegerCalls,
+                                 (unsigned long)MRMyrtleHostHitTestExactMatches,
+                                 (unsigned long long)callerOffset,
+                                 NSStringFromCGRect(hostRect));
+    }
 
     // While the hosted keyboard is visible, retain Myrtle's complete native
     // outside-touch route.  It consumes the touch and invokes the gated close
@@ -316,11 +405,7 @@ static UIView *MRHookMyrtleHostWindowHitTest(id self, SEL selector,
     // The hosted scene can retain full-screen logical bounds while a parent
     // container scales/clips it into the card, so pointInside: on hostView is
     // insufficient.  Derive the live visible card from Myrtle's own view tree.
-    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
-    UIView *hostView = MRSafeValue(manager, @"hostView");
-    CGRect hostRect = MRVisibleMyrtleHostRectInScreen(hostView);
     if (CGRectIsNull(hostRect)) return result;
-    CGPoint screenPoint = [(UIView *)self convertPoint:point toView:nil];
     return CGRectContainsPoint(hostRect, screenPoint) ? result : nil;
 }
 
@@ -1371,10 +1456,20 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
     MRInstallPinnedHandleCenterGuard(self);
     MRApplyFixedKeyboardHandlePosition(self, userInfo);
     MRUpdateMyrtleHostedKeyboardState(self, keyboardFrame);
+    MRNativePassThroughTrace(@"keyboard show frame=%@ visible=%d controllerBundle=%@ managerBundle=%@ open=%@",
+                             NSStringFromCGRect(keyboardFrame),
+                             MRMyrtleHostedKeyboardVisible,
+                             MRSafeValue(self, @"currentWindowBundleID"),
+                             MRSafeValue(MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager"),
+                                         @"currentBundleID"),
+                             MRSafeValue(self, @"isWindowOpen"));
 }
 
 static void MRHookKeyboardWillHide(id self, SEL selector, NSNotification *notification)
 {
+    MRNativePassThroughTrace(@"keyboard hide previousVisible=%d controllerBundle=%@",
+                             MRMyrtleHostedKeyboardVisible,
+                             MRSafeValue(self, @"currentWindowBundleID"));
     MRClearMyrtleHostedKeyboardState();
     UIView *movementView = MRSafeValue(self, @"handleHitView");
     BOOL guarded = [movementView isKindOfClass:UIView.class] &&
