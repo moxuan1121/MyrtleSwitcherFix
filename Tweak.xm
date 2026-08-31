@@ -66,7 +66,11 @@ typedef void (*MRWindowLayoutSubviewsIMP)(id, SEL);
 static MRWindowLayoutSubviewsIMP MROriginalMyrtleHostWindowLayoutSubviews = NULL;
 typedef void (*MRMyrtleHostGestureIMP)(id, SEL, UIGestureRecognizer *);
 static MRMyrtleHostGestureIMP MROriginalMyrtleHostGesture = NULL;
+typedef void (*MRMyrtleSnapTransitionIMP)(id, SEL, BOOL);
+static MRMyrtleSnapTransitionIMP MROriginalMyrtleSnapTransition = NULL;
 static NSUInteger MRMyrtleHostGestureTraceCount = 0;
+static NSUInteger MRMyrtleSnapTransitionGeneration = 0;
+static BOOL MRMyrtleSnapTransitionInFlight = NO;
 static UIWindow *MRScopedMyrtleHostWindow = nil;
 static CGRect MRNativeMyrtleHostWindowFrame = {{0.0, 0.0}, {0.0, 0.0}};
 static CGRect MRNativeMyrtleHostWindowBounds = {{0.0, 0.0}, {0.0, 0.0}};
@@ -422,6 +426,10 @@ static void MRRestoreMyrtleHostWindowGeometry(void)
 static void MRApplyMyrtleHostWindowGeometry(void)
 {
     if (MRMyrtleHostWindowGeometrySyncing) return;
+    // The handle's up/down snap action animates through a separate controller
+    // path. Never crop an intermediate animation frame, because that preserves
+    // the old visible intersection and cuts away content moving on screen.
+    if (MRMyrtleSnapTransitionInFlight) return;
     UIWindow *window = MRMyrtleHostWindow();
     id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
     NSString *bundleID = MRSafeValue(manager, @"currentBundleID");
@@ -634,6 +642,46 @@ static void MRHookMyrtleHostGesture(id self, SEL selector,
         MRScheduleMyrtleHostWindowGeometrySync();
         MRScheduleMyrtleHostWindowGeometryFollowup();
     }
+}
+
+static void MRHookMyrtleSnapTransition(id self, SEL selector, BOOL upward)
+{
+    // Verified Myrtle 1.4.1 handle-snap path: it reads currentSnapStatus,
+    // calculates a destination host frame and commits UIView animations.
+    NSUInteger generation = ++MRMyrtleSnapTransitionGeneration;
+    MRMyrtleSnapTransitionInFlight = YES;
+    MRRestoreMyrtleHostWindowGeometry();
+    MRResetMyrtleHostWindowGeometryCandidate();
+
+    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+    UIView *hostView = MRSafeValue(manager, @"hostView");
+    CGRect before = MRVisibleMyrtleHostRectInScreen(hostView);
+    MRSceneRoutingTrace(@"hostSnap begin n=%lu direction=%d live={%.1f,%.1f,%.1f,%.1f}",
+                        (unsigned long)generation, upward,
+                        before.origin.x, before.origin.y,
+                        before.size.width, before.size.height);
+
+    MROriginalMyrtleSnapTransition(self, selector, upward);
+
+    // The method contains both standard and spring animations. Preserve the
+    // native coordinate space until they settle, then run the existing
+    // two-observation stability gate at the destination.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(0.70 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (generation != MRMyrtleSnapTransitionGeneration) return;
+        MRMyrtleSnapTransitionInFlight = NO;
+        MRResetMyrtleHostWindowGeometryCandidate();
+        id liveManager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+        UIView *liveHostView = MRSafeValue(liveManager, @"hostView");
+        CGRect after = MRVisibleMyrtleHostRectInScreen(liveHostView);
+        MRSceneRoutingTrace(@"hostSnap settle n=%lu live={%.1f,%.1f,%.1f,%.1f}",
+                            (unsigned long)generation,
+                            after.origin.x, after.origin.y,
+                            after.size.width, after.size.height);
+        MRScheduleMyrtleHostWindowGeometrySync();
+        MRScheduleMyrtleHostWindowGeometryFollowup();
+    });
 }
 
 static UIView *MRHookMyrtleHostWindowHitTest(id self, SEL selector,
@@ -2091,6 +2139,31 @@ static BOOL MRInstallMyrtleHostGestureHook(void)
     return installed;
 }
 
+static BOOL MRInstallMyrtleSnapTransitionHook(void)
+{
+    if (MROriginalMyrtleSnapTransition != NULL) return YES;
+
+    Class cls = NSClassFromString(@"MyrtleViewController");
+    SEL selector = NSSelectorFromString(@"MT_llIIIIlllllllllIIIll:");
+    Method method = class_getInstanceMethod(cls, selector);
+    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 3)
+        return NO;
+
+    char returnType[16] = {};
+    char argumentType[16] = {};
+    method_getReturnType(method, returnType, sizeof(returnType));
+    method_getArgumentType(method, 2, argumentType, sizeof(argumentType));
+    if (returnType[0] != 'v' || argumentType[0] != 'B') return NO;
+
+    MSHookMessageEx(cls, selector, (IMP)MRHookMyrtleSnapTransition,
+                    (IMP *)&MROriginalMyrtleSnapTransition);
+    BOOL installed = MROriginalMyrtleSnapTransition != NULL;
+    MRSceneRoutingTrace(@"hostSnapHook installed=%d owner=%@",
+                        installed,
+                        NSStringFromClass(MRClassOwningInstanceSelector(cls, selector)));
+    return installed;
+}
+
 static BOOL MRInstallMyrtleHandleBoundaryHooks(void)
 {
     Class cls = NSClassFromString(@"MyrtleViewController");
@@ -2251,12 +2324,13 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL hostPassThroughInstalled = MRInstallMyrtleHostWindowPassThroughHook();
     BOOL hostGeometryInstalled = MRInstallMyrtleHostWindowGeometryHook();
     BOOL hostGestureInstalled = MRInstallMyrtleHostGestureHook();
+    BOOL hostSnapInstalled = MRInstallMyrtleSnapTransitionHook();
     BOOL handleBoundaryInstalled = MRInstallMyrtleHandleBoundaryHooks();
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
     BOOL actionDispatcherInstalled = MRInstallMyrtleActionDispatcherHook();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
         keyboardAvoidanceInstalled && outsideActionGateInstalled && hostPassThroughInstalled &&
-        hostGeometryInstalled && hostGestureInstalled &&
+        hostGeometryInstalled && hostGestureInstalled && hostSnapInstalled &&
         handleBoundaryInstalled &&
         selectorCenterInstalled && actionDispatcherInstalled) {
         MRSceneRoutingTrace(@"hooksReady attempt=%lu exactInstalled=%d owner=%@",
@@ -2267,11 +2341,11 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
         return;
     }
     if (attempt >= 60) {
-        MRSceneRoutingTrace(@"hooksFailed manager=%d fullscreen=%d hostCore=%d keyboard=%d outside=%d pass=%d geometry=%d gesture=%d boundary=%d selector=%d dispatcher=%d",
+        MRSceneRoutingTrace(@"hooksFailed manager=%d fullscreen=%d hostCore=%d keyboard=%d outside=%d pass=%d geometry=%d gesture=%d snap=%d boundary=%d selector=%d dispatcher=%d",
                             managerInstalled, fullscreenInstalled,
                             hostCoreLaunchInstalled, keyboardAvoidanceInstalled,
                             outsideActionGateInstalled, hostPassThroughInstalled,
-                            hostGeometryInstalled, hostGestureInstalled,
+                            hostGeometryInstalled, hostGestureInstalled, hostSnapInstalled,
                             handleBoundaryInstalled, selectorCenterInstalled,
                             actionDispatcherInstalled);
         MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d outsideAction=%d hostPassThrough=%d boundary=%d selectorCenter=%d",
@@ -2288,7 +2362,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         (void)unlink(MRSceneRoutingTracePath);
-        MRSceneRoutingTrace(@"start version=0.5.4~beta17 process=%@",
+        MRSceneRoutingTrace(@"start version=0.5.4~beta18 process=%@",
                             NSProcessInfo.processInfo.processName);
         dispatch_async(dispatch_get_main_queue(), ^{
             MRInstallSwitcherRemoveHook();

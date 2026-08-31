@@ -1,8 +1,8 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.5.4~beta17
+Version: 0.5.4~beta18
 Architecture: iphoneos-arm64e
-Description: iOS 15 RootHide diagnostic beta rebasing MyrtleHostWindow's clipped WindowServer hit region after Myrtle's verified drag/resize gesture completes, while preserving native gesture coordinates and full-screen-app outside routing.
+Description: iOS 15 RootHide diagnostic beta rebasing MyrtleHostWindow's clipped WindowServer hit region after Myrtle's verified drag/resize and handle snap transitions complete, while preserving native animation coordinates and full-screen-app outside routing.
 Maintainer: Local
 Author: Local
 Section: Tweaks
