@@ -118,6 +118,47 @@ static void MRHookMyrtleOutsideAction(id self, SEL selector)
     MROriginalMyrtleOutsideAction(self, selector);
 }
 
+static BOOL MRUsableMyrtleHostRect(CGRect rect, CGRect screenBounds)
+{
+    if (CGRectIsNull(rect) || CGRectIsInfinite(rect) || CGRectIsEmpty(rect)) return NO;
+    if (!isfinite(rect.origin.x) || !isfinite(rect.origin.y) ||
+        !isfinite(rect.size.width) || !isfinite(rect.size.height)) return NO;
+    if (rect.size.width < 44.0 || rect.size.height < 44.0) return NO;
+
+    CGRect visible = CGRectIntersection(rect, screenBounds);
+    if (CGRectIsNull(visible) || CGRectIsEmpty(visible)) return NO;
+    CGFloat screenArea = CGRectGetWidth(screenBounds) * CGRectGetHeight(screenBounds);
+    CGFloat visibleArea = CGRectGetWidth(visible) * CGRectGetHeight(visible);
+    // The hosted scene itself may retain full-screen logical bounds.  That is
+    // not the visible split card and must not be treated as its touch region.
+    return screenArea > 0.0 && visibleArea < screenArea * 0.96;
+}
+
+static CGRect MRVisibleMyrtleHostRectInScreen(UIView *hostView)
+{
+    if (![hostView isKindOfClass:UIView.class] || hostView.window == nil)
+        return CGRectNull;
+
+    CGRect screenBounds = UIScreen.mainScreen.bounds;
+    CGRect bestRect = CGRectNull;
+    CGFloat bestArea = 0.0;
+    // Myrtle scales/clips the hosted scene through one or more containers.
+    // The largest non-full-screen ancestor includes the complete visible card
+    // while excluding the screen-sized routing roots above it.
+    for (UIView *candidate = hostView;
+         [candidate isKindOfClass:UIView.class] && ![candidate isKindOfClass:UIWindow.class];
+         candidate = candidate.superview) {
+        CGRect rect = [candidate convertRect:candidate.bounds toView:nil];
+        if (!MRUsableMyrtleHostRect(rect, screenBounds)) continue;
+        CGFloat area = CGRectGetWidth(rect) * CGRectGetHeight(rect);
+        if (area > bestArea) {
+            bestRect = rect;
+            bestArea = area;
+        }
+    }
+    return CGRectIsNull(bestRect) ? CGRectNull : CGRectInset(bestRect, -6.0, -6.0);
+}
+
 static UIView *MRHookMyrtleHostWindowHitTest(id self, SEL selector,
                                              CGPoint point, UIEvent *event)
 {
@@ -128,21 +169,16 @@ static UIView *MRHookMyrtleHostWindowHitTest(id self, SEL selector,
     // action without activating the application underneath.
     if (MRMyrtleHostedKeyboardVisible) return result;
 
-    // With no hosted keyboard, only the actual hosted application surface may
-    // keep the hit.  Returning nil outside that surface lets UIKit continue to
-    // the full-screen application below.  No transparent interception view or
-    // guessed screen rectangle is involved: use MyrtleHostManager's live
-    // hostView and UIKit's own pointInside: result.
+    // With no hosted keyboard, only the visible hosted card may keep the hit.
+    // The hosted scene can retain full-screen logical bounds while a parent
+    // container scales/clips it into the card, so pointInside: on hostView is
+    // insufficient.  Derive the live visible card from Myrtle's own view tree.
     id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
     UIView *hostView = MRSafeValue(manager, @"hostView");
-    if (![hostView isKindOfClass:UIView.class] || hostView.window == nil)
-        return result;
-
-    CGPoint hostPoint = [hostView convertPoint:point fromView:(UIView *)self];
-    BOOL insideHost = !hostView.hidden && hostView.alpha > 0.01 &&
-        hostView.userInteractionEnabled && [hostView pointInside:hostPoint withEvent:event];
-    if (insideHost) return result;
-    return nil;
+    CGRect hostRect = MRVisibleMyrtleHostRectInScreen(hostView);
+    if (CGRectIsNull(hostRect)) return result;
+    CGPoint screenPoint = [(UIView *)self convertPoint:point toView:nil];
+    return CGRectContainsPoint(hostRect, screenPoint) ? result : nil;
 }
 
 static id MRMainSwitcher(void)
