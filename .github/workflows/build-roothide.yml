@@ -9,6 +9,7 @@ on:
       - feature/fixed-keyboard-avoidance
       - feature/reload-foreground-app
       - feature/preserve-home-page
+      - feature/handle-bottom-limit
     paths:
       - "Makefile"
       - "control"
