@@ -57,10 +57,12 @@ typedef void (*MRMyrtleHostGestureIMP)(id, SEL, UIGestureRecognizer *);
 static MRMyrtleHostGestureIMP MROriginalMyrtleHostGesture = NULL;
 typedef void (*MRMyrtleSnapTransitionIMP)(id, SEL, BOOL);
 static MRMyrtleSnapTransitionIMP MROriginalMyrtleSnapTransition = NULL;
-typedef void (*MRAlphaLauncherLayoutSubviewsIMP)(id, SEL);
-static MRAlphaLauncherLayoutSubviewsIMP MROriginalAlphaLauncherLayoutSubviews = NULL;
-typedef void (*MRAlphaLauncherPresentIMP)(id, SEL, id);
-static MRAlphaLauncherPresentIMP MROriginalAlphaLauncherPresent = NULL;
+typedef void (*MRSelectorAlphaBuildOverlayIMP)(id, SEL, id);
+static MRSelectorAlphaBuildOverlayIMP MROriginalSelectorAlphaBuildOverlay = NULL;
+typedef void (*MRSelectorAlphaPointerIMP)(id, SEL, CGPoint);
+static MRSelectorAlphaPointerIMP MROriginalSelectorAlphaPointer = NULL;
+typedef void (*MRSelectorAlphaFinishIMP)(id, SEL, BOOL);
+static MRSelectorAlphaFinishIMP MROriginalSelectorAlphaFinish = NULL;
 static NSUInteger MRMyrtleSnapTransitionGeneration = 0;
 static BOOL MRMyrtleSnapTransitionInFlight = NO;
 static UIWindow *MRScopedMyrtleHostWindow = nil;
@@ -200,24 +202,32 @@ static CGFloat MRPixelAligned(CGFloat value)
     return round(value * scale) / scale;
 }
 
-// Myrtle 1.4.1 already implements letter filtering, rail gestures, grid-pan
-// highlighting, auto scrolling, activation, dismissal, icon caching and
-// haptics. Keep those native paths and replace only their existing geometry.
-static void MRLayoutVerticalAlphaLauncher(id controller)
+static void MRSafeSetValue(id object, NSString *key, id value)
+{
+    if (object == nil || key.length == 0) return;
+    @try { [object setValue:value forKey:key]; }
+    @catch (__unused NSException *exception) {}
+}
+
+static const void *MRSelectorAlphaStripKey = &MRSelectorAlphaStripKey;
+
+// This is MyrtleViewController's selector-internal A-Z mode. Myrtle still
+// owns its data source, icon cache, selection state, haptics, dismissal and
+// final application activation; only the active overlay geometry is replaced.
+static void MRLayoutSelectorAlphaStrip(id controller)
 {
     UIView *rootView = MRSafeValue(controller, @"view");
-    UIView *containerView = MRSafeValue(controller, @"containerView");
-    UIView *railView = MRSafeValue(controller, @"railView");
-    UICollectionView *collectionView = MRSafeValue(controller, @"collectionView");
-    UILabel *topLabel = MRSafeValue(controller, @"railTopLabel");
-    UILabel *currentLabel = MRSafeValue(controller, @"currentLetterLabel");
-    UILabel *bottomLabel = MRSafeValue(controller, @"railBottomLabel");
+    UIView *railView = MRSafeValue(controller, @"selectorAlphaLetterPanelView");
+    NSArray *letterLabels = MRSafeValue(controller, @"selectorAlphaLetterLabels");
+    UICollectionView *collectionView = MRSafeValue(controller, @"selectorAlphaCollectionView");
     if (![rootView isKindOfClass:UIView.class] ||
-        ![containerView isKindOfClass:UIView.class] ||
         ![railView isKindOfClass:UIView.class] ||
+        ![letterLabels isKindOfClass:NSArray.class] || letterLabels.count == 0 ||
         ![collectionView isKindOfClass:UICollectionView.class]) return;
 
-    CGRect bounds = rootView.bounds;
+    UIView *hostView = railView.superview ?: collectionView.superview;
+    if (![hostView isKindOfClass:UIView.class]) return;
+    CGRect bounds = hostView.bounds;
     CGFloat rootWidth = CGRectGetWidth(bounds);
     CGFloat rootHeight = CGRectGetHeight(bounds);
     if (!isfinite(rootWidth) || !isfinite(rootHeight) ||
@@ -237,15 +247,33 @@ static void MRLayoutVerticalAlphaLauncher(id controller)
     CGFloat rightMargin = MIN(16.0, MAX(8.0, rootWidth * 0.04));
     CGFloat stripX = safeRight - rightMargin - stripWidth;
     CGFloat stripY = safeTop + MAX(0.0, (availableHeight - stripHeight) * 0.5);
-    containerView.frame = CGRectMake(MRPixelAligned(stripX), MRPixelAligned(stripY),
-                                     MRPixelAligned(stripWidth), MRPixelAligned(stripHeight));
-    containerView.layer.cornerRadius = MIN(30.0, stripWidth * 0.27);
-    if ([containerView.layer respondsToSelector:@selector(setCornerCurve:)])
-        containerView.layer.cornerCurve = @"continuous";
-    // Preserve a strict hit-test and clipping boundary. Myrtle's overlay owns
-    // the presentation shadow; the content container must not leak cells past
-    // its rounded strip while it scrolls.
-    containerView.clipsToBounds = YES;
+    CGRect stripFrame = CGRectMake(MRPixelAligned(stripX), MRPixelAligned(stripY),
+                                   MRPixelAligned(stripWidth), MRPixelAligned(stripHeight));
+
+    UIVisualEffectView *stripView = objc_getAssociatedObject(controller,
+                                                              MRSelectorAlphaStripKey);
+    if (![stripView isKindOfClass:UIVisualEffectView.class] ||
+        stripView.superview != hostView) {
+        UIBlurEffectStyle style = rootView.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark
+            ? UIBlurEffectStyleSystemChromeMaterialDark
+            : UIBlurEffectStyleSystemChromeMaterialLight;
+        stripView = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:style]];
+        stripView.userInteractionEnabled = NO;
+        stripView.layer.shadowColor = UIColor.blackColor.CGColor;
+        stripView.layer.shadowOpacity = 0.18;
+        stripView.layer.shadowRadius = 18.0;
+        stripView.layer.shadowOffset = CGSizeMake(0.0, 6.0);
+        [hostView insertSubview:stripView belowSubview:railView];
+        objc_setAssociatedObject(controller, MRSelectorAlphaStripKey, stripView,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    stripView.frame = stripFrame;
+    stripView.layer.cornerRadius = MIN(30.0, stripWidth * 0.27);
+    stripView.layer.masksToBounds = NO;
+    if ([stripView.layer respondsToSelector:@selector(setCornerCurve:)])
+        stripView.layer.cornerCurve = @"continuous";
+    stripView.contentView.layer.cornerRadius = stripView.layer.cornerRadius;
+    stripView.contentView.layer.masksToBounds = YES;
 
     CGFloat innerTop = 16.0;
     CGFloat innerBottom = 16.0;
@@ -254,34 +282,39 @@ static void MRLayoutVerticalAlphaLauncher(id controller)
     CGFloat contentGap = 4.0;
     CGFloat contentRight = 8.0;
     CGFloat innerHeight = MAX(1.0, stripHeight - innerTop - innerBottom);
-    railView.frame = CGRectMake(railX, innerTop, railWidth, innerHeight);
+    railView.frame = CGRectMake(stripX + railX, stripY + innerTop,
+                                railWidth, innerHeight);
+    railView.backgroundColor = [UIColor colorWithWhite:0.5 alpha:0.10];
     railView.layer.cornerRadius = railWidth * 0.5;
     if ([railView.layer respondsToSelector:@selector(setCornerCurve:)])
         railView.layer.cornerCurve = @"continuous";
     railView.layer.masksToBounds = YES;
 
-    CGFloat currentHeight = MIN(46.0, innerHeight * 0.18);
-    CGFloat surroundingHeight = MAX(0.0, (innerHeight - currentHeight) * 0.5);
-    if ([topLabel isKindOfClass:UILabel.class]) {
-        topLabel.frame = CGRectMake(0.0, 0.0, railWidth, surroundingHeight);
-        topLabel.numberOfLines = 0;
-        topLabel.textAlignment = NSTextAlignmentCenter;
-    }
-    if ([currentLabel isKindOfClass:UILabel.class]) {
-        currentLabel.frame = CGRectMake(0.0, surroundingHeight, railWidth, currentHeight);
-        currentLabel.textAlignment = NSTextAlignmentCenter;
-        currentLabel.font = [UIFont systemFontOfSize:22.0 weight:UIFontWeightSemibold];
-    }
-    if ([bottomLabel isKindOfClass:UILabel.class]) {
-        bottomLabel.frame = CGRectMake(0.0, surroundingHeight + currentHeight,
-                                       railWidth, surroundingHeight);
-        bottomLabel.numberOfLines = 0;
-        bottomLabel.textAlignment = NSTextAlignmentCenter;
+    CGFloat letterHeight = innerHeight / (CGFloat)letterLabels.count;
+    [letterLabels enumerateObjectsUsingBlock:^(id object, NSUInteger index, BOOL *stop) {
+        (void)stop;
+        if (![object isKindOfClass:UILabel.class]) return;
+        UILabel *label = object;
+        label.frame = CGRectMake(0.0, MRPixelAligned(letterHeight * index),
+                                 railWidth, MRPixelAligned(letterHeight));
+        label.textAlignment = NSTextAlignmentCenter;
+        label.font = [UIFont systemFontOfSize:MAX(8.0, MIN(11.0, letterHeight * 0.58))
+                                        weight:UIFontWeightMedium];
+        label.adjustsFontSizeToFitWidth = YES;
+        label.minimumScaleFactor = 0.65;
+    }];
+
+    // The labels are native Myrtle objects. If Myrtle originally attached
+    // them to another temporary view, move them to the visible rail without
+    // replacing their identity or selected-state styling.
+    for (UIView *label in letterLabels) {
+        if ([label isKindOfClass:UIView.class] && label.superview != railView)
+            [railView addSubview:label];
     }
 
     CGFloat collectionX = railX + railWidth + contentGap;
     CGFloat collectionWidth = MAX(44.0, stripWidth - collectionX - contentRight);
-    collectionView.frame = CGRectMake(collectionX, innerTop,
+    collectionView.frame = CGRectMake(stripX + collectionX, stripY + innerTop,
                                       collectionWidth, innerHeight);
     collectionView.backgroundColor = UIColor.clearColor;
     collectionView.alwaysBounceVertical = YES;
@@ -301,20 +334,128 @@ static void MRLayoutVerticalAlphaLauncher(id controller)
                                                    8.0, horizontalInset);
         [flowLayout invalidateLayout];
     }
+
+    [hostView bringSubviewToFront:railView];
+    [hostView bringSubviewToFront:collectionView];
 }
 
-static void MRHookAlphaLauncherLayoutSubviews(id self, SEL selector)
+static BOOL MRSelectorAlphaStripIsActive(id controller)
 {
-    MROriginalAlphaLauncherLayoutSubviews(self, selector);
-    MRLayoutVerticalAlphaLauncher(self);
+    UIVisualEffectView *stripView = objc_getAssociatedObject(controller,
+                                                              MRSelectorAlphaStripKey);
+    UICollectionView *collectionView = MRSafeValue(controller,
+                                                    @"selectorAlphaCollectionView");
+    return [stripView isKindOfClass:UIVisualEffectView.class] &&
+        stripView.superview != nil &&
+        [collectionView isKindOfClass:UICollectionView.class] &&
+        collectionView.superview != nil;
 }
 
-static void MRHookAlphaLauncherPresent(id self, SEL selector, id parentController)
+static void MRHookSelectorAlphaBuildOverlay(id self, SEL selector, id action)
 {
-    MROriginalAlphaLauncherPresent(self, selector, parentController);
-    // Myrtle caches this controller. Reapply after every native presentation,
-    // including presentations that do not trigger another layout callback.
-    MRLayoutVerticalAlphaLauncher(self);
+    MROriginalSelectorAlphaBuildOverlay(self, selector, action);
+    MRLayoutSelectorAlphaStrip(self);
+}
+
+static NSInteger MRClampIndex(NSInteger value, NSInteger count)
+{
+    if (count <= 0) return NSNotFound;
+    return MIN(MAX(value, 0), count - 1);
+}
+
+static void MRSelectorAlphaSelectionChanged(id controller)
+{
+    id feedback = MRSafeValue(controller, @"selectorAlphaSelectionFeedback");
+    if ([feedback respondsToSelector:@selector(selectionChanged)])
+        ((void (*)(id, SEL))objc_msgSend)(feedback, @selector(selectionChanged));
+}
+
+static void MRHookSelectorAlphaPointer(id self, SEL selector, CGPoint point)
+{
+    if (!MRSelectorAlphaStripIsActive(self)) {
+        MROriginalSelectorAlphaPointer(self, selector, point);
+        return;
+    }
+
+    UIView *rootView = MRSafeValue(self, @"view");
+    UIView *railView = MRSafeValue(self, @"selectorAlphaLetterPanelView");
+    NSArray *letters = MRSafeValue(self, @"selectorAlphaLetters");
+    UICollectionView *collectionView = MRSafeValue(self, @"selectorAlphaCollectionView");
+    NSArray *bundleIDs = MRSafeValue(self, @"selectorAlphaCurrentBundleIDs");
+    if (![rootView isKindOfClass:UIView.class] ||
+        ![railView isKindOfClass:UIView.class] ||
+        ![letters isKindOfClass:NSArray.class] || letters.count == 0 ||
+        ![collectionView isKindOfClass:UICollectionView.class]) {
+        MROriginalSelectorAlphaPointer(self, selector, point);
+        return;
+    }
+
+    CGPoint railPoint = [rootView convertPoint:point toView:railView];
+    CGRect railHitBounds = CGRectInset(railView.bounds, -10.0, -8.0);
+    if (CGRectContainsPoint(railHitBounds, railPoint)) {
+        CGFloat height = MAX(1.0, CGRectGetHeight(railView.bounds));
+        NSInteger letterIndex = MRClampIndex((NSInteger)floor(
+            railPoint.y / height * (CGFloat)letters.count), (NSInteger)letters.count);
+        NSInteger oldLetterIndex = [MRSafeValue(self, @"selectorAlphaSelectedLetterIndex") integerValue];
+        if (letterIndex != NSNotFound && letterIndex != oldLetterIndex) {
+            MRSafeSetValue(self, @"selectorAlphaSelectedLetterIndex", @(letterIndex));
+            MRSafeSetValue(self, @"selectorAlphaSelectedAppIndex", @0);
+            ((void (*)(id, SEL))objc_msgSend)(self,
+                NSSelectorFromString(@"MT_IlIlllllIllIlIlllIlI"));
+            ((void (*)(id, SEL))objc_msgSend)(self,
+                NSSelectorFromString(@"MT_IlIIlIllIIllllllIIlI"));
+            bundleIDs = MRSafeValue(self, @"selectorAlphaCurrentBundleIDs");
+            if ([bundleIDs isKindOfClass:NSArray.class] && bundleIDs.count != 0)
+                ((void (*)(id, SEL, NSInteger))objc_msgSend)(self,
+                    NSSelectorFromString(@"MT_IlIlIlllllIIllIllIlI:"), 0);
+            MRSelectorAlphaSelectionChanged(self);
+        }
+        return;
+    }
+
+    CGPoint collectionPoint = [rootView convertPoint:point toView:collectionView];
+    CGRect collectionHitBounds = CGRectInset(collectionView.bounds, -12.0, -8.0);
+    if (CGRectContainsPoint(collectionHitBounds, collectionPoint)) {
+        bundleIDs = MRSafeValue(self, @"selectorAlphaCurrentBundleIDs");
+        if (![bundleIDs isKindOfClass:NSArray.class] || bundleIDs.count == 0) return;
+
+        // Divide the visible column into one continuous band per application.
+        // This keeps every app reachable by one held gesture even when a
+        // letter owns more icons than fit on screen; the collection scrolls to
+        // reveal the selected native cell.
+        CGFloat collectionHeight = MAX(1.0, CGRectGetHeight(collectionView.bounds));
+        CGFloat localY = collectionPoint.y - CGRectGetMinY(collectionView.bounds);
+        NSInteger appIndex = (NSInteger)floor(
+            localY / collectionHeight * (CGFloat)bundleIDs.count);
+        appIndex = MRClampIndex(appIndex, (NSInteger)bundleIDs.count);
+        NSInteger oldAppIndex = [MRSafeValue(self, @"selectorAlphaSelectedAppIndex") integerValue];
+        if (appIndex != NSNotFound && appIndex != oldAppIndex) {
+            ((void (*)(id, SEL))objc_msgSend)(self,
+                NSSelectorFromString(@"MT_IllIlIllllllIIlIIlll"));
+            MRSafeSetValue(self, @"selectorAlphaSelectedAppIndex", @(appIndex));
+            ((void (*)(id, SEL, NSInteger))objc_msgSend)(self,
+                NSSelectorFromString(@"MT_IlIlIlllllIIllIllIlI:"), appIndex);
+            NSIndexPath *target = [NSIndexPath indexPathForItem:appIndex inSection:0];
+            [collectionView scrollToItemAtIndexPath:target
+                                   atScrollPosition:UICollectionViewScrollPositionCenteredVertically
+                                           animated:NO];
+            MRSelectorAlphaSelectionChanged(self);
+        }
+        return;
+    }
+
+    // Outside the strip, keep Myrtle's initial state but do not feed the old
+    // wide-grid mapper; that mapper is the geometry this hook replaces.
+}
+
+static void MRHookSelectorAlphaFinish(id self, SEL selector, BOOL commit)
+{
+    MROriginalSelectorAlphaFinish(self, selector, commit);
+    UIVisualEffectView *stripView = objc_getAssociatedObject(self,
+                                                              MRSelectorAlphaStripKey);
+    [stripView removeFromSuperview];
+    objc_setAssociatedObject(self, MRSelectorAlphaStripKey, nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static id MRSendClassNoArgs(NSString *className, NSString *selectorName)
@@ -2074,53 +2215,93 @@ static BOOL MRInstallMyrtleSnapTransitionHook(void)
     return MROriginalMyrtleSnapTransition != NULL;
 }
 
-static BOOL MRInstallVerticalAlphaLauncherHook(void)
+static BOOL MRInstallSelectorAlphaStripHooks(void)
 {
-    if (MROriginalAlphaLauncherLayoutSubviews != NULL &&
-        MROriginalAlphaLauncherPresent != NULL) return YES;
+    if (MROriginalSelectorAlphaBuildOverlay != NULL &&
+        MROriginalSelectorAlphaPointer != NULL &&
+        MROriginalSelectorAlphaFinish != NULL) return YES;
 
-    Class cls = NSClassFromString(@"MyrtleAlphaAppLauncherViewController");
+    Class cls = NSClassFromString(@"MyrtleViewController");
     if (cls == Nil) return NO;
 
-    NSArray<NSString *> *requiredSelectors = @[
-        @"containerView", @"railView", @"railTopLabel",
-        @"currentLetterLabel", @"railBottomLabel", @"collectionView",
-        @"handleRailPan:", @"handleGridPan:"
-    ];
-    for (NSString *selectorName in requiredSelectors) {
-        if (class_getInstanceMethod(cls, NSSelectorFromString(selectorName)) == NULL)
-            return NO;
-    }
-
-    if (MROriginalAlphaLauncherLayoutSubviews == NULL) {
-        SEL layoutSelector = @selector(viewDidLayoutSubviews);
-        Method layoutMethod = class_getInstanceMethod(cls, layoutSelector);
-        if (layoutMethod == NULL || method_getNumberOfArguments(layoutMethod) != 2)
-            return NO;
-        char returnType[16] = {};
-        method_getReturnType(layoutMethod, returnType, sizeof(returnType));
-        if (returnType[0] != 'v') return NO;
-        MSHookMessageEx(cls, layoutSelector,
-                        (IMP)MRHookAlphaLauncherLayoutSubviews,
-                        (IMP *)&MROriginalAlphaLauncherLayoutSubviews);
-    }
-
-    if (MROriginalAlphaLauncherPresent == NULL) {
-        SEL presentSelector = NSSelectorFromString(@"MT_IlIIlIIIlIllllIlIlII:");
-        Method presentMethod = class_getInstanceMethod(cls, presentSelector);
-        if (presentMethod == NULL || method_getNumberOfArguments(presentMethod) != 3)
+    if (MROriginalSelectorAlphaBuildOverlay == NULL) {
+        SEL buildSelector = NSSelectorFromString(@"MT_IllIlIlllIIllllIIlII:");
+        Method buildMethod = class_getInstanceMethod(cls, buildSelector);
+        if (buildMethod == NULL || method_getNumberOfArguments(buildMethod) != 3)
             return NO;
         char returnType[16] = {};
         char argumentType[16] = {};
-        method_getReturnType(presentMethod, returnType, sizeof(returnType));
-        method_getArgumentType(presentMethod, 2, argumentType, sizeof(argumentType));
+        method_getReturnType(buildMethod, returnType, sizeof(returnType));
+        method_getArgumentType(buildMethod, 2, argumentType, sizeof(argumentType));
         if (returnType[0] != 'v' || argumentType[0] != '@') return NO;
-        MSHookMessageEx(cls, presentSelector, (IMP)MRHookAlphaLauncherPresent,
-                        (IMP *)&MROriginalAlphaLauncherPresent);
+        MSHookMessageEx(cls, buildSelector,
+                        (IMP)MRHookSelectorAlphaBuildOverlay,
+                        (IMP *)&MROriginalSelectorAlphaBuildOverlay);
     }
 
-    return MROriginalAlphaLauncherLayoutSubviews != NULL &&
-        MROriginalAlphaLauncherPresent != NULL;
+    if (MROriginalSelectorAlphaPointer == NULL) {
+        SEL pointerSelector = NSSelectorFromString(@"MT_lllIIIIlIllIIIIIIlll:");
+        Method pointerMethod = class_getInstanceMethod(cls, pointerSelector);
+        if (pointerMethod == NULL || method_getNumberOfArguments(pointerMethod) != 3)
+            return NO;
+        char returnType[16] = {};
+        char argumentType[32] = {};
+        method_getReturnType(pointerMethod, returnType, sizeof(returnType));
+        method_getArgumentType(pointerMethod, 2, argumentType, sizeof(argumentType));
+        if (returnType[0] != 'v' || argumentType[0] != '{') return NO;
+        MSHookMessageEx(cls, pointerSelector,
+                        (IMP)MRHookSelectorAlphaPointer,
+                        (IMP *)&MROriginalSelectorAlphaPointer);
+    }
+
+    if (MROriginalSelectorAlphaFinish == NULL) {
+        SEL finishSelector = NSSelectorFromString(@"MT_lllIllIllIIIIlllIIII:");
+        Method finishMethod = class_getInstanceMethod(cls, finishSelector);
+        if (finishMethod == NULL || method_getNumberOfArguments(finishMethod) != 3)
+            return NO;
+        char returnType[16] = {};
+        char argumentType[16] = {};
+        method_getReturnType(finishMethod, returnType, sizeof(returnType));
+        method_getArgumentType(finishMethod, 2, argumentType, sizeof(argumentType));
+        if (returnType[0] != 'v' || (argumentType[0] != 'B' && argumentType[0] != 'c'))
+            return NO;
+        MSHookMessageEx(cls, finishSelector,
+                        (IMP)MRHookSelectorAlphaFinish,
+                        (IMP *)&MROriginalSelectorAlphaFinish);
+    }
+
+    return MROriginalSelectorAlphaBuildOverlay != NULL &&
+        MROriginalSelectorAlphaPointer != NULL &&
+        MROriginalSelectorAlphaFinish != NULL;
+}
+
+/*
+ * Keep this installer deliberately exact: both selectors belong to
+ * MyrtleViewController's selector long-press A-Z path in Myrtle 1.4.1. A
+ * similarly named standalone alpha-launcher controller is a different action
+ * and must not be hooked here.
+ */
+static BOOL MRValidateSelectorAlphaStripHooks(void)
+{
+    if (MROriginalSelectorAlphaBuildOverlay == NULL ||
+        MROriginalSelectorAlphaPointer == NULL ||
+        MROriginalSelectorAlphaFinish == NULL) return NO;
+    Class cls = NSClassFromString(@"MyrtleViewController");
+    if (cls == Nil) return NO;
+    Method buildMethod = class_getInstanceMethod(
+        cls, NSSelectorFromString(@"MT_IllIlIlllIIllllIIlII:"));
+    Method pointerMethod = class_getInstanceMethod(
+        cls, NSSelectorFromString(@"MT_lllIIIIlIllIIIIIIlll:"));
+    Method finishMethod = class_getInstanceMethod(
+        cls, NSSelectorFromString(@"MT_lllIllIllIIIIlllIIII:"));
+    if (buildMethod == NULL || pointerMethod == NULL || finishMethod == NULL) return NO;
+    char returnType[16] = {};
+    method_getReturnType(buildMethod, returnType, sizeof(returnType));
+    if (returnType[0] != 'v') return NO;
+    method_getReturnType(pointerMethod, returnType, sizeof(returnType));
+    if (returnType[0] != 'v') return NO;
+    method_getReturnType(finishMethod, returnType, sizeof(returnType));
+    return returnType[0] == 'v';
 }
 
 static BOOL MRInstallMyrtleHandleBoundaryHooks(void)
@@ -2284,14 +2465,15 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL hostGeometryInstalled = MRInstallMyrtleHostWindowGeometryHook();
     BOOL hostGestureInstalled = MRInstallMyrtleHostGestureHook();
     BOOL hostSnapInstalled = MRInstallMyrtleSnapTransitionHook();
-    BOOL verticalAlphaLauncherInstalled = MRInstallVerticalAlphaLauncherHook();
+    BOOL selectorAlphaStripInstalled = MRInstallSelectorAlphaStripHooks() &&
+        MRValidateSelectorAlphaStripHooks();
     BOOL handleBoundaryInstalled = MRInstallMyrtleHandleBoundaryHooks();
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
     BOOL actionDispatcherInstalled = MRInstallMyrtleActionDispatcherHook();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
         keyboardAvoidanceInstalled && outsideActionGateInstalled && hostPassThroughInstalled &&
         hostGeometryInstalled && hostGestureInstalled && hostSnapInstalled &&
-        verticalAlphaLauncherInstalled && handleBoundaryInstalled &&
+        selectorAlphaStripInstalled && handleBoundaryInstalled &&
         selectorCenterInstalled && actionDispatcherInstalled) {
         return;
     }
