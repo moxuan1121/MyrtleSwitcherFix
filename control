@@ -1,8 +1,8 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.5.5~beta3
+Version: 0.5.5~beta4
 Architecture: iphoneos-arm64e
-Description: iOS 15 RootHide beta replacing Myrtle selector long-press A-Z browsing with a right-side single-column gesture strip.
+Description: iOS 15 RootHide diagnostic beta targeting Myrtle's standalone A-Z launcher final layout with a right-side single-column gesture strip.
 Maintainer: Local
 Author: Local
 Section: Tweaks

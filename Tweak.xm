@@ -6,6 +6,7 @@
 #import <dlfcn.h>
 #import <math.h>
 #import <stdlib.h>
+#import <stdio.h>
 #import <string.h>
 #if __has_include(<ptrauth.h>)
 #import <ptrauth.h>
@@ -63,6 +64,9 @@ typedef void (*MRSelectorAlphaPointerIMP)(id, SEL, CGPoint);
 static MRSelectorAlphaPointerIMP MROriginalSelectorAlphaPointer = NULL;
 typedef void (*MRSelectorAlphaFinishIMP)(id, SEL, BOOL);
 static MRSelectorAlphaFinishIMP MROriginalSelectorAlphaFinish = NULL;
+typedef void (*MRAlphaLauncherLifecycleIMP)(id, SEL);
+static MRAlphaLauncherLifecycleIMP MROriginalAlphaLauncherViewDidLoad = NULL;
+static MRAlphaLauncherLifecycleIMP MROriginalAlphaLauncherViewDidLayoutSubviews = NULL;
 static NSUInteger MRMyrtleSnapTransitionGeneration = 0;
 static BOOL MRMyrtleSnapTransitionInFlight = NO;
 static UIWindow *MRScopedMyrtleHostWindow = nil;
@@ -92,6 +96,20 @@ static void MRRestoreMyrtleHostWindowGeometry(void);
 // Stable builds discard logging at preprocessing time: neither arguments nor
 // strings reach SpringBoard.
 #define MRLog(...) do {} while (0)
+
+static void MRAlphaLauncherDiagnostic(NSString *line)
+{
+    static NSUInteger lineCount = 0;
+    if (line.length == 0 || lineCount >= 24) return;
+    lineCount++;
+    NSString *record = [NSString stringWithFormat:@"%@\n", line];
+    NSData *data = [record dataUsingEncoding:NSUTF8StringEncoding];
+    const char *path = "/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.alpha-launcher.log";
+    FILE *file = fopen(path, "ab");
+    if (file == NULL) return;
+    fwrite(data.bytes, 1, data.length, file);
+    fclose(file);
+}
 
 static uintptr_t MRStripCodePointer(const void *pointer)
 {
@@ -456,6 +474,114 @@ static void MRHookSelectorAlphaFinish(id self, SEL selector, BOOL commit)
     [stripView removeFromSuperview];
     objc_setAssociatedObject(self, MRSelectorAlphaStripKey, nil,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void MRLayoutStandaloneAlphaLauncher(id controller, NSString *stage)
+{
+    UIView *rootView = MRSafeValue(controller, @"view");
+    UIView *containerView = MRSafeValue(controller, @"containerView");
+    UIView *railView = MRSafeValue(controller, @"railView");
+    UICollectionView *collectionView = MRSafeValue(controller, @"collectionView");
+    UILabel *topLabel = MRSafeValue(controller, @"railTopLabel");
+    UILabel *currentLabel = MRSafeValue(controller, @"currentLetterLabel");
+    UILabel *bottomLabel = MRSafeValue(controller, @"railBottomLabel");
+    MRAlphaLauncherDiagnostic([NSString stringWithFormat:
+        @"%@ class=%@ root=%@ container=%@ rail=%@ collection=%@ rootBounds=%@ containerFrame=%@",
+        stage, NSStringFromClass([controller class]), NSStringFromClass([rootView class]),
+        NSStringFromClass([containerView class]), NSStringFromClass([railView class]),
+        NSStringFromClass([collectionView class]), NSStringFromCGRect(rootView.bounds),
+        NSStringFromCGRect(containerView.frame)]);
+    if (![rootView isKindOfClass:UIView.class] ||
+        ![containerView isKindOfClass:UIView.class] ||
+        ![railView isKindOfClass:UIView.class] ||
+        ![collectionView isKindOfClass:UICollectionView.class]) {
+        MRAlphaLauncherDiagnostic(@"layout skipped: required native views unavailable");
+        return;
+    }
+
+    CGRect bounds = rootView.bounds;
+    CGFloat width = CGRectGetWidth(bounds);
+    CGFloat height = CGRectGetHeight(bounds);
+    if (width < 160.0 || height < 280.0) {
+        MRAlphaLauncherDiagnostic(@"layout skipped: root bounds not ready");
+        return;
+    }
+
+    UIEdgeInsets safe = rootView.safeAreaInsets;
+    CGFloat top = CGRectGetMinY(bounds) + MAX(8.0, safe.top + 8.0);
+    CGFloat bottom = CGRectGetMaxY(bounds) - MAX(8.0, safe.bottom + 8.0);
+    CGFloat right = CGRectGetMaxX(bounds) - MAX(12.0, safe.right + 12.0);
+    CGFloat stripWidth = MIN(116.0, width - 32.0);
+    CGFloat stripHeight = MIN(680.0, MAX(260.0, bottom - top));
+    CGFloat stripX = right - stripWidth;
+    CGFloat stripY = top + MAX(0.0, (bottom - top - stripHeight) * 0.5);
+    containerView.frame = CGRectMake(MRPixelAligned(stripX), MRPixelAligned(stripY),
+                                     MRPixelAligned(stripWidth), MRPixelAligned(stripHeight));
+    containerView.layer.cornerRadius = MIN(30.0, stripWidth * 0.26);
+    containerView.clipsToBounds = YES;
+
+    CGFloat inset = 10.0;
+    CGFloat railWidth = 26.0;
+    CGFloat gap = 5.0;
+    CGFloat contentWidth = MAX(48.0, stripWidth - inset * 2.0 - railWidth - gap);
+    CGFloat contentHeight = MAX(1.0, stripHeight - inset * 2.0);
+    railView.frame = CGRectMake(inset, inset, railWidth, contentHeight);
+    railView.layer.cornerRadius = railWidth * 0.5;
+    railView.clipsToBounds = YES;
+
+    CGFloat currentHeight = MIN(48.0, contentHeight * 0.16);
+    CGFloat sideHeight = MAX(0.0, (contentHeight - currentHeight) * 0.5);
+    if ([topLabel isKindOfClass:UILabel.class]) {
+        topLabel.frame = CGRectMake(0.0, 0.0, railWidth, sideHeight);
+        topLabel.numberOfLines = 0;
+        topLabel.textAlignment = NSTextAlignmentCenter;
+    }
+    if ([currentLabel isKindOfClass:UILabel.class]) {
+        currentLabel.frame = CGRectMake(0.0, sideHeight, railWidth, currentHeight);
+        currentLabel.textAlignment = NSTextAlignmentCenter;
+        currentLabel.font = [UIFont systemFontOfSize:22.0 weight:UIFontWeightSemibold];
+    }
+    if ([bottomLabel isKindOfClass:UILabel.class]) {
+        bottomLabel.frame = CGRectMake(0.0, sideHeight + currentHeight,
+                                       railWidth, sideHeight);
+        bottomLabel.numberOfLines = 0;
+        bottomLabel.textAlignment = NSTextAlignmentCenter;
+    }
+
+    collectionView.frame = CGRectMake(inset + railWidth + gap, inset,
+                                      contentWidth, contentHeight);
+    collectionView.alwaysBounceVertical = YES;
+    collectionView.showsVerticalScrollIndicator = NO;
+    collectionView.showsHorizontalScrollIndicator = NO;
+    UICollectionViewFlowLayout *layout =
+        [collectionView.collectionViewLayout isKindOfClass:UICollectionViewFlowLayout.class]
+            ? (UICollectionViewFlowLayout *)collectionView.collectionViewLayout : nil;
+    if (layout != nil) {
+        CGFloat side = MIN(64.0, MAX(44.0, contentWidth - 4.0));
+        CGFloat horizontal = MAX(0.0, (contentWidth - side) * 0.5);
+        layout.scrollDirection = UICollectionViewScrollDirectionVertical;
+        layout.itemSize = CGSizeMake(side, side);
+        layout.minimumInteritemSpacing = 0.0;
+        layout.minimumLineSpacing = 10.0;
+        layout.sectionInset = UIEdgeInsetsMake(8.0, horizontal, 8.0, horizontal);
+        [layout invalidateLayout];
+    }
+    MRAlphaLauncherDiagnostic([NSString stringWithFormat:
+        @"%@ applied container=%@ rail=%@ collection=%@ items=%@",
+        stage, NSStringFromCGRect(containerView.frame), NSStringFromCGRect(railView.frame),
+        NSStringFromCGRect(collectionView.frame), NSStringFromCGSize(layout.itemSize)]);
+}
+
+static void MRHookAlphaLauncherViewDidLoad(id self, SEL selector)
+{
+    MROriginalAlphaLauncherViewDidLoad(self, selector);
+    MRLayoutStandaloneAlphaLauncher(self, @"viewDidLoad");
+}
+
+static void MRHookAlphaLauncherViewDidLayoutSubviews(id self, SEL selector)
+{
+    MROriginalAlphaLauncherViewDidLayoutSubviews(self, selector);
+    MRLayoutStandaloneAlphaLauncher(self, @"viewDidLayoutSubviews");
 }
 
 static id MRSendClassNoArgs(NSString *className, NSString *selectorName)
@@ -2275,6 +2401,48 @@ static BOOL MRInstallSelectorAlphaStripHooks(void)
         MROriginalSelectorAlphaFinish != NULL;
 }
 
+static BOOL MRInstallStandaloneAlphaLauncherHooks(void)
+{
+    if (MROriginalAlphaLauncherViewDidLoad != NULL &&
+        MROriginalAlphaLauncherViewDidLayoutSubviews != NULL) return YES;
+
+    Class cls = NSClassFromString(@"MyrtleAlphaAppLauncherViewController");
+    if (cls == Nil) {
+        MRAlphaLauncherDiagnostic(@"install: MyrtleAlphaAppLauncherViewController unavailable");
+        return NO;
+    }
+
+    if (MROriginalAlphaLauncherViewDidLoad == NULL) {
+        Method method = class_getInstanceMethod(cls, @selector(viewDidLoad));
+        if (method == NULL || method_getNumberOfArguments(method) != 2) {
+            MRAlphaLauncherDiagnostic(@"install: viewDidLoad signature mismatch");
+            return NO;
+        }
+        MSHookMessageEx(cls, @selector(viewDidLoad),
+                        (IMP)MRHookAlphaLauncherViewDidLoad,
+                        (IMP *)&MROriginalAlphaLauncherViewDidLoad);
+    }
+
+    if (MROriginalAlphaLauncherViewDidLayoutSubviews == NULL) {
+        Method method = class_getInstanceMethod(cls, @selector(viewDidLayoutSubviews));
+        if (method == NULL || method_getNumberOfArguments(method) != 2) {
+            MRAlphaLauncherDiagnostic(@"install: viewDidLayoutSubviews signature mismatch");
+            return NO;
+        }
+        MSHookMessageEx(cls, @selector(viewDidLayoutSubviews),
+                        (IMP)MRHookAlphaLauncherViewDidLayoutSubviews,
+                        (IMP *)&MROriginalAlphaLauncherViewDidLayoutSubviews);
+    }
+
+    BOOL installed = MROriginalAlphaLauncherViewDidLoad != NULL &&
+        MROriginalAlphaLauncherViewDidLayoutSubviews != NULL;
+    MRAlphaLauncherDiagnostic([NSString stringWithFormat:
+        @"install: class=%@ viewDidLoad=%d viewDidLayoutSubviews=%d result=%d",
+        NSStringFromClass(cls), MROriginalAlphaLauncherViewDidLoad != NULL,
+        MROriginalAlphaLauncherViewDidLayoutSubviews != NULL, installed]);
+    return installed;
+}
+
 /*
  * Keep this installer deliberately exact: both selectors belong to
  * MyrtleViewController's selector long-press A-Z path in Myrtle 1.4.1. A
@@ -2465,15 +2633,14 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL hostGeometryInstalled = MRInstallMyrtleHostWindowGeometryHook();
     BOOL hostGestureInstalled = MRInstallMyrtleHostGestureHook();
     BOOL hostSnapInstalled = MRInstallMyrtleSnapTransitionHook();
-    BOOL selectorAlphaStripInstalled = MRInstallSelectorAlphaStripHooks() &&
-        MRValidateSelectorAlphaStripHooks();
+    BOOL standaloneAlphaLauncherInstalled = MRInstallStandaloneAlphaLauncherHooks();
     BOOL handleBoundaryInstalled = MRInstallMyrtleHandleBoundaryHooks();
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
     BOOL actionDispatcherInstalled = MRInstallMyrtleActionDispatcherHook();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
         keyboardAvoidanceInstalled && outsideActionGateInstalled && hostPassThroughInstalled &&
         hostGeometryInstalled && hostGestureInstalled && hostSnapInstalled &&
-        selectorAlphaStripInstalled && handleBoundaryInstalled &&
+        standaloneAlphaLauncherInstalled && handleBoundaryInstalled &&
         selectorCenterInstalled && actionDispatcherInstalled) {
         return;
     }
@@ -2491,6 +2658,10 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 %ctor
 {
     @autoreleasepool {
+        [[NSFileManager defaultManager] removeItemAtPath:
+            @"/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.alpha-launcher.log"
+                                                   error:nil];
+        MRAlphaLauncherDiagnostic(@"0.5.5 beta4 diagnostic start");
         dispatch_async(dispatch_get_main_queue(), ^{
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
