@@ -273,21 +273,23 @@ static UIView *MRMyrtleWindowHitTestRecover(id self, SEL selector,
                                             MRMyrtleWindowHitTestIMP original)
 {
     UIView *originalResult = original(self, selector, point, event);
-    if (originalResult != nil) return originalResult;
 
     // MyrtleWindow normally passes every unclaimed point through to the layer
-    // below it.  On the Home Screen the inserted control is reached during the
-    // ordinary hierarchy walk, but with a full-screen foreground application
-    // Myrtle's routing path can return nil before that control is considered.
-    // Preserve every native hit; only recover an otherwise-unclaimed point.
+    // below it.  On the Home Screen that path returns nil.  With a foreground
+    // app, MyrtleHostWindow can instead return a non-nil routing/proxy view for
+    // the same visual blank area, so preserving every non-nil result prevents
+    // the catcher from ever seeing the touch.  The catcher's pointInside:
+    // already excludes the host card, keyboard, both handles and every open
+    // selector/launcher; after those geometric checks it is safe to give a
+    // qualifying blank point priority over the proxy result.
     MROutsideKeyboardTapControl *catcher =
         objc_getAssociatedObject(self, MROutsideKeyboardTapCatcherKey);
-    if (![catcher isKindOfClass:MROutsideKeyboardTapControl.class] ||
-        catcher.superview == nil)
-        return nil;
-
-    CGPoint catcherPoint = [catcher convertPoint:point fromView:(UIView *)self];
-    return [catcher pointInside:catcherPoint withEvent:event] ? catcher : nil;
+    if ([catcher isKindOfClass:MROutsideKeyboardTapControl.class] &&
+        catcher.superview != nil) {
+        CGPoint catcherPoint = [catcher convertPoint:point fromView:(UIView *)self];
+        if ([catcher pointInside:catcherPoint withEvent:event]) return catcher;
+    }
+    return originalResult;
 }
 
 static UIView *MRHookMyrtleWindowHitTest(id self, SEL selector,
