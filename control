@@ -1,8 +1,8 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.5.3.8~beta8
+Version: 0.5.3.8~beta9
 Architecture: iphoneos-arm64e
-Description: iOS 15 RootHide diagnostic build for Myrtle scene routing after opening a split window over a fullscreen application.
+Description: iOS 15 RootHide beta enabling FrontBoard-style WindowServer hit testing only for MyrtleHostWindow while no hosted keyboard is visible.
 Maintainer: Local
 Author: Local
 Section: Tweaks
