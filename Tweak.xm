@@ -64,6 +64,9 @@ typedef UIView *(*MRMyrtleHostWindowHitTestIMP)(id, SEL, CGPoint, UIEvent *);
 static MRMyrtleHostWindowHitTestIMP MROriginalMyrtleHostWindowHitTest = NULL;
 typedef void (*MRWindowLayoutSubviewsIMP)(id, SEL);
 static MRWindowLayoutSubviewsIMP MROriginalMyrtleHostWindowLayoutSubviews = NULL;
+typedef void (*MRMyrtleHostGestureIMP)(id, SEL, UIGestureRecognizer *);
+static MRMyrtleHostGestureIMP MROriginalMyrtleHostGesture = NULL;
+static NSUInteger MRMyrtleHostGestureTraceCount = 0;
 static UIWindow *MRScopedMyrtleHostWindow = nil;
 static CGRect MRNativeMyrtleHostWindowFrame = {{0.0, 0.0}, {0.0, 0.0}};
 static CGRect MRNativeMyrtleHostWindowBounds = {{0.0, 0.0}, {0.0, 0.0}};
@@ -588,6 +591,49 @@ static void MRHookMyrtleHostWindowLayoutSubviews(id self, SEL selector)
         MRApplyMyrtleHostWindowGeometry();
     else
         MRScheduleMyrtleHostWindowGeometrySync();
+}
+
+static void MRHookMyrtleHostGesture(id self, SEL selector,
+                                    UIGestureRecognizer *gesture)
+{
+    UIGestureRecognizerState stateBefore = gesture.state;
+
+    // Myrtle's window drag/resize path does not toggle isOperating. Restore the
+    // native full-screen coordinate space before it captures gestureStartFrame
+    // so its own movement math remains unchanged and no stale card clip limits
+    // the gesture to the previous position.
+    if (stateBefore == UIGestureRecognizerStateBegan) {
+        MRRestoreMyrtleHostWindowGeometry();
+        MRResetMyrtleHostWindowGeometryCandidate();
+    }
+
+    MROriginalMyrtleHostGesture(self, selector, gesture);
+
+    UIGestureRecognizerState stateAfter = gesture.state;
+    if (MRMyrtleHostGestureTraceCount < 24 &&
+        (stateBefore == UIGestureRecognizerStateBegan ||
+         stateAfter == UIGestureRecognizerStateEnded ||
+         stateAfter == UIGestureRecognizerStateCancelled ||
+         stateAfter == UIGestureRecognizerStateFailed)) {
+        MRMyrtleHostGestureTraceCount++;
+        id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+        UIView *hostView = MRSafeValue(manager, @"hostView");
+        CGRect liveRect = MRVisibleMyrtleHostRectInScreen(hostView);
+        MRSceneRoutingTrace(@"hostGesture n=%lu before=%ld after=%ld crop=%d live={%.1f,%.1f,%.1f,%.1f}",
+                            (unsigned long)MRMyrtleHostGestureTraceCount,
+                            (long)stateBefore, (long)stateAfter,
+                            MRMyrtleHostWindowCropApplied,
+                            liveRect.origin.x, liveRect.origin.y,
+                            liveRect.size.width, liveRect.size.height);
+    }
+
+    if (stateAfter == UIGestureRecognizerStateEnded ||
+        stateAfter == UIGestureRecognizerStateCancelled ||
+        stateAfter == UIGestureRecognizerStateFailed) {
+        MRResetMyrtleHostWindowGeometryCandidate();
+        MRScheduleMyrtleHostWindowGeometrySync();
+        MRScheduleMyrtleHostWindowGeometryFollowup();
+    }
 }
 
 static UIView *MRHookMyrtleHostWindowHitTest(id self, SEL selector,
@@ -2020,6 +2066,31 @@ static BOOL MRInstallMyrtleHostWindowGeometryHook(void)
     return installed;
 }
 
+static BOOL MRInstallMyrtleHostGestureHook(void)
+{
+    if (MROriginalMyrtleHostGesture != NULL) return YES;
+
+    Class cls = NSClassFromString(@"MyrtleHostManager");
+    SEL selector = NSSelectorFromString(@"MT_IllIllllIllIIlIlIlIl:");
+    Method method = class_getInstanceMethod(cls, selector);
+    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 3)
+        return NO;
+
+    char returnType[16] = {};
+    char argumentType[16] = {};
+    method_getReturnType(method, returnType, sizeof(returnType));
+    method_getArgumentType(method, 2, argumentType, sizeof(argumentType));
+    if (returnType[0] != 'v' || argumentType[0] != '@') return NO;
+
+    MSHookMessageEx(cls, selector, (IMP)MRHookMyrtleHostGesture,
+                    (IMP *)&MROriginalMyrtleHostGesture);
+    BOOL installed = MROriginalMyrtleHostGesture != NULL;
+    MRSceneRoutingTrace(@"hostGestureHook installed=%d owner=%@",
+                        installed,
+                        NSStringFromClass(MRClassOwningInstanceSelector(cls, selector)));
+    return installed;
+}
+
 static BOOL MRInstallMyrtleHandleBoundaryHooks(void)
 {
     Class cls = NSClassFromString(@"MyrtleViewController");
@@ -2179,12 +2250,13 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL outsideActionGateInstalled = MRInstallMyrtleOutsideActionGateHook();
     BOOL hostPassThroughInstalled = MRInstallMyrtleHostWindowPassThroughHook();
     BOOL hostGeometryInstalled = MRInstallMyrtleHostWindowGeometryHook();
+    BOOL hostGestureInstalled = MRInstallMyrtleHostGestureHook();
     BOOL handleBoundaryInstalled = MRInstallMyrtleHandleBoundaryHooks();
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
     BOOL actionDispatcherInstalled = MRInstallMyrtleActionDispatcherHook();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
         keyboardAvoidanceInstalled && outsideActionGateInstalled && hostPassThroughInstalled &&
-        hostGeometryInstalled &&
+        hostGeometryInstalled && hostGestureInstalled &&
         handleBoundaryInstalled &&
         selectorCenterInstalled && actionDispatcherInstalled) {
         MRSceneRoutingTrace(@"hooksReady attempt=%lu exactInstalled=%d owner=%@",
@@ -2195,11 +2267,11 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
         return;
     }
     if (attempt >= 60) {
-        MRSceneRoutingTrace(@"hooksFailed manager=%d fullscreen=%d hostCore=%d keyboard=%d outside=%d pass=%d geometry=%d boundary=%d selector=%d dispatcher=%d",
+        MRSceneRoutingTrace(@"hooksFailed manager=%d fullscreen=%d hostCore=%d keyboard=%d outside=%d pass=%d geometry=%d gesture=%d boundary=%d selector=%d dispatcher=%d",
                             managerInstalled, fullscreenInstalled,
                             hostCoreLaunchInstalled, keyboardAvoidanceInstalled,
                             outsideActionGateInstalled, hostPassThroughInstalled,
-                            hostGeometryInstalled,
+                            hostGeometryInstalled, hostGestureInstalled,
                             handleBoundaryInstalled, selectorCenterInstalled,
                             actionDispatcherInstalled);
         MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d outsideAction=%d hostPassThrough=%d boundary=%d selectorCenter=%d",
@@ -2216,7 +2288,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         (void)unlink(MRSceneRoutingTracePath);
-        MRSceneRoutingTrace(@"start version=0.5.4~beta16 process=%@",
+        MRSceneRoutingTrace(@"start version=0.5.4~beta17 process=%@",
                             NSProcessInfo.processInfo.processName);
         dispatch_async(dispatch_get_main_queue(), ^{
             MRInstallSwitcherRemoveHook();
