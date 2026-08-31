@@ -16,6 +16,10 @@ static NSUInteger MRMyrtleFullscreenIntentGeneration = 0;
 static NSTimeInterval MRRecentlyClosedMyrtleTime = 0;
 static const CGFloat MRFixedPortraitKeyboardHeight = 360.0;
 static const CGFloat MRKeyboardHandleGap = 18.0;
+// iPhone 13 Pro Max is 428 x 926 pt.  The second reference screenshot places
+// the handle at approximately y=544 pt.  A 546 pt ceiling leaves the radial
+// selector's lowest item above the 34 pt Home-indicator safe area.
+static const CGFloat MRPortraitHandleMaximumCenterY = 546.0;
 static BOOL MRForegroundReloadInFlight = NO;
 static __strong NSString *MRForegroundReloadCandidateBundleID = nil;
 static NSUInteger MRForegroundReloadCandidateGeneration = 0;
@@ -885,6 +889,10 @@ typedef void (*MROpenSelectorAtPointIMP)(id, SEL, CGPoint);
 static MROpenSelectorAtPointIMP MROriginalOpenSelectorAtPoint = NULL;
 typedef void (*MRActionDispatcherIMP)(id, SEL, id, id, id);
 static MRActionDispatcherIMP MROriginalActionDispatcher = NULL;
+typedef void (*MRMyrtleViewDidLoadIMP)(id, SEL);
+static MRMyrtleViewDidLoadIMP MROriginalMyrtleViewDidLoad = NULL;
+typedef void (*MRMyrtleHandlePanIMP)(id, SEL, id);
+static MRMyrtleHandlePanIMP MROriginalMyrtleHandlePan = NULL;
 
 static void MRHookActionDispatcher(id self, SEL selector, id argument1,
                                    id argument2, id argument3)
@@ -900,6 +908,24 @@ static void MRHookActionDispatcher(id self, SEL selector, id argument1,
 static const void *MRPinnedHandleControllerKey = &MRPinnedHandleControllerKey;
 static const void *MRPinnedHandleInstalledKey = &MRPinnedHandleInstalledKey;
 static const void *MRPinnedHandleBypassKey = &MRPinnedHandleBypassKey;
+
+static BOOL MRBoundHandleCenter(id controller, UIView *movementView,
+                                CGPoint proposedCenter, CGPoint *boundedCenter)
+{
+    CGRect screenBounds = UIScreen.mainScreen.bounds;
+    if (CGRectGetHeight(screenBounds) <= CGRectGetWidth(screenBounds)) return NO;
+    if (![movementView isKindOfClass:UIView.class]) return NO;
+    UIView *coordinateView = movementView.superview ?: MRSafeValue(controller, @"view");
+    if (![coordinateView isKindOfClass:UIView.class]) return NO;
+
+    CGFloat screenLimit = MIN(MRPortraitHandleMaximumCenterY,
+                              CGRectGetMaxY(screenBounds));
+    CGPoint limitInView = [coordinateView convertPoint:
+        CGPointMake(CGRectGetMidX(screenBounds), screenLimit) fromView:nil];
+    if (proposedCenter.y > limitInView.y) proposedCenter.y = limitInView.y;
+    if (boundedCenter != NULL) *boundedCenter = proposedCenter;
+    return YES;
+}
 
 static BOOL MRFixedKeyboardHandleCenter(id controller, UIView *movementView,
                                         CGPoint proposedCenter, CGPoint *fixedCenter)
@@ -953,6 +979,7 @@ static void MRPinnedHandleSetCenter(id view, SEL selector, CGPoint proposedCente
     id controller = objc_getAssociatedObject(view, MRPinnedHandleControllerKey);
     NSNumber *bypass = objc_getAssociatedObject(view, MRPinnedHandleBypassKey);
     CGPoint effectiveCenter = proposedCenter;
+    MRBoundHandleCenter(controller, view, effectiveCenter, &effectiveCenter);
     if (!bypass.boolValue)
         MRFixedKeyboardHandleCenter(controller, view, proposedCenter, &effectiveCenter);
 
@@ -1000,6 +1027,31 @@ static BOOL MRInstallPinnedHandleCenterGuard(id controller)
     objc_setAssociatedObject(movementView, MRPinnedHandleInstalledKey, @YES,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return YES;
+}
+
+static void MRApplyHandleBottomBoundary(id controller)
+{
+    UIView *movementView = MRSafeValue(controller, @"handleHitView");
+    if (![movementView isKindOfClass:UIView.class]) return;
+    if (!MRInstallPinnedHandleCenterGuard(controller)) return;
+    CGPoint boundedCenter = movementView.center;
+    if (MRBoundHandleCenter(controller, movementView, movementView.center,
+                            &boundedCenter) &&
+        !CGPointEqualToPoint(boundedCenter, movementView.center)) {
+        movementView.center = boundedCenter;
+    }
+}
+
+static void MRHookMyrtleViewDidLoad(id self, SEL selector)
+{
+    MROriginalMyrtleViewDidLoad(self, selector);
+    MRApplyHandleBottomBoundary(self);
+}
+
+static void MRHookMyrtleHandlePan(id self, SEL selector, id gesture)
+{
+    MROriginalMyrtleHandlePan(self, selector, gesture);
+    MRApplyHandleBottomBoundary(self);
 }
 
 static BOOL MRApplyFixedKeyboardHandlePosition(id controller, NSDictionary *animationInfo)
@@ -1160,6 +1212,35 @@ static BOOL MRInstallMyrtleKeyboardAvoidanceHook(void)
     return MROriginalKeyboardWillShow != NULL && MROriginalKeyboardWillHide != NULL;
 }
 
+static BOOL MRInstallMyrtleHandleBoundaryHooks(void)
+{
+    Class cls = NSClassFromString(@"MyrtleViewController");
+    if (cls == Nil) return NO;
+
+    if (MROriginalMyrtleViewDidLoad == NULL) {
+        SEL selector = @selector(viewDidLoad);
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method == NULL || method_getNumberOfArguments(method) != 2) return NO;
+        MSHookMessageEx(cls, selector, (IMP)MRHookMyrtleViewDidLoad,
+                        (IMP *)&MROriginalMyrtleViewDidLoad);
+    }
+
+    if (MROriginalMyrtleHandlePan == NULL) {
+        SEL selector = NSSelectorFromString(@"MT_IIlIllIlIlIlIlIlIlII:");
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+        char returnType[16] = {};
+        char argumentType[16] = {};
+        method_getReturnType(method, returnType, sizeof(returnType));
+        method_getArgumentType(method, 2, argumentType, sizeof(argumentType));
+        if (returnType[0] != 'v' || argumentType[0] != '@') return NO;
+        MSHookMessageEx(cls, selector, (IMP)MRHookMyrtleHandlePan,
+                        (IMP *)&MROriginalMyrtleHandlePan);
+    }
+
+    return MROriginalMyrtleViewDidLoad != NULL && MROriginalMyrtleHandlePan != NULL;
+}
+
 static BOOL MRInstallMyrtleSelectorCenterHook(void)
 {
     if (MROriginalOpenSelectorAtPoint != NULL) return YES;
@@ -1287,15 +1368,16 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL fullscreenInstalled = MRInstallMyrtleFullscreenHook();
     BOOL hostCoreLaunchInstalled = MRInstallMyrtleHostCoreLaunchHook();
     BOOL keyboardAvoidanceInstalled = MRInstallMyrtleKeyboardAvoidanceHook();
+    BOOL handleBoundaryInstalled = MRInstallMyrtleHandleBoundaryHooks();
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
     BOOL actionDispatcherInstalled = MRInstallMyrtleActionDispatcherHook();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
-        keyboardAvoidanceInstalled && selectorCenterInstalled &&
+        keyboardAvoidanceInstalled && handleBoundaryInstalled && selectorCenterInstalled &&
         actionDispatcherInstalled) return;
     if (attempt >= 60) {
-        MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d selectorCenter=%d",
+        MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d boundary=%d selectorCenter=%d",
               managerInstalled, fullscreenInstalled, hostCoreLaunchInstalled,
-              keyboardAvoidanceInstalled, selectorCenterInstalled);
+              keyboardAvoidanceInstalled, handleBoundaryInstalled, selectorCenterInstalled);
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
