@@ -58,14 +58,19 @@ typedef void (*MRMyrtleHostGestureIMP)(id, SEL, UIGestureRecognizer *);
 static MRMyrtleHostGestureIMP MROriginalMyrtleHostGesture = NULL;
 typedef void (*MRMyrtleSnapTransitionIMP)(id, SEL, BOOL);
 static MRMyrtleSnapTransitionIMP MROriginalMyrtleSnapTransition = NULL;
-// Retained only while beta4 compares the former selector-internal hypothesis
-// with the verified standalone launcher path. These hooks are never installed.
+// The inner selector helpers are retained as a fallback reference, but Myrtle
+// invokes them directly inside its long-press state machine. beta8 therefore
+// hooks the outer Objective-C boundary below and reuses only our pointer mapper.
 typedef void (*MRSelectorAlphaBuildOverlayIMP)(id, SEL, id);
 static MRSelectorAlphaBuildOverlayIMP MROriginalSelectorAlphaBuildOverlay = NULL;
 typedef void (*MRSelectorAlphaPointerIMP)(id, SEL, CGPoint);
 static MRSelectorAlphaPointerIMP MROriginalSelectorAlphaPointer = NULL;
 typedef void (*MRSelectorAlphaFinishIMP)(id, SEL, BOOL);
 static MRSelectorAlphaFinishIMP MROriginalSelectorAlphaFinish = NULL;
+typedef void (*MRSelectorLongPressEnterIMP)(id, SEL, id, CGPoint);
+static MRSelectorLongPressEnterIMP MROriginalSelectorLongPressEnter = NULL;
+typedef void (*MRSelectorLongPressUpdateIMP)(id, SEL, CGPoint);
+static MRSelectorLongPressUpdateIMP MROriginalSelectorLongPressUpdate = NULL;
 typedef void (*MRAlphaLauncherLifecycleIMP)(id, SEL);
 static MRAlphaLauncherLifecycleIMP MROriginalAlphaLauncherViewDidLoad = NULL;
 static MRAlphaLauncherLifecycleIMP MROriginalAlphaLauncherViewDidLayoutSubviews = NULL;
@@ -393,7 +398,8 @@ static void MRSelectorAlphaSelectionChanged(id controller)
 static void MRHookSelectorAlphaPointer(id self, SEL selector, CGPoint point)
 {
     if (!MRSelectorAlphaStripIsActive(self)) {
-        MROriginalSelectorAlphaPointer(self, selector, point);
+        if (MROriginalSelectorAlphaPointer != NULL)
+            MROriginalSelectorAlphaPointer(self, selector, point);
         return;
     }
 
@@ -406,7 +412,8 @@ static void MRHookSelectorAlphaPointer(id self, SEL selector, CGPoint point)
         ![railView isKindOfClass:UIView.class] ||
         ![letters isKindOfClass:NSArray.class] || letters.count == 0 ||
         ![collectionView isKindOfClass:UICollectionView.class]) {
-        MROriginalSelectorAlphaPointer(self, selector, point);
+        if (MROriginalSelectorAlphaPointer != NULL)
+            MROriginalSelectorAlphaPointer(self, selector, point);
         return;
     }
 
@@ -476,6 +483,33 @@ static void MRHookSelectorAlphaFinish(id self, SEL selector, BOOL commit)
     [stripView removeFromSuperview];
     objc_setAssociatedObject(self, MRSelectorAlphaStripKey, nil,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void MRHookSelectorLongPressEnter(id self, SEL selector, id action,
+                                         CGPoint point)
+{
+    MROriginalSelectorLongPressEnter(self, selector, action, point);
+    UICollectionView *collectionView = MRSafeValue(self, @"selectorAlphaCollectionView");
+    MRAlphaLauncherDiagnostic([NSString stringWithFormat:
+        @"selector enter action=%@ active=%@ collection=%@ overlay=%@",
+        action, MRSafeValue(self, @"selectorAdjustModeActive"),
+        NSStringFromClass([collectionView class]),
+        NSStringFromClass([MRSafeValue(self, @"selectorAdjustOverlayView") class])]);
+    if ([collectionView isKindOfClass:UICollectionView.class]) {
+        MRLayoutSelectorAlphaStrip(self);
+        MRAlphaLauncherDiagnostic([NSString stringWithFormat:
+            @"selector strip applied rail=%@ collection=%@",
+            NSStringFromCGRect([MRSafeValue(self, @"selectorAlphaLetterPanelView") frame]),
+            NSStringFromCGRect(collectionView.frame)]);
+    }
+}
+
+static void MRHookSelectorLongPressUpdate(id self, SEL selector, CGPoint point)
+{
+    MROriginalSelectorLongPressUpdate(self, selector, point);
+    if (MRSelectorAlphaStripIsActive(self))
+        MRHookSelectorAlphaPointer(self,
+            NSSelectorFromString(@"MT_lllIIIIlIllIIIIIIlll:"), point);
 }
 
 static void MRLayoutStandaloneAlphaLauncher(id controller, NSString *stage)
@@ -2572,6 +2606,65 @@ static BOOL __attribute__((unused)) MRValidateSelectorAlphaStripHooks(void)
     return returnType[0] == 'v';
 }
 
+static BOOL MRInstallSelectorAlphaStateMachineHooks(void)
+{
+    Class cls = NSClassFromString(@"MyrtleViewController");
+    if (cls == Nil) return NO;
+
+    if (MROriginalSelectorLongPressEnter == NULL) {
+        SEL selector = NSSelectorFromString(@"MT_IlllIIIllIIlIIllIIll::");
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method == NULL || method_getNumberOfArguments(method) != 4) return NO;
+        char returnType[16] = {};
+        char actionType[16] = {};
+        char pointType[32] = {};
+        method_getReturnType(method, returnType, sizeof(returnType));
+        method_getArgumentType(method, 2, actionType, sizeof(actionType));
+        method_getArgumentType(method, 3, pointType, sizeof(pointType));
+        if (returnType[0] != 'v' || actionType[0] != '@' || pointType[0] != '{')
+            return NO;
+        MSHookMessageEx(cls, selector, (IMP)MRHookSelectorLongPressEnter,
+                        (IMP *)&MROriginalSelectorLongPressEnter);
+    }
+
+    if (MROriginalSelectorLongPressUpdate == NULL) {
+        SEL selector = NSSelectorFromString(@"MT_IIlIlIllllllllllllll:");
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+        char returnType[16] = {};
+        char pointType[32] = {};
+        method_getReturnType(method, returnType, sizeof(returnType));
+        method_getArgumentType(method, 2, pointType, sizeof(pointType));
+        if (returnType[0] != 'v' || pointType[0] != '{') return NO;
+        MSHookMessageEx(cls, selector, (IMP)MRHookSelectorLongPressUpdate,
+                        (IMP *)&MROriginalSelectorLongPressUpdate);
+    }
+
+    if (MROriginalSelectorAlphaFinish == NULL) {
+        SEL selector = NSSelectorFromString(@"MT_lllIllIllIIIIlllIIII:");
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+        char returnType[16] = {};
+        char commitType[16] = {};
+        method_getReturnType(method, returnType, sizeof(returnType));
+        method_getArgumentType(method, 2, commitType, sizeof(commitType));
+        if (returnType[0] != 'v' || (commitType[0] != 'B' && commitType[0] != 'c'))
+            return NO;
+        MSHookMessageEx(cls, selector, (IMP)MRHookSelectorAlphaFinish,
+                        (IMP *)&MROriginalSelectorAlphaFinish);
+    }
+
+    BOOL installed = MROriginalSelectorLongPressEnter != NULL &&
+        MROriginalSelectorLongPressUpdate != NULL &&
+        MROriginalSelectorAlphaFinish != NULL;
+    MRAlphaLauncherDiagnostic([NSString stringWithFormat:
+        @"selector state install enter=%d update=%d finish=%d result=%d",
+        MROriginalSelectorLongPressEnter != NULL,
+        MROriginalSelectorLongPressUpdate != NULL,
+        MROriginalSelectorAlphaFinish != NULL, installed]);
+    return installed;
+}
+
 static BOOL MRInstallMyrtleHandleBoundaryHooks(void)
 {
     Class cls = NSClassFromString(@"MyrtleViewController");
@@ -2781,11 +2874,13 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
     BOOL actionDispatcherInstalled = MRInstallMyrtleActionDispatcherHook();
     BOOL alphaContainmentInstalled = MRInstallAlphaLauncherContainmentHooks();
+    BOOL selectorAlphaStateInstalled = MRInstallSelectorAlphaStateMachineHooks();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
         keyboardAvoidanceInstalled && outsideActionGateInstalled && hostPassThroughInstalled &&
         hostGeometryInstalled && hostGestureInstalled && hostSnapInstalled &&
         standaloneAlphaLauncherInstalled && handleBoundaryInstalled &&
-        selectorCenterInstalled && actionDispatcherInstalled && alphaContainmentInstalled) {
+        selectorCenterInstalled && actionDispatcherInstalled && alphaContainmentInstalled &&
+        selectorAlphaStateInstalled) {
         return;
     }
     if (attempt >= 60) {
@@ -2805,7 +2900,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
         [[NSFileManager defaultManager] removeItemAtPath:
             @"/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.alpha-launcher.log"
                                                    error:nil];
-        MRAlphaLauncherDiagnostic(@"0.5.5 beta7 normalized-action diagnostic start");
+        MRAlphaLauncherDiagnostic(@"0.5.5 beta8 selector-state diagnostic start");
         dispatch_async(dispatch_get_main_queue(), ^{
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();

@@ -1,8 +1,8 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.5.5~beta7
+Version: 0.5.5~beta8
 Architecture: iphoneos-arm64e
-Description: iOS 15 RootHide diagnostic beta that follows Myrtle's normalized alphaapplauncher action and reflows its cached A-Z controller.
+Description: iOS 15 RootHide diagnostic beta that reflows Myrtle's selector-internal A-Z browser at its outer long-press state-machine boundary.
 Maintainer: Local
 Author: Local
 Section: Tweaks
