@@ -18,10 +18,11 @@ static NSUInteger MRMyrtleFullscreenIntentGeneration = 0;
 static NSTimeInterval MRRecentlyClosedMyrtleTime = 0;
 static const CGFloat MRFixedPortraitKeyboardHeight = 360.0;
 static const CGFloat MRKeyboardHandleGap = 18.0;
-// iPhone 13 Pro Max is 428 x 926 pt.  The second reference screenshot places
-// the handle at approximately y=544 pt.  A 546 pt ceiling leaves the radial
-// selector's lowest item above the 34 pt Home-indicator safe area.
-static const CGFloat MRPortraitHandleMaximumCenterY = 546.0;
+// iPhone 13 Pro Max is 428 x 926 pt.  The updated 3x reference marks the
+// desired lowest handle center at roughly 2160 px / 3 = 720 pt.  This is a
+// center-coordinate ceiling shared by the left and right handles; keyboard
+// avoidance continues to use its independent fixed position above.
+static const CGFloat MRPortraitHandleMaximumCenterY = 720.0;
 static BOOL MRForegroundReloadInFlight = NO;
 static __strong NSString *MRForegroundReloadCandidateBundleID = nil;
 static NSUInteger MRForegroundReloadCandidateGeneration = 0;
@@ -32,7 +33,8 @@ static long long MRHomePageGuardMinimumIndex = 0;
 static BOOL MRHomePageGuardClosing = NO;
 static __strong NSString *MRHomePageGuardBundleID = nil;
 static __weak UIScrollView *MRHomePageGuardScrollView = nil;
-static __strong UIControl *MROutsideKeyboardTapCatcher = nil;
+static __strong NSMutableArray<UIControl *> *MROutsideKeyboardTapCatchers = nil;
+static const void *MROutsideKeyboardTapCatcherKey = &MROutsideKeyboardTapCatcherKey;
 
 typedef void (*MRSetContentOffsetAnimatedIMP)(id, SEL, CGPoint, BOOL);
 static MRSetContentOffsetAnimatedIMP MROriginalSetContentOffsetAnimated = NULL;
@@ -40,6 +42,7 @@ typedef void (*MRSetContentOffsetIMP)(id, SEL, CGPoint);
 static MRSetContentOffsetIMP MROriginalSetContentOffset = NULL;
 typedef UIView *(*MRMyrtleWindowHitTestIMP)(id, SEL, CGPoint, UIEvent *);
 static MRMyrtleWindowHitTestIMP MROriginalMyrtleWindowHitTest = NULL;
+static MRMyrtleWindowHitTestIMP MROriginalMyrtleHostWindowHitTest = NULL;
 
 // Production builds discard the complete diagnostic expression at preprocessing
 // time: no arguments or diagnostic strings reach SpringBoard.
@@ -119,6 +122,16 @@ static CGRect MRProtectedMyrtleHostRectInScreen(void)
     return CGRectIsNull(bestRect) ? CGRectNull : CGRectInset(bestRect, -6.0, -6.0);
 }
 
+static BOOL MRScreenPointInsideView(CGPoint screenPoint, id object, CGFloat padding)
+{
+    UIView *view = [object isKindOfClass:UIView.class] ? object : nil;
+    if (view == nil || view.window == nil || view.hidden || view.alpha <= 0.01)
+        return NO;
+    CGRect rect = [view convertRect:view.bounds toView:nil];
+    if (CGRectIsNull(rect) || CGRectIsInfinite(rect) || CGRectIsEmpty(rect)) return NO;
+    return CGRectContainsPoint(CGRectInset(rect, -padding, -padding), screenPoint);
+}
+
 @interface MROutsideKeyboardTapControl : UIControl
 @property (nonatomic, weak) id myrtleController;
 @property (nonatomic, assign) CGFloat keyboardTopInScreen;
@@ -132,8 +145,7 @@ static CGRect MRProtectedMyrtleHostRectInScreen(void)
         return NO;
 
     id controller = self.myrtleController;
-    if (controller == nil || ![MRSafeValue(controller, @"isWindowOpen") boolValue] ||
-        ![MRSafeValue(controller, @"handleWasMovedForKeyboard") boolValue])
+    if (controller == nil || ![MRSafeValue(controller, @"isWindowOpen") boolValue])
         return NO;
 
     // Preserve every radial selector and launcher interaction.  Outside-tap
@@ -150,6 +162,12 @@ static CGRect MRProtectedMyrtleHostRectInScreen(void)
     CGPoint screenPoint = [self convertPoint:point toView:nil];
     if (!isfinite(screenPoint.x) || !isfinite(screenPoint.y) ||
         self.keyboardTopInScreen <= 0.0 || screenPoint.y >= self.keyboardTopInScreen)
+        return NO;
+
+    // The grip is intentionally outside the app card.  Keep both left/right
+    // hit containers interactive while the keyboard catcher is enabled.
+    if (MRScreenPointInsideView(screenPoint, MRSafeValue(controller, @"handleHitView"), 8.0) ||
+        MRScreenPointInsideView(screenPoint, MRSafeValue(controller, @"secondaryHandleHitView"), 8.0))
         return NO;
 
     CGRect protectedRect = MRProtectedMyrtleHostRectInScreen();
@@ -182,60 +200,79 @@ static CGRect MRProtectedMyrtleHostRectInScreen(void)
 
 static void MRActivateOutsideKeyboardTapCatcher(id controller, CGRect keyboardFrame)
 {
-    if (controller == nil || ![MRSafeValue(controller, @"isWindowOpen") boolValue] ||
-        ![MRSafeValue(controller, @"handleWasMovedForKeyboard") boolValue]) {
+    if (controller == nil || ![MRSafeValue(controller, @"isWindowOpen") boolValue]) {
         MRDeactivateOutsideKeyboardTapCatcher();
         return;
     }
 
-    UIView *rootView = MRSafeValue(controller, @"view");
-    if (![rootView isKindOfClass:UIView.class] || rootView.window == nil) {
-        MRDeactivateOutsideKeyboardTapCatcher();
-        return;
+    MRDeactivateOutsideKeyboardTapCatcher();
+
+    NSMutableOrderedSet<UIWindow *> *windows = [NSMutableOrderedSet orderedSet];
+    UIView *controllerView = MRSafeValue(controller, @"view");
+    if ([controllerView.window isKindOfClass:UIWindow.class])
+        [windows addObject:controllerView.window];
+
+    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+    UIWindow *managerHostWindow = MRSafeValue(manager, @"hostWindow");
+    if ([managerHostWindow isKindOfClass:UIWindow.class])
+        [windows addObject:managerHostWindow];
+
+    for (NSString *className in @[@"MyrtleWindow", @"MyrtleHostWindow"]) {
+        UIWindow *sharedWindow = MRSendClassNoArgs(className, @"sharedWindow");
+        if ([sharedWindow isKindOfClass:UIWindow.class])
+            [windows addObject:sharedWindow];
     }
 
-    MROutsideKeyboardTapControl *catcher =
-        [MROutsideKeyboardTapCatcher isKindOfClass:MROutsideKeyboardTapControl.class]
-            ? (MROutsideKeyboardTapControl *)MROutsideKeyboardTapCatcher
-            : nil;
-    if (catcher == nil) {
-        catcher = [[MROutsideKeyboardTapControl alloc] initWithFrame:rootView.bounds];
-        catcher.backgroundColor = UIColor.clearColor;
-        catcher.opaque = NO;
-        catcher.exclusiveTouch = YES;
-        catcher.accessibilityElementsHidden = YES;
-        [catcher addTarget:catcher
-                    action:@selector(mr_closeMyrtleWindowFromOutsideTap:)
-          forControlEvents:UIControlEventTouchUpInside];
-        MROutsideKeyboardTapCatcher = catcher;
-    }
+    MROutsideKeyboardTapCatchers = [NSMutableArray array];
+    for (UIWindow *window in windows) {
+        UIView *rootView = window.rootViewController.view ?: window;
+        if (![rootView isKindOfClass:UIView.class]) continue;
 
-    [catcher removeFromSuperview];
-    catcher.myrtleController = controller;
-    catcher.keyboardTopInScreen = CGRectGetMinY(keyboardFrame);
-    catcher.frame = rootView.bounds;
-    catcher.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    catcher.hidden = NO;
-    catcher.enabled = YES;
-    [rootView insertSubview:catcher atIndex:0];
+        MROutsideKeyboardTapControl *catcher =
+            objc_getAssociatedObject(window, MROutsideKeyboardTapCatcherKey);
+        if (![catcher isKindOfClass:MROutsideKeyboardTapControl.class]) {
+            catcher = [[MROutsideKeyboardTapControl alloc] initWithFrame:rootView.bounds];
+            catcher.backgroundColor = UIColor.clearColor;
+            catcher.opaque = NO;
+            catcher.exclusiveTouch = YES;
+            catcher.accessibilityElementsHidden = YES;
+            [catcher addTarget:catcher
+                        action:@selector(mr_closeMyrtleWindowFromOutsideTap:)
+              forControlEvents:UIControlEventTouchUpInside];
+            objc_setAssociatedObject(window, MROutsideKeyboardTapCatcherKey, catcher,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+
+        [catcher removeFromSuperview];
+        catcher.myrtleController = controller;
+        catcher.keyboardTopInScreen = CGRectGetMinY(keyboardFrame);
+        catcher.frame = rootView.bounds;
+        catcher.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                                   UIViewAutoresizingFlexibleHeight;
+        catcher.hidden = NO;
+        catcher.enabled = YES;
+        [rootView insertSubview:catcher atIndex:0];
+        [MROutsideKeyboardTapCatchers addObject:catcher];
+    }
 }
 
 static void MRDeactivateOutsideKeyboardTapCatcher(void)
 {
-    MROutsideKeyboardTapControl *catcher =
-        [MROutsideKeyboardTapCatcher isKindOfClass:MROutsideKeyboardTapControl.class]
-            ? (MROutsideKeyboardTapControl *)MROutsideKeyboardTapCatcher
-            : nil;
-    catcher.enabled = NO;
-    catcher.hidden = YES;
-    catcher.myrtleController = nil;
-    [catcher removeFromSuperview];
+    for (MROutsideKeyboardTapControl *catcher in
+         [MROutsideKeyboardTapCatchers copy]) {
+        catcher.enabled = NO;
+        catcher.hidden = YES;
+        catcher.myrtleController = nil;
+        [catcher removeFromSuperview];
+    }
+    [MROutsideKeyboardTapCatchers removeAllObjects];
 }
 
-static UIView *MRHookMyrtleWindowHitTest(id self, SEL selector,
-                                         CGPoint point, UIEvent *event)
+static UIView *MRMyrtleWindowHitTestRecover(id self, SEL selector,
+                                            CGPoint point, UIEvent *event,
+                                            MRMyrtleWindowHitTestIMP original)
 {
-    UIView *originalResult = MROriginalMyrtleWindowHitTest(self, selector, point, event);
+    UIView *originalResult = original(self, selector, point, event);
     if (originalResult != nil) return originalResult;
 
     // MyrtleWindow normally passes every unclaimed point through to the layer
@@ -244,14 +281,27 @@ static UIView *MRHookMyrtleWindowHitTest(id self, SEL selector,
     // Myrtle's routing path can return nil before that control is considered.
     // Preserve every native hit; only recover an otherwise-unclaimed point.
     MROutsideKeyboardTapControl *catcher =
-        [MROutsideKeyboardTapCatcher isKindOfClass:MROutsideKeyboardTapControl.class]
-            ? (MROutsideKeyboardTapControl *)MROutsideKeyboardTapCatcher
-            : nil;
-    if (catcher == nil || catcher.superview == nil || catcher.window != self)
+        objc_getAssociatedObject(self, MROutsideKeyboardTapCatcherKey);
+    if (![catcher isKindOfClass:MROutsideKeyboardTapControl.class] ||
+        catcher.superview == nil)
         return nil;
 
     CGPoint catcherPoint = [catcher convertPoint:point fromView:(UIView *)self];
     return [catcher pointInside:catcherPoint withEvent:event] ? catcher : nil;
+}
+
+static UIView *MRHookMyrtleWindowHitTest(id self, SEL selector,
+                                         CGPoint point, UIEvent *event)
+{
+    return MRMyrtleWindowHitTestRecover(self, selector, point, event,
+                                        MROriginalMyrtleWindowHitTest);
+}
+
+static UIView *MRHookMyrtleHostWindowHitTest(id self, SEL selector,
+                                             CGPoint point, UIEvent *event)
+{
+    return MRMyrtleWindowHitTestRecover(self, selector, point, event,
+                                        MROriginalMyrtleHostWindowHitTest);
 }
 
 static id MRMainSwitcher(void)
@@ -1415,25 +1465,47 @@ static BOOL MRInstallMyrtleKeyboardAvoidanceHook(void)
 
 static BOOL MRInstallMyrtleWindowHitTestHook(void)
 {
-    if (MROriginalMyrtleWindowHitTest != NULL) return YES;
-    Class cls = NSClassFromString(@"MyrtleWindow");
     SEL selector = @selector(hitTest:withEvent:);
-    Method method = class_getInstanceMethod(cls, selector);
-    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 4)
-        return NO;
+    if (MROriginalMyrtleWindowHitTest == NULL) {
+        Class cls = NSClassFromString(@"MyrtleWindow");
+        Method method = class_getInstanceMethod(cls, selector);
+        if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 4)
+            return NO;
 
-    char returnType[16] = {};
-    char pointType[16] = {};
-    char eventType[16] = {};
-    method_getReturnType(method, returnType, sizeof(returnType));
-    method_getArgumentType(method, 2, pointType, sizeof(pointType));
-    method_getArgumentType(method, 3, eventType, sizeof(eventType));
-    if (returnType[0] != '@' || pointType[0] != '{' || eventType[0] != '@')
-        return NO;
+        char returnType[16] = {};
+        char pointType[16] = {};
+        char eventType[16] = {};
+        method_getReturnType(method, returnType, sizeof(returnType));
+        method_getArgumentType(method, 2, pointType, sizeof(pointType));
+        method_getArgumentType(method, 3, eventType, sizeof(eventType));
+        if (returnType[0] != '@' || pointType[0] != '{' || eventType[0] != '@')
+            return NO;
 
-    MSHookMessageEx(cls, selector, (IMP)MRHookMyrtleWindowHitTest,
-                    (IMP *)&MROriginalMyrtleWindowHitTest);
-    return MROriginalMyrtleWindowHitTest != NULL;
+        MSHookMessageEx(cls, selector, (IMP)MRHookMyrtleWindowHitTest,
+                        (IMP *)&MROriginalMyrtleWindowHitTest);
+    }
+
+    if (MROriginalMyrtleHostWindowHitTest == NULL) {
+        Class cls = NSClassFromString(@"MyrtleHostWindow");
+        Method method = class_getInstanceMethod(cls, selector);
+        if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 4)
+            return NO;
+
+        char returnType[16] = {};
+        char pointType[16] = {};
+        char eventType[16] = {};
+        method_getReturnType(method, returnType, sizeof(returnType));
+        method_getArgumentType(method, 2, pointType, sizeof(pointType));
+        method_getArgumentType(method, 3, eventType, sizeof(eventType));
+        if (returnType[0] != '@' || pointType[0] != '{' || eventType[0] != '@')
+            return NO;
+
+        MSHookMessageEx(cls, selector, (IMP)MRHookMyrtleHostWindowHitTest,
+                        (IMP *)&MROriginalMyrtleHostWindowHitTest);
+    }
+
+    return MROriginalMyrtleWindowHitTest != NULL &&
+           MROriginalMyrtleHostWindowHitTest != NULL;
 }
 
 static BOOL MRInstallMyrtleHandleBoundaryHooks(void)
