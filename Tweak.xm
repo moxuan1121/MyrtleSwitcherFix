@@ -42,6 +42,8 @@ typedef void (*MRSetContentOffsetIMP)(id, SEL, CGPoint);
 static MRSetContentOffsetIMP MROriginalSetContentOffset = NULL;
 typedef void (*MRMyrtleOutsideActionIMP)(id, SEL);
 static MRMyrtleOutsideActionIMP MROriginalMyrtleOutsideAction = NULL;
+typedef UIView *(*MRMyrtleHostWindowHitTestIMP)(id, SEL, CGPoint, UIEvent *);
+static MRMyrtleHostWindowHitTestIMP MROriginalMyrtleHostWindowHitTest = NULL;
 
 // Production builds discard the complete diagnostic expression at preprocessing
 // time: no arguments or diagnostic strings reach SpringBoard.
@@ -114,6 +116,33 @@ static void MRHookMyrtleOutsideAction(id self, SEL selector)
 {
     if (!MRShouldAllowMyrtleOutsideAction(self)) return;
     MROriginalMyrtleOutsideAction(self, selector);
+}
+
+static UIView *MRHookMyrtleHostWindowHitTest(id self, SEL selector,
+                                             CGPoint point, UIEvent *event)
+{
+    UIView *result = MROriginalMyrtleHostWindowHitTest(self, selector, point, event);
+
+    // While the hosted keyboard is visible, retain Myrtle's complete native
+    // outside-touch route.  It consumes the touch and invokes the gated close
+    // action without activating the application underneath.
+    if (MRMyrtleHostedKeyboardVisible) return result;
+
+    // With no hosted keyboard, only the actual hosted application surface may
+    // keep the hit.  Returning nil outside that surface lets UIKit continue to
+    // the full-screen application below.  No transparent interception view or
+    // guessed screen rectangle is involved: use MyrtleHostManager's live
+    // hostView and UIKit's own pointInside: result.
+    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+    UIView *hostView = MRSafeValue(manager, @"hostView");
+    if (![hostView isKindOfClass:UIView.class] || hostView.window == nil)
+        return result;
+
+    CGPoint hostPoint = [hostView convertPoint:point fromView:(UIView *)self];
+    BOOL insideHost = !hostView.hidden && hostView.alpha > 0.01 &&
+        hostView.userInteractionEnabled && [hostView pointInside:hostPoint withEvent:event];
+    if (insideHost) return result;
+    return nil;
 }
 
 static id MRMainSwitcher(void)
@@ -1301,6 +1330,30 @@ static BOOL MRInstallMyrtleOutsideActionGateHook(void)
     return MROriginalMyrtleOutsideAction != NULL;
 }
 
+static BOOL MRInstallMyrtleHostWindowPassThroughHook(void)
+{
+    if (MROriginalMyrtleHostWindowHitTest != NULL) return YES;
+
+    Class cls = NSClassFromString(@"MyrtleHostWindow");
+    SEL selector = @selector(hitTest:withEvent:);
+    Method method = class_getInstanceMethod(cls, selector);
+    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 4)
+        return NO;
+
+    char returnType[16] = {};
+    char pointType[16] = {};
+    char eventType[16] = {};
+    method_getReturnType(method, returnType, sizeof(returnType));
+    method_getArgumentType(method, 2, pointType, sizeof(pointType));
+    method_getArgumentType(method, 3, eventType, sizeof(eventType));
+    if (returnType[0] != '@' || pointType[0] != '{' || eventType[0] != '@')
+        return NO;
+
+    MSHookMessageEx(cls, selector, (IMP)MRHookMyrtleHostWindowHitTest,
+                    (IMP *)&MROriginalMyrtleHostWindowHitTest);
+    return MROriginalMyrtleHostWindowHitTest != NULL;
+}
+
 static BOOL MRInstallMyrtleHandleBoundaryHooks(void)
 {
     Class cls = NSClassFromString(@"MyrtleViewController");
@@ -1458,16 +1511,18 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL hostCoreLaunchInstalled = MRInstallMyrtleHostCoreLaunchHook();
     BOOL keyboardAvoidanceInstalled = MRInstallMyrtleKeyboardAvoidanceHook();
     BOOL outsideActionGateInstalled = MRInstallMyrtleOutsideActionGateHook();
+    BOOL hostPassThroughInstalled = MRInstallMyrtleHostWindowPassThroughHook();
     BOOL handleBoundaryInstalled = MRInstallMyrtleHandleBoundaryHooks();
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
     BOOL actionDispatcherInstalled = MRInstallMyrtleActionDispatcherHook();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
-        keyboardAvoidanceInstalled && outsideActionGateInstalled && handleBoundaryInstalled &&
+        keyboardAvoidanceInstalled && outsideActionGateInstalled && hostPassThroughInstalled &&
+        handleBoundaryInstalled &&
         selectorCenterInstalled && actionDispatcherInstalled) return;
     if (attempt >= 60) {
-        MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d outsideAction=%d boundary=%d selectorCenter=%d",
+        MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d outsideAction=%d hostPassThrough=%d boundary=%d selectorCenter=%d",
               managerInstalled, fullscreenInstalled, hostCoreLaunchInstalled,
-              keyboardAvoidanceInstalled, outsideActionGateInstalled,
+              keyboardAvoidanceInstalled, outsideActionGateInstalled, hostPassThroughInstalled,
               handleBoundaryInstalled, selectorCenterInstalled);
         return;
     }
