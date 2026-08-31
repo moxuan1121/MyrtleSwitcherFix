@@ -64,7 +64,9 @@ typedef UIView *(*MRMyrtleHostWindowHitTestIMP)(id, SEL, CGPoint, UIEvent *);
 static MRMyrtleHostWindowHitTestIMP MROriginalMyrtleHostWindowHitTest = NULL;
 typedef BOOL (*MRWindowBooleanGetterIMP)(id, SEL);
 static MRWindowBooleanGetterIMP MROriginalUsesWindowServerHitTesting = NULL;
+static MRWindowBooleanGetterIMP MROriginalIgnoresHitTest = NULL;
 static NSUInteger MRWindowServerHitTestingCallCount = 0;
+static NSUInteger MRWindowIgnoreHitTestCallCount = 0;
 typedef NSInteger (*MRIntegerValueIMP)(id, SEL);
 static Class MRMyrtleTapOutsideValueOwnerClass = Nil;
 static MRIntegerValueIMP MROriginalMyrtleTapOutsideValueIntegerValue = NULL;
@@ -370,11 +372,33 @@ static BOOL MRHookUsesWindowServerHitTesting(id self, SEL selector)
 {
     BOOL nativeValue = MROriginalUsesWindowServerHitTesting == NULL
         ? NO : MROriginalUsesWindowServerHitTesting(self, selector);
-    BOOL result = MRMyrtleHostedKeyboardVisible ? nativeValue : YES;
+    // Cross-process pass-through uses the native non-WindowServer UIKit path
+    // for the SpringBoard parent context. The independently hosted B scene
+    // remains a WindowServer child-context hit candidate.
+    BOOL result = MRMyrtleHostedKeyboardVisible ? nativeValue : NO;
     if (MRWindowServerHitTestingCallCount < 24) {
         MRWindowServerHitTestingCallCount++;
         MRSceneRoutingTrace(@"windowServerHitTesting n=%lu keyboard=%d native=%d result=%d class=%@",
                             (unsigned long)MRWindowServerHitTestingCallCount,
+                            MRMyrtleHostedKeyboardVisible, nativeValue, result,
+                            NSStringFromClass([self class]));
+    }
+    return result;
+}
+
+static BOOL MRHookIgnoresHitTest(id self, SEL selector)
+{
+    BOOL nativeValue = MROriginalIgnoresHitTest == NULL
+        ? NO : MROriginalIgnoresHitTest(self, selector);
+    // With no hosted keyboard, exclude only MyrtleHostWindow's SpringBoard
+    // parent context from hit testing. The embedded app scene has its own
+    // context and stays interactive. Keyboard mode restores Myrtle/UIKit's
+    // native value so its outside-close path can consume the touch.
+    BOOL result = MRMyrtleHostedKeyboardVisible ? nativeValue : YES;
+    if (MRWindowIgnoreHitTestCallCount < 24) {
+        MRWindowIgnoreHitTestCallCount++;
+        MRSceneRoutingTrace(@"ignoresHitTest n=%lu keyboard=%d native=%d result=%d class=%@",
+                            (unsigned long)MRWindowIgnoreHitTestCallCount,
                             MRMyrtleHostedKeyboardVisible, nativeValue, result,
                             NSStringFromClass([self class]));
     }
@@ -1679,7 +1703,8 @@ static BOOL MRInstallMyrtleHostWindowPassThroughHook(void)
 
 static BOOL MRInstallMyrtleWindowServerHitTestingHook(void)
 {
-    if (MROriginalUsesWindowServerHitTesting != NULL) return YES;
+    if (MROriginalUsesWindowServerHitTesting != NULL &&
+        MROriginalIgnoresHitTest != NULL) return YES;
 
     Class cls = NSClassFromString(@"MyrtleHostWindow");
     SEL selector = NSSelectorFromString(@"_usesWindowServerHitTesting");
@@ -1690,23 +1715,54 @@ static BOOL MRInstallMyrtleWindowServerHitTestingHook(void)
     method_getReturnType(method, returnType, sizeof(returnType));
     if (returnType[0] != 'B' && returnType[0] != 'c') return NO;
 
-    IMP inheritedOrDirect = method_getImplementation(method);
-    const char *types = method_getTypeEncoding(method);
-    if (class_addMethod(cls, selector,
-                        (IMP)MRHookUsesWindowServerHitTesting, types)) {
-        MROriginalUsesWindowServerHitTesting =
-            (MRWindowBooleanGetterIMP)inheritedOrDirect;
-    } else {
-        MSHookMessageEx(cls, selector,
-                        (IMP)MRHookUsesWindowServerHitTesting,
-                        (IMP *)&MROriginalUsesWindowServerHitTesting);
+    if (MROriginalUsesWindowServerHitTesting == NULL) {
+        IMP inheritedOrDirect = method_getImplementation(method);
+        const char *types = method_getTypeEncoding(method);
+        if (class_addMethod(cls, selector,
+                            (IMP)MRHookUsesWindowServerHitTesting, types)) {
+            MROriginalUsesWindowServerHitTesting =
+                (MRWindowBooleanGetterIMP)inheritedOrDirect;
+        } else {
+            MSHookMessageEx(cls, selector,
+                            (IMP)MRHookUsesWindowServerHitTesting,
+                            (IMP *)&MROriginalUsesWindowServerHitTesting);
+        }
     }
-    BOOL installed = MROriginalUsesWindowServerHitTesting != NULL;
+    BOOL usesInstalled = MROriginalUsesWindowServerHitTesting != NULL;
     MRSceneRoutingTrace(@"windowServerHook installed=%d owner=%@ inherited=%d",
-                        installed,
+                        usesInstalled,
                         NSStringFromClass(MRClassOwningInstanceSelector(cls, selector)),
                         class_getInstanceMethod(cls, selector) != method);
-    return installed;
+
+    SEL ignoresSelector = NSSelectorFromString(@"_ignoresHitTest");
+    Method ignoresMethod = class_getInstanceMethod(cls, ignoresSelector);
+    if (ignoresMethod == NULL || method_getNumberOfArguments(ignoresMethod) != 2)
+        return NO;
+    char ignoresReturnType[16] = {};
+    method_getReturnType(ignoresMethod, ignoresReturnType,
+                         sizeof(ignoresReturnType));
+    if (ignoresReturnType[0] != 'B' && ignoresReturnType[0] != 'c')
+        return NO;
+    if (MROriginalIgnoresHitTest == NULL) {
+        IMP ignoresInheritedOrDirect = method_getImplementation(ignoresMethod);
+        const char *ignoresTypes = method_getTypeEncoding(ignoresMethod);
+        if (class_addMethod(cls, ignoresSelector,
+                            (IMP)MRHookIgnoresHitTest, ignoresTypes)) {
+            MROriginalIgnoresHitTest =
+                (MRWindowBooleanGetterIMP)ignoresInheritedOrDirect;
+        } else {
+            MSHookMessageEx(cls, ignoresSelector,
+                            (IMP)MRHookIgnoresHitTest,
+                            (IMP *)&MROriginalIgnoresHitTest);
+        }
+    }
+    BOOL ignoresInstalled = MROriginalIgnoresHitTest != NULL;
+    MRSceneRoutingTrace(@"ignoreHitTestHook installed=%d owner=%@ inherited=%d",
+                        ignoresInstalled,
+                        NSStringFromClass(MRClassOwningInstanceSelector(cls,
+                                                                       ignoresSelector)),
+                        class_getInstanceMethod(cls, ignoresSelector) != ignoresMethod);
+    return usesInstalled && ignoresInstalled;
 }
 
 static BOOL MRInstallMyrtleHandleBoundaryHooks(void)
@@ -1905,7 +1961,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         (void)unlink(MRSceneRoutingTracePath);
-        MRSceneRoutingTrace(@"start version=0.5.3.8~beta9 process=%@",
+        MRSceneRoutingTrace(@"start version=0.5.3.8~beta10 process=%@",
                             NSProcessInfo.processInfo.processName);
         dispatch_async(dispatch_get_main_queue(), ^{
             MRInstallSwitcherRemoveHook();
