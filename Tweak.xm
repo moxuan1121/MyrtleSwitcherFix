@@ -419,8 +419,12 @@ static void MRApplyMyrtleHostWindowGeometry(void)
                 // Keep Myrtle's existing screen-coordinate content geometry by
                 // giving the cropped window the same bounds origin as its
                 // screen-space frame. Only its WindowServer hit region changes.
-                window.frame = cropRect;
                 window.bounds = cropBounds;
+                // UIWindow recomputes frame origin from its layer geometry
+                // when bounds carries a non-zero origin. Set frame last so
+                // the compositor region stays at Myrtle's original card
+                // position instead of being normalized to {0,0}.
+                window.frame = cropRect;
                 [window layoutIfNeeded];
             }];
         } @finally {
@@ -475,7 +479,8 @@ static UIView *MRHookMyrtleHostWindowHitTest(id self, SEL selector,
     id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
     UIView *hostView = MRSafeValue(manager, @"hostView");
     CGRect hostRect = MRVisibleMyrtleHostRectInScreen(hostView);
-    CGPoint screenPoint = [(UIView *)self convertPoint:point toView:nil];
+    CGPoint screenPoint = [(UIView *)self convertPoint:point
+                                    toCoordinateSpace:UIScreen.mainScreen.fixedCoordinateSpace];
     BOOL outsideHost = !CGRectIsNull(hostRect) &&
         !CGRectContainsPoint(hostRect, screenPoint);
     if (rootCall && outsideHost && MRRootHostOutsideTraceCount < 24) {
@@ -2038,7 +2043,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         (void)unlink(MRSceneRoutingTracePath);
-        MRSceneRoutingTrace(@"start version=0.5.3.8~beta11 process=%@",
+        MRSceneRoutingTrace(@"start version=0.5.3.8~beta12 process=%@",
                             NSProcessInfo.processInfo.processName);
         dispatch_async(dispatch_get_main_queue(), ^{
             MRInstallSwitcherRemoveHook();
