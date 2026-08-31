@@ -128,9 +128,8 @@ static BOOL MRConfigureMyrtleTapOutsidePreferenceOverride(IMP hostWindowHitTestI
     // as strings ("0" through "4"). Do not guess or enumerate NSNumber
     // subclasses: read Myrtle's own verified preference dictionary slot and
     // hook only the concrete class that actually supplies integerValue here.
-    id __unsafe_unretained *preferencesSlot =
-        (id __unsafe_unretained *)(imageBase + preferencesSlotOffset);
-    id preferences = *preferencesSlot;
+    void **preferencesSlot = (void **)(imageBase + preferencesSlotOffset);
+    id preferences = (__bridge id)(*preferencesSlot);
     SEL keyedSubscriptSelector = @selector(objectForKeyedSubscript:);
     if (preferences == nil || ![preferences respondsToSelector:keyedSubscriptSelector])
         return NO;
