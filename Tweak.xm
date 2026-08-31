@@ -1886,14 +1886,60 @@ static MRMyrtleViewDidLoadIMP MROriginalMyrtleViewDidLoad = NULL;
 typedef void (*MRMyrtleHandlePanIMP)(id, SEL, id);
 static MRMyrtleHandlePanIMP MROriginalMyrtleHandlePan = NULL;
 
+static id MRFindEmbeddedAlphaLauncher(id parent, NSString **childSummary)
+{
+    NSArray *children = MRSafeValue(parent, @"childViewControllers");
+    if (![children isKindOfClass:NSArray.class]) children = @[];
+    NSMutableArray<NSString *> *names = [NSMutableArray arrayWithCapacity:children.count];
+    Class launcherClass = NSClassFromString(@"MyrtleAlphaAppLauncherViewController");
+    id launcher = nil;
+    for (id child in children) {
+        [names addObject:NSStringFromClass([child class]) ?: @"(unknown)"];
+        if (launcher == nil && launcherClass != Nil &&
+            [child isKindOfClass:launcherClass]) launcher = child;
+    }
+    if (childSummary != NULL) *childSummary = [names componentsJoinedByString:@","];
+    return launcher;
+}
+
+static void MRApplyEmbeddedAlphaLauncherLayout(id parent, NSString *stage)
+{
+    NSString *children = nil;
+    id launcher = MRFindEmbeddedAlphaLauncher(parent, &children);
+    MRAlphaLauncherDiagnostic([NSString stringWithFormat:
+        @"%@ parent=%@ open=%@ children=[%@] launcher=%@",
+        stage, NSStringFromClass([parent class]), MRSafeValue(parent, @"isAlphaAppLauncherOpen"),
+        children ?: @"", NSStringFromClass([launcher class])]);
+    if (launcher == nil) return;
+
+    // The launcher is constructed and cached before this dylib is loaded.  Its
+    // lifecycle callbacks therefore cannot be used as the opening trigger.
+    // Re-layout the exact child that Myrtle embeds for alphaApplauncher.
+    UIView *view = MRSafeValue(launcher, @"view");
+    [view setNeedsLayout];
+    [view layoutIfNeeded];
+    MRLayoutStandaloneAlphaLauncher(launcher, stage);
+}
+
 static void MRHookActionDispatcher(id self, SEL selector, id argument1,
                                    id argument2, id argument3)
 {
     BOOL isReloadAction = [argument1 isKindOfClass:NSString.class] &&
         [(NSString *)argument1 isEqualToString:@"reloadApp"];
+    BOOL isAlphaLauncherAction = [argument1 isKindOfClass:NSString.class] &&
+        [(NSString *)argument1 isEqualToString:@"alphaApplauncher"];
     BOOL isWindowOpen = [MRSafeValue(self, @"isWindowOpen") boolValue];
     if (isReloadAction && !isWindowOpen) MRReloadForegroundApplication();
     MROriginalActionDispatcher(self, selector, argument1, argument2, argument3);
+    if (isAlphaLauncherAction) {
+        MRApplyEmbeddedAlphaLauncherLayout(self, @"actionDispatcherImmediate");
+        __weak id weakParent = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            id parent = weakParent;
+            if (parent != nil)
+                MRApplyEmbeddedAlphaLauncherLayout(parent, @"actionDispatcherNextRunLoop");
+        });
+    }
     MRForegroundReloadCandidateBundleID = nil;
     MRForegroundReloadCandidateGeneration++;
 }
@@ -2663,7 +2709,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
         [[NSFileManager defaultManager] removeItemAtPath:
             @"/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.alpha-launcher.log"
                                                    error:nil];
-        MRAlphaLauncherDiagnostic(@"0.5.5 beta4 diagnostic start");
+        MRAlphaLauncherDiagnostic(@"0.5.5 beta5 cached-instance diagnostic start");
         dispatch_async(dispatch_get_main_queue(), ^{
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
