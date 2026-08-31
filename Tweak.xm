@@ -67,10 +67,17 @@ static MRWindowLayoutSubviewsIMP MROriginalMyrtleHostWindowLayoutSubviews = NULL
 static UIWindow *MRScopedMyrtleHostWindow = nil;
 static CGRect MRNativeMyrtleHostWindowFrame = {{0.0, 0.0}, {0.0, 0.0}};
 static CGRect MRNativeMyrtleHostWindowBounds = {{0.0, 0.0}, {0.0, 0.0}};
+static __weak UIView *MRScopedMyrtleHostRootView = nil;
+static CGRect MRNativeMyrtleHostRootViewFrame = {{0.0, 0.0}, {0.0, 0.0}};
+static CGRect MRNativeMyrtleHostRootViewBounds = {{0.0, 0.0}, {0.0, 0.0}};
+static UIViewAutoresizing MRNativeMyrtleHostRootViewAutoresizingMask = UIViewAutoresizingNone;
 static BOOL MRNativeMyrtleHostWindowGeometrySaved = NO;
 static BOOL MRMyrtleHostWindowCropApplied = NO;
 static BOOL MRMyrtleHostWindowGeometrySyncing = NO;
 static BOOL MRMyrtleHostWindowGeometrySyncScheduled = NO;
+static BOOL MRMyrtleHostWindowGeometryFollowupScheduled = NO;
+static CGRect MRMyrtleHostWindowCandidateRect = {{0.0, 0.0}, {0.0, 0.0}};
+static NSUInteger MRMyrtleHostWindowCandidateCount = 0;
 static NSUInteger MRMyrtleHostWindowGeometryTraceCount = 0;
 typedef NSInteger (*MRIntegerValueIMP)(id, SEL);
 static Class MRMyrtleTapOutsideValueOwnerClass = Nil;
@@ -78,6 +85,7 @@ static MRIntegerValueIMP MROriginalMyrtleTapOutsideValueIntegerValue = NULL;
 static uintptr_t MRMyrtleTapOutsideIntegerValueReturnAddress = 0;
 static BOOL MRMyrtleTapOutsidePreferenceOverrideInstalled = NO;
 static void MRScheduleMyrtleHostWindowGeometrySync(void);
+static void MRScheduleMyrtleHostWindowGeometryFollowup(void);
 static void MRRestoreMyrtleHostWindowGeometry(void);
 
 // Production builds discard the complete diagnostic expression at preprocessing
@@ -353,7 +361,20 @@ static void MRSaveNativeMyrtleHostWindowGeometry(UIWindow *window)
     MRScopedMyrtleHostWindow = window;
     MRNativeMyrtleHostWindowFrame = window.frame;
     MRNativeMyrtleHostWindowBounds = window.bounds;
+    UIView *rootView = window.rootViewController.view;
+    if ([rootView isKindOfClass:UIView.class]) {
+        MRScopedMyrtleHostRootView = rootView;
+        MRNativeMyrtleHostRootViewFrame = rootView.frame;
+        MRNativeMyrtleHostRootViewBounds = rootView.bounds;
+        MRNativeMyrtleHostRootViewAutoresizingMask = rootView.autoresizingMask;
+    }
     MRNativeMyrtleHostWindowGeometrySaved = YES;
+}
+
+static void MRResetMyrtleHostWindowGeometryCandidate(void)
+{
+    MRMyrtleHostWindowCandidateRect = CGRectZero;
+    MRMyrtleHostWindowCandidateCount = 0;
 }
 
 static void MRRestoreMyrtleHostWindowGeometry(void)
@@ -367,7 +388,12 @@ static void MRRestoreMyrtleHostWindowGeometry(void)
         [UIView performWithoutAnimation:^{
             window.bounds = MRNativeMyrtleHostWindowBounds;
             window.frame = MRNativeMyrtleHostWindowFrame;
-            [window layoutIfNeeded];
+            UIView *rootView = MRScopedMyrtleHostRootView ?: window.rootViewController.view;
+            if ([rootView isKindOfClass:UIView.class]) {
+                rootView.autoresizingMask = MRNativeMyrtleHostRootViewAutoresizingMask;
+                rootView.bounds = MRNativeMyrtleHostRootViewBounds;
+                rootView.frame = MRNativeMyrtleHostRootViewFrame;
+            }
         }];
     } @finally {
         MRMyrtleHostWindowGeometrySyncing = NO;
@@ -392,10 +418,25 @@ static void MRApplyMyrtleHostWindowGeometry(void)
     id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
     NSString *bundleID = MRSafeValue(manager, @"currentBundleID");
     UIView *hostView = MRSafeValue(manager, @"hostView");
+    UIView *splashContainer = MRSafeValue(manager, @"splashContainer");
+    BOOL isOperating = [MRSafeValue(manager, @"isOperating") boolValue];
 
     if (MRMyrtleHostedKeyboardVisible || bundleID.length == 0 ||
         ![hostView isKindOfClass:UIView.class] || hostView.window != window) {
         MRRestoreMyrtleHostWindowGeometry();
+        MRResetMyrtleHostWindowGeometryCandidate();
+        return;
+    }
+
+    // Myrtle creates and animates the card in the full-screen host context.
+    // Cropping that context while a cold-launch splash or an open/drag/resize
+    // operation is active freezes the gesture coordinate space at an
+    // intermediate frame. Leave Myrtle completely native until its own
+    // lifecycle reports a settled host.
+    if (isOperating || [splashContainer isKindOfClass:UIView.class]) {
+        MRRestoreMyrtleHostWindowGeometry();
+        MRResetMyrtleHostWindowGeometryCandidate();
+        MRScheduleMyrtleHostWindowGeometryFollowup();
         return;
     }
 
@@ -404,28 +445,56 @@ static void MRApplyMyrtleHostWindowGeometry(void)
     CGRect cropRect = CGRectIntersection(hostRect, screenBounds);
     if (!MRUsableMyrtleHostRect(cropRect, screenBounds)) {
         MRRestoreMyrtleHostWindowGeometry();
+        MRResetMyrtleHostWindowGeometryCandidate();
         return;
     }
 
+    // Require the visible card to be identical on two separated main-loop
+    // observations before changing the WindowServer context. This filters the
+    // one-frame cold-launch geometry without a permanent timer or poller.
+    if (!MRMyrtleHostWindowCropApplied) {
+        if (MRMyrtleHostWindowCandidateCount != 0 &&
+            MRRectsNearlyEqual(MRMyrtleHostWindowCandidateRect, cropRect)) {
+            MRMyrtleHostWindowCandidateCount++;
+        } else {
+            MRMyrtleHostWindowCandidateRect = cropRect;
+            MRMyrtleHostWindowCandidateCount = 1;
+        }
+        if (MRMyrtleHostWindowCandidateCount < 2) {
+            MRScheduleMyrtleHostWindowGeometryFollowup();
+            return;
+        }
+    }
+
     MRSaveNativeMyrtleHostWindowGeometry(window);
-    CGRect cropBounds = cropRect;
+    UIView *rootView = MRScopedMyrtleHostRootView ?: window.rootViewController.view;
+    CGRect cropBounds = CGRectMake(0.0, 0.0,
+                                   CGRectGetWidth(cropRect),
+                                   CGRectGetHeight(cropRect));
+    CGFloat offsetX = cropRect.origin.x - MRNativeMyrtleHostWindowFrame.origin.x;
+    CGFloat offsetY = cropRect.origin.y - MRNativeMyrtleHostWindowFrame.origin.y;
+    CGRect compensatedRootFrame = CGRectOffset(MRNativeMyrtleHostRootViewFrame,
+                                               -offsetX, -offsetY);
     BOOL alreadyApplied = MRMyrtleHostWindowCropApplied &&
         MRRectsNearlyEqual(window.frame, cropRect) &&
-        MRRectsNearlyEqual(window.bounds, cropBounds);
+        MRRectsNearlyEqual(window.bounds, cropBounds) &&
+        (![rootView isKindOfClass:UIView.class] ||
+         (MRRectsNearlyEqual(rootView.frame, compensatedRootFrame) &&
+          MRRectsNearlyEqual(rootView.bounds, MRNativeMyrtleHostRootViewBounds)));
     if (!alreadyApplied) {
         MRMyrtleHostWindowGeometrySyncing = YES;
         @try {
             [UIView performWithoutAnimation:^{
-                // Keep Myrtle's existing screen-coordinate content geometry by
-                // giving the cropped window the same bounds origin as its
-                // screen-space frame. Only its WindowServer hit region changes.
+                // Keep UIWindow's context conventional and compensate inside
+                // the root view. Myrtle's own full-screen coordinate system,
+                // cold-launch layout, drag and resize math remain unchanged.
                 window.bounds = cropBounds;
-                // UIWindow recomputes frame origin from its layer geometry
-                // when bounds carries a non-zero origin. Set frame last so
-                // the compositor region stays at Myrtle's original card
-                // position instead of being normalized to {0,0}.
                 window.frame = cropRect;
-                [window layoutIfNeeded];
+                if ([rootView isKindOfClass:UIView.class]) {
+                    rootView.autoresizingMask = UIViewAutoresizingNone;
+                    rootView.bounds = MRNativeMyrtleHostRootViewBounds;
+                    rootView.frame = compensatedRootFrame;
+                }
             }];
         } @finally {
             MRMyrtleHostWindowGeometrySyncing = NO;
@@ -435,9 +504,12 @@ static void MRApplyMyrtleHostWindowGeometry(void)
     if (MRMyrtleHostWindowGeometryTraceCount < 48) {
         MRMyrtleHostWindowGeometryTraceCount++;
         CGRect resolvedHost = MRVisibleMyrtleHostRectInScreen(hostView);
-        MRSceneRoutingTrace(@"hostGeometry crop n=%lu applied=%d host={%.1f,%.1f,%.1f,%.1f} target={%.1f,%.1f,%.1f,%.1f} frame={%.1f,%.1f,%.1f,%.1f} bounds={%.1f,%.1f,%.1f,%.1f} resolved={%.1f,%.1f,%.1f,%.1f}",
+        MRSceneRoutingTrace(@"hostGeometry crop n=%lu applied=%d operating=%d splash=%d stable=%lu host={%.1f,%.1f,%.1f,%.1f} target={%.1f,%.1f,%.1f,%.1f} frame={%.1f,%.1f,%.1f,%.1f} bounds={%.1f,%.1f,%.1f,%.1f} root={%.1f,%.1f,%.1f,%.1f} resolved={%.1f,%.1f,%.1f,%.1f}",
                             (unsigned long)MRMyrtleHostWindowGeometryTraceCount,
                             !alreadyApplied,
+                            isOperating,
+                            [splashContainer isKindOfClass:UIView.class],
+                            (unsigned long)MRMyrtleHostWindowCandidateCount,
                             hostRect.origin.x, hostRect.origin.y,
                             hostRect.size.width, hostRect.size.height,
                             cropRect.origin.x, cropRect.origin.y,
@@ -446,6 +518,8 @@ static void MRApplyMyrtleHostWindowGeometry(void)
                             window.frame.size.width, window.frame.size.height,
                             window.bounds.origin.x, window.bounds.origin.y,
                             window.bounds.size.width, window.bounds.size.height,
+                            rootView.frame.origin.x, rootView.frame.origin.y,
+                            rootView.frame.size.width, rootView.frame.size.height,
                             resolvedHost.origin.x, resolvedHost.origin.y,
                             resolvedHost.size.width, resolvedHost.size.height);
     }
@@ -458,6 +532,18 @@ static void MRScheduleMyrtleHostWindowGeometrySync(void)
     dispatch_async(dispatch_get_main_queue(), ^{
         MRMyrtleHostWindowGeometrySyncScheduled = NO;
         MRApplyMyrtleHostWindowGeometry();
+    });
+}
+
+static void MRScheduleMyrtleHostWindowGeometryFollowup(void)
+{
+    if (MRMyrtleHostWindowGeometryFollowupScheduled) return;
+    MRMyrtleHostWindowGeometryFollowupScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(0.12 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        MRMyrtleHostWindowGeometryFollowupScheduled = NO;
+        MRScheduleMyrtleHostWindowGeometrySync();
     });
 }
 
@@ -1161,6 +1247,37 @@ static BOOL MREnsureSwitcherCardAfterMyrtleClosed(NSString *bundleID,
 
 typedef void (*MRSetCurrentBundleIMP)(id, SEL, NSString *);
 static MRSetCurrentBundleIMP MROriginalSetCurrentBundle = NULL;
+typedef void (*MRSetManagerOperatingIMP)(id, SEL, BOOL);
+static MRSetManagerOperatingIMP MROriginalSetManagerOperating = NULL;
+typedef void (*MRSetManagerSplashIMP)(id, SEL, UIView *);
+static MRSetManagerSplashIMP MROriginalSetManagerSplash = NULL;
+
+static void MRHookSetManagerOperating(id self, SEL selector, BOOL operating)
+{
+    // Myrtle's native full-screen context is required throughout every open,
+    // close, drag and resize transaction. Restore it before the transaction
+    // starts, then crop only after Myrtle commits its settled geometry.
+    if (operating) {
+        MRRestoreMyrtleHostWindowGeometry();
+        MRResetMyrtleHostWindowGeometryCandidate();
+    }
+    MROriginalSetManagerOperating(self, selector, operating);
+    if (!operating) {
+        MRResetMyrtleHostWindowGeometryCandidate();
+        MRScheduleMyrtleHostWindowGeometrySync();
+        MRScheduleMyrtleHostWindowGeometryFollowup();
+    }
+}
+
+static void MRHookSetManagerSplash(id self, SEL selector, UIView *splash)
+{
+    MROriginalSetManagerSplash(self, selector, splash);
+    if (splash == nil) {
+        MRResetMyrtleHostWindowGeometryCandidate();
+        MRScheduleMyrtleHostWindowGeometrySync();
+        MRScheduleMyrtleHostWindowGeometryFollowup();
+    }
+}
 
 static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
 {
@@ -1213,6 +1330,7 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
     if (meaningfulTransition) transitionGeneration = ++MRReturnToMainGeneration;
     if (bundleID.length == 0 && previousBundleID.length != 0)
         MRRestoreMyrtleHostWindowGeometry();
+    MRResetMyrtleHostWindowGeometryCandidate();
     MROriginalSetCurrentBundle(self, selector, bundleID);
     MRScheduleMyrtleHostWindowGeometrySync();
     NSString *stableBundleID = [bundleID copy];
@@ -1696,15 +1814,34 @@ static void MRHookOpenSelectorAtPoint(id self, SEL selector, CGPoint centerPoint
 
 static BOOL MRInstallMyrtleHook(void)
 {
-    if (MROriginalSetCurrentBundle != NULL) return YES;
     Class cls = NSClassFromString(@"MyrtleHostManager");
-    SEL selector = NSSelectorFromString(@"setCurrentBundleID:");
-    Method method = class_getInstanceMethod(cls, selector);
-    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 3) return NO;
-    MSHookMessageEx(cls, selector, (IMP)MRHookSetCurrentBundle,
-                    (IMP *)&MROriginalSetCurrentBundle);
+    if (cls == Nil) return NO;
+
+    if (MROriginalSetCurrentBundle == NULL) {
+        SEL selector = NSSelectorFromString(@"setCurrentBundleID:");
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+        MSHookMessageEx(cls, selector, (IMP)MRHookSetCurrentBundle,
+                        (IMP *)&MROriginalSetCurrentBundle);
+    }
+    if (MROriginalSetManagerOperating == NULL) {
+        SEL selector = NSSelectorFromString(@"setIsOperating:");
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+        MSHookMessageEx(cls, selector, (IMP)MRHookSetManagerOperating,
+                        (IMP *)&MROriginalSetManagerOperating);
+    }
+    if (MROriginalSetManagerSplash == NULL) {
+        SEL selector = NSSelectorFromString(@"setSplashContainer:");
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method == NULL || method_getNumberOfArguments(method) != 3) return NO;
+        MSHookMessageEx(cls, selector, (IMP)MRHookSetManagerSplash,
+                        (IMP *)&MROriginalSetManagerSplash);
+    }
     MRLog(@"installed direct MyrtleHostManager hook");
-    return MROriginalSetCurrentBundle != NULL;
+    return MROriginalSetCurrentBundle != NULL &&
+        MROriginalSetManagerOperating != NULL &&
+        MROriginalSetManagerSplash != NULL;
 }
 
 static BOOL MRInstallMyrtleFullscreenHook(void)
