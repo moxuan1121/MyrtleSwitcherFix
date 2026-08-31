@@ -62,6 +62,9 @@ typedef void (*MRMyrtleOutsideActionIMP)(id, SEL);
 static MRMyrtleOutsideActionIMP MROriginalMyrtleOutsideAction = NULL;
 typedef UIView *(*MRMyrtleHostWindowHitTestIMP)(id, SEL, CGPoint, UIEvent *);
 static MRMyrtleHostWindowHitTestIMP MROriginalMyrtleHostWindowHitTest = NULL;
+typedef BOOL (*MRWindowBooleanGetterIMP)(id, SEL);
+static MRWindowBooleanGetterIMP MROriginalMyrtleMainUsesWindowServerHitTesting = NULL;
+static NSUInteger MRMyrtleMainWindowServerHitTestingTraceCount = 0;
 typedef void (*MRWindowLayoutSubviewsIMP)(id, SEL);
 static MRWindowLayoutSubviewsIMP MROriginalMyrtleHostWindowLayoutSubviews = NULL;
 static UIWindow *MRScopedMyrtleHostWindow = nil;
@@ -623,6 +626,29 @@ static UIView *MRHookMyrtleHostWindowHitTest(id self, SEL selector,
     // insufficient.  Derive the live visible card from Myrtle's own view tree.
     if (CGRectIsNull(hostRect)) return result;
     return CGRectContainsPoint(hostRect, screenPoint) ? result : nil;
+}
+
+static BOOL MRHookMyrtleMainUsesWindowServerHitTesting(id self, SEL selector)
+{
+    BOOL nativeValue = MROriginalMyrtleMainUsesWindowServerHitTesting == NULL
+        ? NO : MROriginalMyrtleMainUsesWindowServerHitTesting(self, selector);
+
+    // MyrtleWindow is the full-screen SpringBoard window that owns the handle
+    // and radial menu.  Its native hitTest already returns nil outside Myrtle's
+    // interactive regions, but without WindowServer hit testing that nil result
+    // is observed only after the event has been routed into SpringBoard.  Let
+    // WindowServer consult that region only while no hosted keyboard is shown.
+    // MyrtleHostWindow is deliberately left untouched so the hosted app remains
+    // interactive inside the visible card.
+    BOOL result = MRMyrtleHostedKeyboardVisible ? nativeValue : YES;
+    if (MRMyrtleMainWindowServerHitTestingTraceCount < 32) {
+        MRMyrtleMainWindowServerHitTestingTraceCount++;
+        MRSceneRoutingTrace(@"mainWindowServerHitTesting n=%lu keyboard=%d native=%d result=%d class=%@",
+                            (unsigned long)MRMyrtleMainWindowServerHitTestingTraceCount,
+                            MRMyrtleHostedKeyboardVisible, nativeValue, result,
+                            NSStringFromClass([self class]));
+    }
+    return result;
 }
 
 static id MRMainSwitcher(void)
@@ -2008,6 +2034,39 @@ static BOOL MRInstallMyrtleHostWindowGeometryHook(void)
     return installed;
 }
 
+static BOOL MRInstallMyrtleMainWindowServerHitTestingHook(void)
+{
+    if (MROriginalMyrtleMainUsesWindowServerHitTesting != NULL) return YES;
+
+    Class cls = NSClassFromString(@"MyrtleWindow");
+    SEL selector = NSSelectorFromString(@"_usesWindowServerHitTesting");
+    Method method = class_getInstanceMethod(cls, selector);
+    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 2)
+        return NO;
+
+    char returnType[16] = {};
+    method_getReturnType(method, returnType, sizeof(returnType));
+    if (returnType[0] != 'B' && returnType[0] != 'c') return NO;
+
+    IMP inheritedImplementation = method_getImplementation(method);
+    const char *types = method_getTypeEncoding(method);
+    if (class_addMethod(cls, selector,
+                        (IMP)MRHookMyrtleMainUsesWindowServerHitTesting, types)) {
+        MROriginalMyrtleMainUsesWindowServerHitTesting =
+            (MRWindowBooleanGetterIMP)inheritedImplementation;
+    } else {
+        MSHookMessageEx(cls, selector,
+                        (IMP)MRHookMyrtleMainUsesWindowServerHitTesting,
+                        (IMP *)&MROriginalMyrtleMainUsesWindowServerHitTesting);
+    }
+
+    BOOL installed = MROriginalMyrtleMainUsesWindowServerHitTesting != NULL;
+    MRSceneRoutingTrace(@"mainWindowServerHook installed=%d owner=%@",
+                        installed,
+                        NSStringFromClass(MRClassOwningInstanceSelector(cls, selector)));
+    return installed;
+}
+
 static BOOL MRInstallMyrtleHandleBoundaryHooks(void)
 {
     Class cls = NSClassFromString(@"MyrtleViewController");
@@ -2167,12 +2226,13 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL outsideActionGateInstalled = MRInstallMyrtleOutsideActionGateHook();
     BOOL hostPassThroughInstalled = MRInstallMyrtleHostWindowPassThroughHook();
     BOOL hostGeometryInstalled = MRInstallMyrtleHostWindowGeometryHook();
+    BOOL mainWindowServerInstalled = MRInstallMyrtleMainWindowServerHitTestingHook();
     BOOL handleBoundaryInstalled = MRInstallMyrtleHandleBoundaryHooks();
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
     BOOL actionDispatcherInstalled = MRInstallMyrtleActionDispatcherHook();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
         keyboardAvoidanceInstalled && outsideActionGateInstalled && hostPassThroughInstalled &&
-        hostGeometryInstalled &&
+        hostGeometryInstalled && mainWindowServerInstalled &&
         handleBoundaryInstalled &&
         selectorCenterInstalled && actionDispatcherInstalled) {
         MRSceneRoutingTrace(@"hooksReady attempt=%lu exactInstalled=%d owner=%@",
@@ -2183,11 +2243,11 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
         return;
     }
     if (attempt >= 60) {
-        MRSceneRoutingTrace(@"hooksFailed manager=%d fullscreen=%d hostCore=%d keyboard=%d outside=%d pass=%d geometry=%d boundary=%d selector=%d dispatcher=%d",
+        MRSceneRoutingTrace(@"hooksFailed manager=%d fullscreen=%d hostCore=%d keyboard=%d outside=%d pass=%d geometry=%d mainWS=%d boundary=%d selector=%d dispatcher=%d",
                             managerInstalled, fullscreenInstalled,
                             hostCoreLaunchInstalled, keyboardAvoidanceInstalled,
                             outsideActionGateInstalled, hostPassThroughInstalled,
-                            hostGeometryInstalled,
+                            hostGeometryInstalled, mainWindowServerInstalled,
                             handleBoundaryInstalled, selectorCenterInstalled,
                             actionDispatcherInstalled);
         MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d outsideAction=%d hostPassThrough=%d boundary=%d selectorCenter=%d",
@@ -2204,7 +2264,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         (void)unlink(MRSceneRoutingTracePath);
-        MRSceneRoutingTrace(@"start version=0.5.3.8~beta12 process=%@",
+        MRSceneRoutingTrace(@"start version=0.5.3.8~beta15 process=%@",
                             NSProcessInfo.processInfo.processName);
         dispatch_async(dispatch_get_main_queue(), ^{
             MRInstallSwitcherRemoveHook();
