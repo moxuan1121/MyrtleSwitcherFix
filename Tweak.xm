@@ -59,6 +59,8 @@ typedef void (*MRMyrtleSnapTransitionIMP)(id, SEL, BOOL);
 static MRMyrtleSnapTransitionIMP MROriginalMyrtleSnapTransition = NULL;
 typedef void (*MRAlphaLauncherLayoutSubviewsIMP)(id, SEL);
 static MRAlphaLauncherLayoutSubviewsIMP MROriginalAlphaLauncherLayoutSubviews = NULL;
+typedef void (*MRAlphaLauncherPresentIMP)(id, SEL, id);
+static MRAlphaLauncherPresentIMP MROriginalAlphaLauncherPresent = NULL;
 static NSUInteger MRMyrtleSnapTransitionGeneration = 0;
 static BOOL MRMyrtleSnapTransitionInFlight = NO;
 static UIWindow *MRScopedMyrtleHostWindow = nil;
@@ -304,6 +306,14 @@ static void MRLayoutVerticalAlphaLauncher(id controller)
 static void MRHookAlphaLauncherLayoutSubviews(id self, SEL selector)
 {
     MROriginalAlphaLauncherLayoutSubviews(self, selector);
+    MRLayoutVerticalAlphaLauncher(self);
+}
+
+static void MRHookAlphaLauncherPresent(id self, SEL selector, id parentController)
+{
+    MROriginalAlphaLauncherPresent(self, selector, parentController);
+    // Myrtle caches this controller. Reapply after every native presentation,
+    // including presentations that do not trigger another layout callback.
     MRLayoutVerticalAlphaLauncher(self);
 }
 
@@ -2066,17 +2076,11 @@ static BOOL MRInstallMyrtleSnapTransitionHook(void)
 
 static BOOL MRInstallVerticalAlphaLauncherHook(void)
 {
-    if (MROriginalAlphaLauncherLayoutSubviews != NULL) return YES;
+    if (MROriginalAlphaLauncherLayoutSubviews != NULL &&
+        MROriginalAlphaLauncherPresent != NULL) return YES;
 
     Class cls = NSClassFromString(@"MyrtleAlphaAppLauncherViewController");
-    SEL selector = @selector(viewDidLayoutSubviews);
-    Method method = class_getInstanceMethod(cls, selector);
-    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 2)
-        return NO;
-
-    char returnType[16] = {};
-    method_getReturnType(method, returnType, sizeof(returnType));
-    if (returnType[0] != 'v') return NO;
+    if (cls == Nil) return NO;
 
     NSArray<NSString *> *requiredSelectors = @[
         @"containerView", @"railView", @"railTopLabel",
@@ -2088,9 +2092,35 @@ static BOOL MRInstallVerticalAlphaLauncherHook(void)
             return NO;
     }
 
-    MSHookMessageEx(cls, selector, (IMP)MRHookAlphaLauncherLayoutSubviews,
-                    (IMP *)&MROriginalAlphaLauncherLayoutSubviews);
-    return MROriginalAlphaLauncherLayoutSubviews != NULL;
+    if (MROriginalAlphaLauncherLayoutSubviews == NULL) {
+        SEL layoutSelector = @selector(viewDidLayoutSubviews);
+        Method layoutMethod = class_getInstanceMethod(cls, layoutSelector);
+        if (layoutMethod == NULL || method_getNumberOfArguments(layoutMethod) != 2)
+            return NO;
+        char returnType[16] = {};
+        method_getReturnType(layoutMethod, returnType, sizeof(returnType));
+        if (returnType[0] != 'v') return NO;
+        MSHookMessageEx(cls, layoutSelector,
+                        (IMP)MRHookAlphaLauncherLayoutSubviews,
+                        (IMP *)&MROriginalAlphaLauncherLayoutSubviews);
+    }
+
+    if (MROriginalAlphaLauncherPresent == NULL) {
+        SEL presentSelector = NSSelectorFromString(@"MT_IlIIlIIIlIllllIlIlII:");
+        Method presentMethod = class_getInstanceMethod(cls, presentSelector);
+        if (presentMethod == NULL || method_getNumberOfArguments(presentMethod) != 3)
+            return NO;
+        char returnType[16] = {};
+        char argumentType[16] = {};
+        method_getReturnType(presentMethod, returnType, sizeof(returnType));
+        method_getArgumentType(presentMethod, 2, argumentType, sizeof(argumentType));
+        if (returnType[0] != 'v' || argumentType[0] != '@') return NO;
+        MSHookMessageEx(cls, presentSelector, (IMP)MRHookAlphaLauncherPresent,
+                        (IMP *)&MROriginalAlphaLauncherPresent);
+    }
+
+    return MROriginalAlphaLauncherLayoutSubviews != NULL &&
+        MROriginalAlphaLauncherPresent != NULL;
 }
 
 static BOOL MRInstallMyrtleHandleBoundaryHooks(void)
