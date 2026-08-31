@@ -78,6 +78,7 @@ static BOOL MRMyrtleHostWindowGeometrySyncScheduled = NO;
 static BOOL MRMyrtleHostWindowGeometryFollowupScheduled = NO;
 static CGRect MRMyrtleHostWindowCandidateRect = {{0.0, 0.0}, {0.0, 0.0}};
 static NSUInteger MRMyrtleHostWindowCandidateCount = 0;
+static CGRect MRMyrtleHostWindowActiveCropRect = {{0.0, 0.0}, {0.0, 0.0}};
 static NSUInteger MRMyrtleHostWindowGeometryTraceCount = 0;
 typedef NSInteger (*MRIntegerValueIMP)(id, SEL);
 static Class MRMyrtleTapOutsideValueOwnerClass = Nil;
@@ -375,6 +376,7 @@ static void MRResetMyrtleHostWindowGeometryCandidate(void)
 {
     MRMyrtleHostWindowCandidateRect = CGRectZero;
     MRMyrtleHostWindowCandidateCount = 0;
+    MRMyrtleHostWindowActiveCropRect = CGRectZero;
 }
 
 static void MRRestoreMyrtleHostWindowGeometry(void)
@@ -441,8 +443,22 @@ static void MRApplyMyrtleHostWindowGeometry(void)
     }
 
     CGRect screenBounds = UIScreen.mainScreen.bounds;
-    CGRect hostRect = MRVisibleMyrtleHostRectInScreen(hostView);
-    CGRect cropRect = CGRectIntersection(hostRect, screenBounds);
+    CGRect hostRect = CGRectNull;
+    CGRect cropRect = CGRectNull;
+    if (MRMyrtleHostWindowCropApplied &&
+        MRUsableMyrtleHostRect(MRMyrtleHostWindowActiveCropRect, screenBounds)) {
+        // Once the card has been cropped, its hierarchy is expressed through
+        // our compensated root coordinates. Re-reading that hierarchy as if it
+        // were still native caused beta13's second crop to expand from
+        // {46.6,66.6,381.4,792.8} to almost the whole screen. Keep the verified
+        // native card rect immutable until Myrtle starts a real operation; the
+        // setIsOperating:/splash/currentBundle hooks restore and invalidate it.
+        hostRect = MRMyrtleHostWindowActiveCropRect;
+        cropRect = MRMyrtleHostWindowActiveCropRect;
+    } else {
+        hostRect = MRVisibleMyrtleHostRectInScreen(hostView);
+        cropRect = CGRectIntersection(hostRect, screenBounds);
+    }
     if (!MRUsableMyrtleHostRect(cropRect, screenBounds)) {
         MRRestoreMyrtleHostWindowGeometry();
         MRResetMyrtleHostWindowGeometryCandidate();
@@ -499,6 +515,7 @@ static void MRApplyMyrtleHostWindowGeometry(void)
         } @finally {
             MRMyrtleHostWindowGeometrySyncing = NO;
         }
+        MRMyrtleHostWindowActiveCropRect = cropRect;
         MRMyrtleHostWindowCropApplied = YES;
     }
     if (MRMyrtleHostWindowGeometryTraceCount < 48) {
