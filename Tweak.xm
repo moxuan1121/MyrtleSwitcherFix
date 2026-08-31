@@ -6,11 +6,10 @@
 #import <math.h>
 
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
-// MyrtleHostWindow's own hitTest:withEvent: dispatches this no-argument
-// controller method for an unclaimed point outside the hosted card.  Reuse
-// the same entry point when the foreground application's routing view would
-// otherwise swallow that point.
-static NSString *const MROutsideTapSelector = @"MT_IlllIIIIlIlIIIIIlIll";
+// Myrtle's controller-level host-close completion path.  Unlike the generic
+// configurable outside-action dispatcher, this path closes the active host
+// and synchronizes isWindowOpen, bundle, snap and selector-centre state.
+static NSString *const MRControllerCloseSelector = @"MT_llIIIlllIIIllIllllIl:";
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
 static __strong NSString *MRUnderlyingMainBundleID = nil;
 static __strong NSString *MRMyrtleFullscreenIntentBundleID = nil;
@@ -39,6 +38,8 @@ static __strong NSString *MRHomePageGuardBundleID = nil;
 static __weak UIScrollView *MRHomePageGuardScrollView = nil;
 static __strong NSMutableArray<UIControl *> *MROutsideKeyboardTapCatchers = nil;
 static const void *MROutsideKeyboardTapCatcherKey = &MROutsideKeyboardTapCatcherKey;
+static BOOL MROutsideCloseShieldActive = NO;
+static NSUInteger MROutsideCloseShieldGeneration = 0;
 
 typedef void (*MRSetContentOffsetAnimatedIMP)(id, SEL, CGPoint, BOOL);
 static MRSetContentOffsetAnimatedIMP MROriginalSetContentOffsetAnimated = NULL;
@@ -68,6 +69,7 @@ static id MRSendClassNoArgs(NSString *className, NSString *selectorName)
 }
 
 static void MRDeactivateOutsideKeyboardTapCatcher(void);
+static void MRForceDeactivateOutsideKeyboardTapCatcher(void);
 
 static BOOL MRUsableProtectedHostRect(CGRect rect, CGRect screenBounds)
 {
@@ -139,6 +141,7 @@ static BOOL MRScreenPointInsideView(CGPoint screenPoint, id object, CGFloat padd
 @interface MROutsideKeyboardTapControl : UIControl
 @property (nonatomic, weak) id myrtleController;
 @property (nonatomic, assign) CGFloat keyboardTopInScreen;
+@property (nonatomic, assign) BOOL closingShield;
 @end
 
 @implementation MROutsideKeyboardTapControl
@@ -147,6 +150,11 @@ static BOOL MRScreenPointInsideView(CGPoint screenPoint, id object, CGFloat padd
 {
     if (![super pointInside:point withEvent:event] || self.hidden || !self.enabled)
         return NO;
+
+    // Keep the closing touch and any transition-time re-hit tests inside
+    // Myrtle's overlay windows until the host/keyboard animation has settled.
+    // This state is armed only by an accepted outside tap and lasts 0.45 s.
+    if (self.closingShield) return YES;
 
     id controller = self.myrtleController;
     if (controller == nil || ![MRSafeValue(controller, @"isWindowOpen") boolValue])
@@ -182,19 +190,36 @@ static BOOL MRScreenPointInsideView(CGPoint screenPoint, id object, CGFloat padd
 - (void)mr_closeMyrtleWindowFromOutsideTap:(__unused id)sender
 {
     id controller = self.myrtleController;
-    SEL outsideTapSelector = NSSelectorFromString(MROutsideTapSelector);
-    Method outsideTapMethod = controller == nil ? NULL :
-        class_getInstanceMethod([controller class], outsideTapSelector);
-    if (outsideTapMethod == NULL || method_getNumberOfArguments(outsideTapMethod) != 2)
-        return;
+    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+    NSString *bundleID = MRSafeValue(manager, @"currentBundleID");
+    SEL closeSelector = NSSelectorFromString(MRControllerCloseSelector);
+    Method closeMethod = controller == nil ? NULL :
+        class_getInstanceMethod([controller class], closeSelector);
+    if (bundleID.length == 0 || closeMethod == NULL ||
+        method_getNumberOfArguments(closeMethod) != 3) return;
 
-    // This is Myrtle's native outside-window action, not its internal
-    // close-completion notification.  It owns debounce, configured outside
-    // behavior, host teardown and all controller state broadcasts.  Since the
-    // current UIControl remains the touch target for the complete sequence,
-    // the Home Screen icon/widget below cannot receive this same tap.
-    ((void (*)(id, SEL))objc_msgSend)(controller, outsideTapSelector);
-    MRDeactivateOutsideKeyboardTapCatcher();
+    MROutsideCloseShieldActive = YES;
+    NSUInteger generation = ++MROutsideCloseShieldGeneration;
+    for (MROutsideKeyboardTapControl *catcher in
+         [MROutsideKeyboardTapCatchers copy]) {
+        catcher.closingShield = YES;
+        catcher.hidden = NO;
+        catcher.enabled = YES;
+    }
+
+    ((void (*)(id, SEL, id))objc_msgSend)(controller, closeSelector, nil);
+
+    // Keyboard/host teardown can perform another hit test after the close
+    // callback.  Preserve the transparent consumers for one short transition
+    // window, then remove them deterministically.  No timer repeats and no
+    // state is sampled in the background.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(0.45 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (generation != MROutsideCloseShieldGeneration) return;
+        MROutsideCloseShieldActive = NO;
+        MRForceDeactivateOutsideKeyboardTapCatcher();
+    });
 }
 
 @end
@@ -202,6 +227,10 @@ static BOOL MRScreenPointInsideView(CGPoint screenPoint, id object, CGFloat padd
 
 static void MRActivateOutsideKeyboardTapCatcher(id controller, CGRect keyboardFrame)
 {
+    // Ignore keyboard frame churn emitted by the host while an accepted close
+    // is completing; rebuilding here would tear down the short-lived shield.
+    if (MROutsideCloseShieldActive) return;
+
     if (controller == nil || ![MRSafeValue(controller, @"isWindowOpen") boolValue]) {
         MRDeactivateOutsideKeyboardTapCatcher();
         return;
@@ -248,6 +277,7 @@ static void MRActivateOutsideKeyboardTapCatcher(id controller, CGRect keyboardFr
         [catcher removeFromSuperview];
         catcher.myrtleController = controller;
         catcher.keyboardTopInScreen = CGRectGetMinY(keyboardFrame);
+        catcher.closingShield = NO;
         catcher.frame = rootView.bounds;
         catcher.autoresizingMask = UIViewAutoresizingFlexibleWidth |
                                    UIViewAutoresizingFlexibleHeight;
@@ -260,10 +290,17 @@ static void MRActivateOutsideKeyboardTapCatcher(id controller, CGRect keyboardFr
 
 static void MRDeactivateOutsideKeyboardTapCatcher(void)
 {
+    if (MROutsideCloseShieldActive) return;
+    MRForceDeactivateOutsideKeyboardTapCatcher();
+}
+
+static void MRForceDeactivateOutsideKeyboardTapCatcher(void)
+{
     for (MROutsideKeyboardTapControl *catcher in
          [MROutsideKeyboardTapCatchers copy]) {
         catcher.enabled = NO;
         catcher.hidden = YES;
+        catcher.closingShield = NO;
         catcher.myrtleController = nil;
         [catcher removeFromSuperview];
     }
