@@ -16,10 +16,9 @@ static NSUInteger MRMyrtleFullscreenIntentGeneration = 0;
 static NSTimeInterval MRRecentlyClosedMyrtleTime = 0;
 static const CGFloat MRFixedPortraitKeyboardHeight = 360.0;
 static const CGFloat MRKeyboardHandleGap = 18.0;
-// iPhone 13 Pro Max is 428 x 926 pt.  The second reference screenshot places
-// the handle at approximately y=544 pt.  A 546 pt ceiling leaves the radial
-// selector's lowest item above the 34 pt Home-indicator safe area.
-static const CGFloat MRPortraitHandleMaximumCenterY = 546.0;
+// Final iPhone 13 Pro Max reference: keep the handle center at or above 720 pt
+// on both screen edges so the expanded radial selector remains fully visible.
+static const CGFloat MRPortraitHandleMaximumCenterY = 720.0;
 static BOOL MRForegroundReloadInFlight = NO;
 static __strong NSString *MRForegroundReloadCandidateBundleID = nil;
 static NSUInteger MRForegroundReloadCandidateGeneration = 0;
