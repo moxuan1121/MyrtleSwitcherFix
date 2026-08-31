@@ -1,6 +1,6 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.5.3.8~diag5
+Version: 0.5.3.8~beta5
 Architecture: iphoneos-arm64e
 Description: Diagnostic iOS 15 RootHide build tracing Myrtle native no-keyboard pass-through call-site matching and keyboard-state transitions.
 Maintainer: Local
