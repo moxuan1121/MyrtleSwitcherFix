@@ -57,6 +57,8 @@ typedef void (*MRMyrtleHostGestureIMP)(id, SEL, UIGestureRecognizer *);
 static MRMyrtleHostGestureIMP MROriginalMyrtleHostGesture = NULL;
 typedef void (*MRMyrtleSnapTransitionIMP)(id, SEL, BOOL);
 static MRMyrtleSnapTransitionIMP MROriginalMyrtleSnapTransition = NULL;
+typedef void (*MRAlphaLauncherLayoutSubviewsIMP)(id, SEL);
+static MRAlphaLauncherLayoutSubviewsIMP MROriginalAlphaLauncherLayoutSubviews = NULL;
 static NSUInteger MRMyrtleSnapTransitionGeneration = 0;
 static BOOL MRMyrtleSnapTransitionInFlight = NO;
 static UIWindow *MRScopedMyrtleHostWindow = nil;
@@ -187,6 +189,122 @@ static id MRSafeValue(id object, NSString *key)
     if (object == nil || key.length == 0) return nil;
     @try { return [object valueForKey:key]; }
     @catch (__unused NSException *exception) { return nil; }
+}
+
+static CGFloat MRPixelAligned(CGFloat value)
+{
+    CGFloat scale = UIScreen.mainScreen.scale;
+    if (scale <= 0.0 || !isfinite(scale)) scale = 1.0;
+    return round(value * scale) / scale;
+}
+
+// Myrtle 1.4.1 already implements letter filtering, rail gestures, grid-pan
+// highlighting, auto scrolling, activation, dismissal, icon caching and
+// haptics. Keep those native paths and replace only their existing geometry.
+static void MRLayoutVerticalAlphaLauncher(id controller)
+{
+    UIView *rootView = MRSafeValue(controller, @"view");
+    UIView *containerView = MRSafeValue(controller, @"containerView");
+    UIView *railView = MRSafeValue(controller, @"railView");
+    UICollectionView *collectionView = MRSafeValue(controller, @"collectionView");
+    UILabel *topLabel = MRSafeValue(controller, @"railTopLabel");
+    UILabel *currentLabel = MRSafeValue(controller, @"currentLetterLabel");
+    UILabel *bottomLabel = MRSafeValue(controller, @"railBottomLabel");
+    if (![rootView isKindOfClass:UIView.class] ||
+        ![containerView isKindOfClass:UIView.class] ||
+        ![railView isKindOfClass:UIView.class] ||
+        ![collectionView isKindOfClass:UICollectionView.class]) return;
+
+    CGRect bounds = rootView.bounds;
+    CGFloat rootWidth = CGRectGetWidth(bounds);
+    CGFloat rootHeight = CGRectGetHeight(bounds);
+    if (!isfinite(rootWidth) || !isfinite(rootHeight) ||
+        rootWidth < 160.0 || rootHeight < 280.0) return;
+
+    UIEdgeInsets safeInsets = rootView.safeAreaInsets;
+    CGFloat safeTop = CGRectGetMinY(bounds) + MAX(0.0, safeInsets.top);
+    CGFloat safeBottom = CGRectGetMaxY(bounds) - MAX(0.0, safeInsets.bottom);
+    CGFloat safeRight = CGRectGetMaxX(bounds) - MAX(0.0, safeInsets.right);
+    CGFloat availableHeight = MAX(0.0, safeBottom - safeTop);
+
+    // The approved iPhone 13 Pro Max design is 116 x 680 pt. Adapt down for
+    // smaller displays and landscape bounds without changing the interaction.
+    CGFloat stripWidth = MIN(116.0, MAX(88.0, rootWidth - 32.0));
+    CGFloat stripHeight = MIN(680.0, MAX(240.0, availableHeight - 24.0));
+    stripHeight = MIN(stripHeight, availableHeight);
+    CGFloat rightMargin = MIN(16.0, MAX(8.0, rootWidth * 0.04));
+    CGFloat stripX = safeRight - rightMargin - stripWidth;
+    CGFloat stripY = safeTop + MAX(0.0, (availableHeight - stripHeight) * 0.5);
+    containerView.frame = CGRectMake(MRPixelAligned(stripX), MRPixelAligned(stripY),
+                                     MRPixelAligned(stripWidth), MRPixelAligned(stripHeight));
+    containerView.layer.cornerRadius = MIN(30.0, stripWidth * 0.27);
+    if ([containerView.layer respondsToSelector:@selector(setCornerCurve:)])
+        containerView.layer.cornerCurve = @"continuous";
+    // Preserve a strict hit-test and clipping boundary. Myrtle's overlay owns
+    // the presentation shadow; the content container must not leak cells past
+    // its rounded strip while it scrolls.
+    containerView.clipsToBounds = YES;
+
+    CGFloat innerTop = 16.0;
+    CGFloat innerBottom = 16.0;
+    CGFloat railX = 8.0;
+    CGFloat railWidth = 25.0;
+    CGFloat contentGap = 4.0;
+    CGFloat contentRight = 8.0;
+    CGFloat innerHeight = MAX(1.0, stripHeight - innerTop - innerBottom);
+    railView.frame = CGRectMake(railX, innerTop, railWidth, innerHeight);
+    railView.layer.cornerRadius = railWidth * 0.5;
+    if ([railView.layer respondsToSelector:@selector(setCornerCurve:)])
+        railView.layer.cornerCurve = @"continuous";
+    railView.layer.masksToBounds = YES;
+
+    CGFloat currentHeight = MIN(46.0, innerHeight * 0.18);
+    CGFloat surroundingHeight = MAX(0.0, (innerHeight - currentHeight) * 0.5);
+    if ([topLabel isKindOfClass:UILabel.class]) {
+        topLabel.frame = CGRectMake(0.0, 0.0, railWidth, surroundingHeight);
+        topLabel.numberOfLines = 0;
+        topLabel.textAlignment = NSTextAlignmentCenter;
+    }
+    if ([currentLabel isKindOfClass:UILabel.class]) {
+        currentLabel.frame = CGRectMake(0.0, surroundingHeight, railWidth, currentHeight);
+        currentLabel.textAlignment = NSTextAlignmentCenter;
+        currentLabel.font = [UIFont systemFontOfSize:22.0 weight:UIFontWeightSemibold];
+    }
+    if ([bottomLabel isKindOfClass:UILabel.class]) {
+        bottomLabel.frame = CGRectMake(0.0, surroundingHeight + currentHeight,
+                                       railWidth, surroundingHeight);
+        bottomLabel.numberOfLines = 0;
+        bottomLabel.textAlignment = NSTextAlignmentCenter;
+    }
+
+    CGFloat collectionX = railX + railWidth + contentGap;
+    CGFloat collectionWidth = MAX(44.0, stripWidth - collectionX - contentRight);
+    collectionView.frame = CGRectMake(collectionX, innerTop,
+                                      collectionWidth, innerHeight);
+    collectionView.backgroundColor = UIColor.clearColor;
+    collectionView.alwaysBounceVertical = YES;
+    collectionView.showsVerticalScrollIndicator = NO;
+    collectionView.showsHorizontalScrollIndicator = NO;
+
+    UICollectionViewLayout *layout = collectionView.collectionViewLayout;
+    if ([layout isKindOfClass:UICollectionViewFlowLayout.class]) {
+        UICollectionViewFlowLayout *flowLayout = (UICollectionViewFlowLayout *)layout;
+        CGFloat itemSide = MIN(64.0, MAX(44.0, collectionWidth - 8.0));
+        CGFloat horizontalInset = MAX(0.0, (collectionWidth - itemSide) * 0.5);
+        flowLayout.scrollDirection = UICollectionViewScrollDirectionVertical;
+        flowLayout.itemSize = CGSizeMake(itemSide, itemSide);
+        flowLayout.minimumInteritemSpacing = 0.0;
+        flowLayout.minimumLineSpacing = 10.0;
+        flowLayout.sectionInset = UIEdgeInsetsMake(8.0, horizontalInset,
+                                                   8.0, horizontalInset);
+        [flowLayout invalidateLayout];
+    }
+}
+
+static void MRHookAlphaLauncherLayoutSubviews(id self, SEL selector)
+{
+    MROriginalAlphaLauncherLayoutSubviews(self, selector);
+    MRLayoutVerticalAlphaLauncher(self);
 }
 
 static id MRSendClassNoArgs(NSString *className, NSString *selectorName)
@@ -1946,6 +2064,35 @@ static BOOL MRInstallMyrtleSnapTransitionHook(void)
     return MROriginalMyrtleSnapTransition != NULL;
 }
 
+static BOOL MRInstallVerticalAlphaLauncherHook(void)
+{
+    if (MROriginalAlphaLauncherLayoutSubviews != NULL) return YES;
+
+    Class cls = NSClassFromString(@"MyrtleAlphaAppLauncherViewController");
+    SEL selector = @selector(viewDidLayoutSubviews);
+    Method method = class_getInstanceMethod(cls, selector);
+    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 2)
+        return NO;
+
+    char returnType[16] = {};
+    method_getReturnType(method, returnType, sizeof(returnType));
+    if (returnType[0] != 'v') return NO;
+
+    NSArray<NSString *> *requiredSelectors = @[
+        @"containerView", @"railView", @"railTopLabel",
+        @"currentLetterLabel", @"railBottomLabel", @"collectionView",
+        @"handleRailPan:", @"handleGridPan:"
+    ];
+    for (NSString *selectorName in requiredSelectors) {
+        if (class_getInstanceMethod(cls, NSSelectorFromString(selectorName)) == NULL)
+            return NO;
+    }
+
+    MSHookMessageEx(cls, selector, (IMP)MRHookAlphaLauncherLayoutSubviews,
+                    (IMP *)&MROriginalAlphaLauncherLayoutSubviews);
+    return MROriginalAlphaLauncherLayoutSubviews != NULL;
+}
+
 static BOOL MRInstallMyrtleHandleBoundaryHooks(void)
 {
     Class cls = NSClassFromString(@"MyrtleViewController");
@@ -2107,13 +2254,14 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL hostGeometryInstalled = MRInstallMyrtleHostWindowGeometryHook();
     BOOL hostGestureInstalled = MRInstallMyrtleHostGestureHook();
     BOOL hostSnapInstalled = MRInstallMyrtleSnapTransitionHook();
+    BOOL verticalAlphaLauncherInstalled = MRInstallVerticalAlphaLauncherHook();
     BOOL handleBoundaryInstalled = MRInstallMyrtleHandleBoundaryHooks();
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
     BOOL actionDispatcherInstalled = MRInstallMyrtleActionDispatcherHook();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
         keyboardAvoidanceInstalled && outsideActionGateInstalled && hostPassThroughInstalled &&
         hostGeometryInstalled && hostGestureInstalled && hostSnapInstalled &&
-        handleBoundaryInstalled &&
+        verticalAlphaLauncherInstalled && handleBoundaryInstalled &&
         selectorCenterInstalled && actionDispatcherInstalled) {
         return;
     }
