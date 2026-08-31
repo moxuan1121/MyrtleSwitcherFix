@@ -6,7 +6,11 @@
 #import <math.h>
 
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
-static NSString *const MRControllerCloseSelector = @"MT_llIIIlllIIIllIllllIl:";
+// MyrtleHostWindow's own hitTest:withEvent: dispatches this no-argument
+// controller method for an unclaimed point outside the hosted card.  Reuse
+// the same entry point when the foreground application's routing view would
+// otherwise swallow that point.
+static NSString *const MROutsideTapSelector = @"MT_IlllIIIIlIlIIIIIlIll";
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
 static __strong NSString *MRUnderlyingMainBundleID = nil;
 static __strong NSString *MRMyrtleFullscreenIntentBundleID = nil;
@@ -178,21 +182,19 @@ static BOOL MRScreenPointInsideView(CGPoint screenPoint, id object, CGFloat padd
 - (void)mr_closeMyrtleWindowFromOutsideTap:(__unused id)sender
 {
     id controller = self.myrtleController;
-    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
-    NSString *bundleID = MRSafeValue(manager, @"currentBundleID");
-    SEL closeSelector = NSSelectorFromString(MRControllerCloseSelector);
-    Method closeMethod = controller == nil ? NULL :
-        class_getInstanceMethod([controller class], closeSelector);
-    if (bundleID.length == 0 || closeMethod == NULL ||
-        method_getNumberOfArguments(closeMethod) != 3) return;
+    SEL outsideTapSelector = NSSelectorFromString(MROutsideTapSelector);
+    Method outsideTapMethod = controller == nil ? NULL :
+        class_getInstanceMethod([controller class], outsideTapSelector);
+    if (outsideTapMethod == NULL || method_getNumberOfArguments(outsideTapMethod) != 2)
+        return;
 
-    // Disable first so the same physical tap cannot fall through and launch a
-    // Home Screen icon while Myrtle performs its close animation.  Then use
-    // MyrtleViewController's own close-notification handler: unlike calling
-    // MyrtleHostManager directly, it also clears isWindowOpen/current bundle,
-    // resets snap status and refreshes the handle/selector center icon.
+    // This is Myrtle's native outside-window action, not its internal
+    // close-completion notification.  It owns debounce, configured outside
+    // behavior, host teardown and all controller state broadcasts.  Since the
+    // current UIControl remains the touch target for the complete sequence,
+    // the Home Screen icon/widget below cannot receive this same tap.
+    ((void (*)(id, SEL))objc_msgSend)(controller, outsideTapSelector);
     MRDeactivateOutsideKeyboardTapCatcher();
-    ((void (*)(id, SEL, id))objc_msgSend)(controller, closeSelector, nil);
 }
 
 @end
