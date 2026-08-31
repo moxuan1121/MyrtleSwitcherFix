@@ -67,6 +67,7 @@ static MRWindowLayoutSubviewsIMP MROriginalMyrtleHostWindowLayoutSubviews = NULL
 static UIWindow *MRScopedMyrtleHostWindow = nil;
 static CGRect MRNativeMyrtleHostWindowFrame = {{0.0, 0.0}, {0.0, 0.0}};
 static CGRect MRNativeMyrtleHostWindowBounds = {{0.0, 0.0}, {0.0, 0.0}};
+static BOOL MRNativeMyrtleHostWindowClipsToBounds = NO;
 static __weak UIView *MRScopedMyrtleHostRootView = nil;
 static CGRect MRNativeMyrtleHostRootViewFrame = {{0.0, 0.0}, {0.0, 0.0}};
 static CGRect MRNativeMyrtleHostRootViewBounds = {{0.0, 0.0}, {0.0, 0.0}};
@@ -362,6 +363,7 @@ static void MRSaveNativeMyrtleHostWindowGeometry(UIWindow *window)
     MRScopedMyrtleHostWindow = window;
     MRNativeMyrtleHostWindowFrame = window.frame;
     MRNativeMyrtleHostWindowBounds = window.bounds;
+    MRNativeMyrtleHostWindowClipsToBounds = window.clipsToBounds;
     UIView *rootView = window.rootViewController.view;
     if ([rootView isKindOfClass:UIView.class]) {
         MRScopedMyrtleHostRootView = rootView;
@@ -390,6 +392,7 @@ static void MRRestoreMyrtleHostWindowGeometry(void)
         [UIView performWithoutAnimation:^{
             window.bounds = MRNativeMyrtleHostWindowBounds;
             window.frame = MRNativeMyrtleHostWindowFrame;
+            window.clipsToBounds = MRNativeMyrtleHostWindowClipsToBounds;
             UIView *rootView = MRScopedMyrtleHostRootView ?: window.rootViewController.view;
             if ([rootView isKindOfClass:UIView.class]) {
                 rootView.autoresizingMask = MRNativeMyrtleHostRootViewAutoresizingMask;
@@ -494,6 +497,7 @@ static void MRApplyMyrtleHostWindowGeometry(void)
     BOOL alreadyApplied = MRMyrtleHostWindowCropApplied &&
         MRRectsNearlyEqual(window.frame, cropRect) &&
         MRRectsNearlyEqual(window.bounds, cropBounds) &&
+        window.clipsToBounds &&
         (![rootView isKindOfClass:UIView.class] ||
          (MRRectsNearlyEqual(rootView.frame, compensatedRootFrame) &&
           MRRectsNearlyEqual(rootView.bounds, MRNativeMyrtleHostRootViewBounds)));
@@ -506,6 +510,13 @@ static void MRApplyMyrtleHostWindowGeometry(void)
                 // cold-launch layout, drag and resize math remain unchanged.
                 window.bounds = cropBounds;
                 window.frame = cropRect;
+                // beta11 proved that a genuinely card-sized host context lets
+                // WindowServer route touches outside the card to the full-screen
+                // app. Later root-coordinate compensation repaired the visual
+                // position but allowed the full-screen root subtree to extend
+                // beyond the cropped UIWindow again. Clip at the UIWindow
+                // boundary so that compensation cannot enlarge its hit region.
+                window.clipsToBounds = YES;
                 if ([rootView isKindOfClass:UIView.class]) {
                     rootView.autoresizingMask = UIViewAutoresizingNone;
                     rootView.bounds = MRNativeMyrtleHostRootViewBounds;
@@ -521,12 +532,13 @@ static void MRApplyMyrtleHostWindowGeometry(void)
     if (MRMyrtleHostWindowGeometryTraceCount < 48) {
         MRMyrtleHostWindowGeometryTraceCount++;
         CGRect resolvedHost = MRVisibleMyrtleHostRectInScreen(hostView);
-        MRSceneRoutingTrace(@"hostGeometry crop n=%lu applied=%d operating=%d splash=%d stable=%lu host={%.1f,%.1f,%.1f,%.1f} target={%.1f,%.1f,%.1f,%.1f} frame={%.1f,%.1f,%.1f,%.1f} bounds={%.1f,%.1f,%.1f,%.1f} root={%.1f,%.1f,%.1f,%.1f} resolved={%.1f,%.1f,%.1f,%.1f}",
+        MRSceneRoutingTrace(@"hostGeometry crop n=%lu applied=%d operating=%d splash=%d stable=%lu clip=%d host={%.1f,%.1f,%.1f,%.1f} target={%.1f,%.1f,%.1f,%.1f} frame={%.1f,%.1f,%.1f,%.1f} bounds={%.1f,%.1f,%.1f,%.1f} root={%.1f,%.1f,%.1f,%.1f} resolved={%.1f,%.1f,%.1f,%.1f}",
                             (unsigned long)MRMyrtleHostWindowGeometryTraceCount,
                             !alreadyApplied,
                             isOperating,
                             [splashContainer isKindOfClass:UIView.class],
                             (unsigned long)MRMyrtleHostWindowCandidateCount,
+                            window.clipsToBounds,
                             hostRect.origin.x, hostRect.origin.y,
                             hostRect.size.width, hostRect.size.height,
                             cropRect.origin.x, cropRect.origin.y,
@@ -2204,7 +2216,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     @autoreleasepool {
         (void)unlink(MRSceneRoutingTracePath);
-        MRSceneRoutingTrace(@"start version=0.5.3.8~beta12 process=%@",
+        MRSceneRoutingTrace(@"start version=0.5.3.8~beta16 process=%@",
                             NSProcessInfo.processInfo.processName);
         dispatch_async(dispatch_get_main_queue(), ^{
             MRInstallSwitcherRemoveHook();

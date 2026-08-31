@@ -1,8 +1,8 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.5.3.8~beta14
+Version: 0.5.3.8~beta16
 Architecture: iphoneos-arm64e
-Description: iOS 15 RootHide beta locking MyrtleHostWindow's verified native card hit region until a real Myrtle lifecycle operation, with root-view coordinate compensation and keyboard-only outside close.
+Description: iOS 15 RootHide diagnostic beta clipping MyrtleHostWindow's compensated full-screen root at the verified native card boundary, preserving card position while restoring outside routing to the full-screen app.
 Maintainer: Local
 Author: Local
 Section: Tweaks
