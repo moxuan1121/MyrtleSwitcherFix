@@ -3,7 +3,12 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <substrate.h>
+#import <dlfcn.h>
 #import <math.h>
+#import <stdlib.h>
+#if __has_include(<ptrauth.h>)
+#import <ptrauth.h>
+#endif
 
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
@@ -44,10 +49,142 @@ typedef void (*MRMyrtleOutsideActionIMP)(id, SEL);
 static MRMyrtleOutsideActionIMP MROriginalMyrtleOutsideAction = NULL;
 typedef UIView *(*MRMyrtleHostWindowHitTestIMP)(id, SEL, CGPoint, UIEvent *);
 static MRMyrtleHostWindowHitTestIMP MROriginalMyrtleHostWindowHitTest = NULL;
+typedef NSInteger (*MRNSNumberIntegerValueIMP)(id, SEL);
+typedef struct {
+    Class ownerClass;
+    MRNSNumberIntegerValueIMP original;
+} MRNSNumberIntegerValueHookRecord;
+static MRNSNumberIntegerValueHookRecord MRNSNumberIntegerValueHooks[8] = {};
+static NSUInteger MRNSNumberIntegerValueHookCount = 0;
+static uintptr_t MRMyrtleTapOutsideIntegerValueReturnAddress = 0;
+static BOOL MRMyrtleTapOutsidePreferenceOverrideInstalled = NO;
 
 // Production builds discard the complete diagnostic expression at preprocessing
 // time: no arguments or diagnostic strings reach SpringBoard.
 #define MRLog(...) do {} while (0)
+
+static uintptr_t MRStripCodePointer(const void *pointer)
+{
+#if __has_feature(ptrauth_calls) && __has_include(<ptrauth.h>)
+    return (uintptr_t)ptrauth_strip((void *)pointer, ptrauth_key_function_pointer);
+#else
+    return (uintptr_t)pointer;
+#endif
+}
+
+static MRNSNumberIntegerValueIMP MROriginalIntegerValueForObject(id object)
+{
+    for (Class cls = object_getClass(object); cls != Nil; cls = class_getSuperclass(cls)) {
+        for (NSUInteger index = 0; index < MRNSNumberIntegerValueHookCount; index++) {
+            if (MRNSNumberIntegerValueHooks[index].ownerClass == cls)
+                return MRNSNumberIntegerValueHooks[index].original;
+        }
+    }
+    return NULL;
+}
+
+static NSInteger MRHookNSNumberIntegerValue(id self, SEL selector)
+{
+    uintptr_t caller = MRStripCodePointer(__builtin_return_address(0));
+    if (!MRMyrtleHostedKeyboardVisible &&
+        MRMyrtleTapOutsideIntegerValueReturnAddress != 0 &&
+        caller == MRMyrtleTapOutsideIntegerValueReturnAddress) {
+        return 0;
+    }
+
+    MRNSNumberIntegerValueIMP original = MROriginalIntegerValueForObject(self);
+    if (original != NULL) return original(self, selector);
+
+    // This path is not expected because only method-owning classes are hooked.
+    // Preserve NSNumber semantics rather than returning a fabricated value if
+    // another tweak changes the class hierarchy while SpringBoard is running.
+    SEL fallbackSelector = @selector(longLongValue);
+    return (NSInteger)((long long (*)(id, SEL))objc_msgSend)(self, fallbackSelector);
+}
+
+static Class MRClassOwningInstanceSelector(Class cls, SEL selector)
+{
+    for (Class candidate = cls; candidate != Nil; candidate = class_getSuperclass(candidate)) {
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(candidate, &methodCount);
+        BOOL ownsMethod = NO;
+        for (unsigned int index = 0; index < methodCount; index++) {
+            if (method_getName(methods[index]) == selector) {
+                ownsMethod = YES;
+                break;
+            }
+        }
+        free(methods);
+        if (ownsMethod) return candidate;
+    }
+    return Nil;
+}
+
+static BOOL MRInstallTargetedNSNumberIntegerValueHooks(void)
+{
+    if (MRNSNumberIntegerValueHookCount != 0) return YES;
+
+    SEL selector = @selector(integerValue);
+    NSArray<NSNumber *> *samples = @[
+        @0, @1, @2, @(-1), @(NSIntegerMax),
+        [NSNumber numberWithBool:YES], [NSNumber numberWithBool:NO]
+    ];
+    for (NSNumber *sample in samples) {
+        Class owner = MRClassOwningInstanceSelector(object_getClass(sample), selector);
+        if (owner == Nil) continue;
+
+        BOOL alreadyHooked = NO;
+        for (NSUInteger index = 0; index < MRNSNumberIntegerValueHookCount; index++) {
+            if (MRNSNumberIntegerValueHooks[index].ownerClass == owner) {
+                alreadyHooked = YES;
+                break;
+            }
+        }
+        if (alreadyHooked) continue;
+        if (MRNSNumberIntegerValueHookCount >=
+            sizeof(MRNSNumberIntegerValueHooks) / sizeof(MRNSNumberIntegerValueHooks[0]))
+            return NO;
+
+        MRNSNumberIntegerValueHookRecord *record =
+            &MRNSNumberIntegerValueHooks[MRNSNumberIntegerValueHookCount];
+        record->ownerClass = owner;
+        MSHookMessageEx(owner, selector, (IMP)MRHookNSNumberIntegerValue,
+                        (IMP *)&record->original);
+        if (record->original == NULL) {
+            record->ownerClass = Nil;
+            return NO;
+        }
+        MRNSNumberIntegerValueHookCount++;
+    }
+    return MRNSNumberIntegerValueHookCount != 0;
+}
+
+static BOOL MRConfigureMyrtleTapOutsidePreferenceOverride(IMP hostWindowHitTestIMP)
+{
+    uintptr_t methodAddress = MRStripCodePointer((const void *)hostWindowHitTestIMP);
+    Dl_info imageInfo = {};
+    if (methodAddress == 0 || dladdr((const void *)methodAddress, &imageInfo) == 0 ||
+        imageInfo.dli_fbase == NULL)
+        return NO;
+
+    uintptr_t imageBase = (uintptr_t)imageInfo.dli_fbase;
+    uintptr_t methodOffset = methodAddress - imageBase;
+    uintptr_t callerOffset = 0;
+    // Myrtle 1.4.1 contains arm64 and arm64e slices. Whitelist both exact
+    // hitTest implementations and the single return address immediately after
+    // their TapOutsideAction integerValue call.
+    if (methodOffset == 0x198fbc) callerOffset = 0x19afa8;
+    else if (methodOffset == 0x1a49c0) callerOffset = 0x1aab5c;
+    else return NO;
+
+    MRMyrtleTapOutsideIntegerValueReturnAddress = imageBase + callerOffset;
+    if (!MRInstallTargetedNSNumberIntegerValueHooks()) {
+        MRMyrtleTapOutsideIntegerValueReturnAddress = 0;
+        return NO;
+    }
+    MRMyrtleTapOutsidePreferenceOverrideInstalled = YES;
+    return YES;
+}
 
 static id MRSafeValue(id object, NSString *key)
 {
@@ -168,6 +305,12 @@ static UIView *MRHookMyrtleHostWindowHitTest(id self, SEL selector,
     // outside-touch route.  It consumes the touch and invokes the gated close
     // action without activating the application underneath.
     if (MRMyrtleHostedKeyboardVisible) return result;
+
+    // On the verified Myrtle 1.4.1 implementation, its own hitTest method has
+    // already observed TapOutsideAction=0 at the exact preference branch. Use
+    // its native result unchanged so the touch can reach either SpringBoard or
+    // a full-screen application behind the split window.
+    if (MRMyrtleTapOutsidePreferenceOverrideInstalled) return result;
 
     // With no hosted keyboard, only the visible hosted card may keep the hit.
     // The hosted scene can retain full-screen logical bounds while a parent
@@ -1385,6 +1528,8 @@ static BOOL MRInstallMyrtleHostWindowPassThroughHook(void)
     if (returnType[0] != '@' || pointType[0] != '{' || eventType[0] != '@')
         return NO;
 
+    IMP nativeImplementation = method_getImplementation(method);
+    MRConfigureMyrtleTapOutsidePreferenceOverride(nativeImplementation);
     MSHookMessageEx(cls, selector, (IMP)MRHookMyrtleHostWindowHitTest,
                     (IMP *)&MROriginalMyrtleHostWindowHitTest);
     return MROriginalMyrtleHostWindowHitTest != NULL;
