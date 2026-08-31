@@ -10,6 +10,7 @@ on:
       - feature/reload-foreground-app
       - feature/preserve-home-page
       - feature/handle-bottom-limit
+      - release/0.5.3.9-stable
     paths:
       - "Makefile"
       - "control"
