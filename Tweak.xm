@@ -58,6 +58,8 @@ typedef void (*MRMyrtleHostGestureIMP)(id, SEL, UIGestureRecognizer *);
 static MRMyrtleHostGestureIMP MROriginalMyrtleHostGesture = NULL;
 typedef void (*MRMyrtleSnapTransitionIMP)(id, SEL, BOOL);
 static MRMyrtleSnapTransitionIMP MROriginalMyrtleSnapTransition = NULL;
+// Retained only while beta4 compares the former selector-internal hypothesis
+// with the verified standalone launcher path. These hooks are never installed.
 typedef void (*MRSelectorAlphaBuildOverlayIMP)(id, SEL, id);
 static MRSelectorAlphaBuildOverlayIMP MROriginalSelectorAlphaBuildOverlay = NULL;
 typedef void (*MRSelectorAlphaPointerIMP)(id, SEL, CGPoint);
@@ -2341,7 +2343,7 @@ static BOOL MRInstallMyrtleSnapTransitionHook(void)
     return MROriginalMyrtleSnapTransition != NULL;
 }
 
-static BOOL MRInstallSelectorAlphaStripHooks(void)
+static BOOL __attribute__((unused)) MRInstallSelectorAlphaStripHooks(void)
 {
     if (MROriginalSelectorAlphaBuildOverlay != NULL &&
         MROriginalSelectorAlphaPointer != NULL &&
@@ -2449,7 +2451,7 @@ static BOOL MRInstallStandaloneAlphaLauncherHooks(void)
  * similarly named standalone alpha-launcher controller is a different action
  * and must not be hooked here.
  */
-static BOOL MRValidateSelectorAlphaStripHooks(void)
+static BOOL __attribute__((unused)) MRValidateSelectorAlphaStripHooks(void)
 {
     if (MROriginalSelectorAlphaBuildOverlay == NULL ||
         MROriginalSelectorAlphaPointer == NULL ||
