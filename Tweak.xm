@@ -550,7 +550,14 @@ static void MRScheduleMyrtleHostWindowGeometryFollowup(void)
 static void MRHookMyrtleHostWindowLayoutSubviews(id self, SEL selector)
 {
     MROriginalMyrtleHostWindowLayoutSubviews(self, selector);
-    if (!MRMyrtleHostWindowGeometrySyncing)
+    if (MRMyrtleHostWindowGeometrySyncing) return;
+    // UIWindow may reset its controller view to bounds during layout. When a
+    // crop is already active, repair the root compensation before this layout
+    // is committed on screen; the asynchronous path is only for discovering a
+    // not-yet-cropped card.
+    if (MRMyrtleHostWindowCropApplied)
+        MRApplyMyrtleHostWindowGeometry();
+    else
         MRScheduleMyrtleHostWindowGeometrySync();
 }
 
