@@ -4,8 +4,13 @@
 #import <objc/runtime.h>
 #import <substrate.h>
 #import <dlfcn.h>
+#import <fcntl.h>
 #import <math.h>
+#import <stdarg.h>
 #import <stdlib.h>
+#import <string.h>
+#import <sys/stat.h>
+#import <unistd.h>
 #if __has_include(<ptrauth.h>)
 #import <ptrauth.h>
 #endif
@@ -40,6 +45,14 @@ static __weak UIScrollView *MRHomePageGuardScrollView = nil;
 static BOOL MRMyrtleHostedKeyboardVisible = NO;
 static __weak id MRMyrtleKeyboardOwnerController = nil;
 static __strong NSString *MRMyrtleKeyboardOwnerBundleID = nil;
+static NSUInteger MRSceneRoutingTraceCount = 0;
+static NSUInteger MRExactTapOutsidePreferenceHits = 0;
+static NSUInteger MRRootHostOutsideTraceCount = 0;
+static NSUInteger MRSceneRoutingTraceGeneration = 0;
+static __thread NSUInteger MRHostWindowHitTestDepth = 0;
+static const char *MRSceneRoutingTracePath =
+    "/var/mobile/Documents/com.moxuan.myrtleswitcherfix.scene-routing.log";
+static NSString *MRCurrentMainApplicationBundleID(void);
 
 typedef void (*MRSetContentOffsetAnimatedIMP)(id, SEL, CGPoint, BOOL);
 static MRSetContentOffsetAnimatedIMP MROriginalSetContentOffsetAnimated = NULL;
@@ -59,6 +72,37 @@ static BOOL MRMyrtleTapOutsidePreferenceOverrideInstalled = NO;
 // time: no arguments or diagnostic strings reach SpringBoard.
 #define MRLog(...) do {} while (0)
 
+// beta8 is a bounded, event-driven diagnostic. It performs no polling and
+// never mutates either application's scene state. The trace is intentionally
+// separate from production logging and is capped to keep SpringBoard I/O
+// finite even if the user repeats the test many times.
+static void MRSceneRoutingTrace(NSString *format, ...)
+{
+    if (format.length == 0 || MRSceneRoutingTraceCount >= 192) return;
+
+    va_list arguments;
+    va_start(arguments, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments];
+    va_end(arguments);
+    if (message.length == 0) return;
+
+    int file = open(MRSceneRoutingTracePath, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    if (file < 0) return;
+    struct stat status = {};
+    if (fstat(file, &status) == 0 && status.st_size >= 262144) {
+        close(file);
+        return;
+    }
+
+    NSString *line = [NSString stringWithFormat:@"%.3f %@\n",
+                      [NSDate timeIntervalSinceReferenceDate], message];
+    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+    if (data.length != 0)
+        (void)write(file, data.bytes, data.length);
+    close(file);
+    MRSceneRoutingTraceCount++;
+}
+
 static uintptr_t MRStripCodePointer(const void *pointer)
 {
 #if __has_feature(ptrauth_calls) && __has_include(<ptrauth.h>)
@@ -74,6 +118,7 @@ static NSInteger MRHookMyrtleTapOutsideValueIntegerValue(id self, SEL selector)
     if (!MRMyrtleHostedKeyboardVisible &&
         MRMyrtleTapOutsideIntegerValueReturnAddress != 0 &&
         caller == MRMyrtleTapOutsideIntegerValueReturnAddress) {
+        MRExactTapOutsidePreferenceHits++;
         return 0;
     }
 
@@ -153,6 +198,12 @@ static BOOL MRConfigureMyrtleTapOutsidePreferenceOverride(IMP hostWindowHitTestI
         return NO;
     }
     MRMyrtleTapOutsidePreferenceOverrideInstalled = YES;
+    MRSceneRoutingTrace(@"install hostMethod=0x%lx prefSlot=0x%lx caller=0x%lx prefClass=%@ owner=%@ value=%@",
+                        (unsigned long)methodOffset,
+                        (unsigned long)preferencesSlotOffset,
+                        (unsigned long)callerOffset,
+                        NSStringFromClass(object_getClass(tapOutsideValue)),
+                        NSStringFromClass(ownerClass), tapOutsideValue);
     return YES;
 }
 
@@ -269,7 +320,29 @@ static CGRect MRVisibleMyrtleHostRectInScreen(UIView *hostView)
 static UIView *MRHookMyrtleHostWindowHitTest(id self, SEL selector,
                                              CGPoint point, UIEvent *event)
 {
+    BOOL rootCall = MRHostWindowHitTestDepth == 0;
+    MRHostWindowHitTestDepth++;
     UIView *result = MROriginalMyrtleHostWindowHitTest(self, selector, point, event);
+    MRHostWindowHitTestDepth--;
+
+    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+    UIView *hostView = MRSafeValue(manager, @"hostView");
+    CGRect hostRect = MRVisibleMyrtleHostRectInScreen(hostView);
+    CGPoint screenPoint = [(UIView *)self convertPoint:point toView:nil];
+    BOOL outsideHost = !CGRectIsNull(hostRect) &&
+        !CGRectContainsPoint(hostRect, screenPoint);
+    if (rootCall && outsideHost && MRRootHostOutsideTraceCount < 24) {
+        MRRootHostOutsideTraceCount++;
+        MRSceneRoutingTrace(@"outsideHit n=%lu keyboard=%d result=%@ point={%.1f,%.1f} host={%.1f,%.1f,%.1f,%.1f} exactHits=%lu windowLevel=%.1f",
+                            (unsigned long)MRRootHostOutsideTraceCount,
+                            MRMyrtleHostedKeyboardVisible,
+                            result == nil ? @"nil" : NSStringFromClass([result class]),
+                            screenPoint.x, screenPoint.y,
+                            hostRect.origin.x, hostRect.origin.y,
+                            hostRect.size.width, hostRect.size.height,
+                            (unsigned long)MRExactTapOutsidePreferenceHits,
+                            [(UIWindow *)self windowLevel]);
+    }
 
     // While the hosted keyboard is visible, retain Myrtle's complete native
     // outside-touch route.  It consumes the touch and invokes the gated close
@@ -286,11 +359,7 @@ static UIView *MRHookMyrtleHostWindowHitTest(id self, SEL selector,
     // The hosted scene can retain full-screen logical bounds while a parent
     // container scales/clips it into the card, so pointInside: on hostView is
     // insufficient.  Derive the live visible card from Myrtle's own view tree.
-    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
-    UIView *hostView = MRSafeValue(manager, @"hostView");
-    CGRect hostRect = MRVisibleMyrtleHostRectInScreen(hostView);
     if (CGRectIsNull(hostRect)) return result;
-    CGPoint screenPoint = [(UIView *)self convertPoint:point toView:nil];
     return CGRectContainsPoint(hostRect, screenPoint) ? result : nil;
 }
 
@@ -473,6 +542,84 @@ static id MRMyrtleSceneForApplication(id application)
     @try { return ((id (*)(id, SEL, id))objc_msgSend)(cls, selector, application); }
     @catch (__unused NSException *exception) {
         return nil;
+    }
+}
+
+static id MRMyrtleApplicationForBundleID(NSString *bundleID)
+{
+    if (bundleID.length == 0) return nil;
+    Class cls = NSClassFromString(@"MyrtleHostCore");
+    SEL selector = NSSelectorFromString(@"MT_llIIIIIIIIllIlIIIlIl:");
+    Method method = class_getClassMethod(cls, selector);
+    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 3)
+        return nil;
+    @try { return ((id (*)(id, SEL, id))objc_msgSend)(cls, selector, bundleID); }
+    @catch (__unused NSException *exception) { return nil; }
+}
+
+static NSString *MRSceneTraceValue(id value)
+{
+    if (value == nil) return @"nil";
+    NSString *description = nil;
+    @try { description = [value description]; }
+    @catch (__unused NSException *exception) { description = @"<exception>"; }
+    if (description.length > 160)
+        description = [[description substringToIndex:160] stringByAppendingString:@"…"];
+    return description ?: @"nil";
+}
+
+static void MRTraceSceneSnapshot(NSString *role, NSString *bundleID,
+                                 NSTimeInterval delay, NSUInteger generation)
+{
+    id application = MRMyrtleApplicationForBundleID(bundleID);
+    id scene = MRMyrtleSceneForApplication(application);
+    id settings = MRSafeValue(scene, @"settings");
+    id process = MRSafeValue(application, @"mainProcess");
+    if (process == nil) process = MRSafeValue(application, @"applicationProcess");
+    if (process == nil) process = MRSafeValue(application, @"process");
+
+    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
+    NSString *managerBundleID = MRSafeValue(manager, @"currentBundleID");
+    NSString *frontBundleID = MRCurrentMainApplicationBundleID();
+    MRSceneRoutingTrace(@"scene gen=%lu t=%.2f role=%@ bundle=%@ manager=%@ front=%@ app=%@ scene=%@ id=%@ settings=%@ backgrounded=%@ activation=%@ sceneState=%@ appState=%@ process=%@ processState=%@ visibility=%@ exactHits=%lu",
+                        (unsigned long)generation, delay, role ?: @"?",
+                        bundleID ?: @"nil", managerBundleID ?: @"nil",
+                        frontBundleID ?: @"nil",
+                        application == nil ? @"nil" : NSStringFromClass([application class]),
+                        scene == nil ? @"nil" : NSStringFromClass([scene class]),
+                        MRSceneTraceValue(MRSafeValue(scene, @"identifier")),
+                        settings == nil ? @"nil" : NSStringFromClass([settings class]),
+                        MRSceneTraceValue(MRSafeValue(settings, @"backgrounded")),
+                        MRSceneTraceValue(MRSafeValue(scene, @"activationState")),
+                        MRSceneTraceValue(MRSafeValue(scene, @"state")),
+                        MRSceneTraceValue(MRSafeValue(application, @"state")),
+                        process == nil ? @"nil" : NSStringFromClass([process class]),
+                        MRSceneTraceValue(MRSafeValue(process, @"state")),
+                        MRSceneTraceValue(MRSafeValue(process, @"visibility")),
+                        (unsigned long)MRExactTapOutsidePreferenceHits);
+}
+
+static void MRScheduleSceneRoutingTrace(NSString *underlyingBundleID,
+                                        NSString *hostedBundleID)
+{
+    if (underlyingBundleID.length == 0 || hostedBundleID.length == 0 ||
+        [underlyingBundleID isEqualToString:hostedBundleID]) return;
+    NSUInteger generation = ++MRSceneRoutingTraceGeneration;
+    NSString *underlying = [underlyingBundleID copy];
+    NSString *hosted = [hostedBundleID copy];
+    MRSceneRoutingTrace(@"open gen=%lu A=%@ B=%@ keyboard=%d exactInstalled=%d",
+                        (unsigned long)generation, underlying, hosted,
+                        MRMyrtleHostedKeyboardVisible,
+                        MRMyrtleTapOutsidePreferenceOverrideInstalled);
+    for (NSNumber *delayValue in @[@0.0, @0.10, @0.40, @1.00]) {
+        NSTimeInterval delay = delayValue.doubleValue;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(delay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (generation != MRSceneRoutingTraceGeneration) return;
+            MRTraceSceneSnapshot(@"A", underlying, delay, generation);
+            MRTraceSceneSnapshot(@"B", hosted, delay, generation);
+        });
     }
 }
 
@@ -917,6 +1064,11 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
     if (stableBundleID.length != 0 && underlyingBeforeChange.length != 0 &&
         ![underlyingBeforeChange isEqualToString:stableBundleID]) {
         MRUnderlyingMainBundleID = underlyingBeforeChange;
+    }
+    if (stableBundleID.length != 0) {
+        NSString *traceUnderlying = underlyingBeforeChange.length != 0
+            ? underlyingBeforeChange : MRUnderlyingMainBundleID;
+        MRScheduleSceneRoutingTrace(traceUnderlying, stableBundleID);
     }
     if (stableBundleID.length != 0) {
         MRRecentlyClosedMyrtleBundleID = nil;
@@ -1671,8 +1823,21 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
         keyboardAvoidanceInstalled && outsideActionGateInstalled && hostPassThroughInstalled &&
         handleBoundaryInstalled &&
-        selectorCenterInstalled && actionDispatcherInstalled) return;
+        selectorCenterInstalled && actionDispatcherInstalled) {
+        MRSceneRoutingTrace(@"hooksReady attempt=%lu exactInstalled=%d owner=%@",
+                            (unsigned long)attempt,
+                            MRMyrtleTapOutsidePreferenceOverrideInstalled,
+                            MRMyrtleTapOutsideValueOwnerClass == Nil ? @"nil" :
+                                NSStringFromClass(MRMyrtleTapOutsideValueOwnerClass));
+        return;
+    }
     if (attempt >= 60) {
+        MRSceneRoutingTrace(@"hooksFailed manager=%d fullscreen=%d hostCore=%d keyboard=%d outside=%d pass=%d boundary=%d selector=%d dispatcher=%d",
+                            managerInstalled, fullscreenInstalled,
+                            hostCoreLaunchInstalled, keyboardAvoidanceInstalled,
+                            outsideActionGateInstalled, hostPassThroughInstalled,
+                            handleBoundaryInstalled, selectorCenterInstalled,
+                            actionDispatcherInstalled);
         MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d outsideAction=%d hostPassThrough=%d boundary=%d selectorCenter=%d",
               managerInstalled, fullscreenInstalled, hostCoreLaunchInstalled,
               keyboardAvoidanceInstalled, outsideActionGateInstalled, hostPassThroughInstalled,
@@ -1686,6 +1851,9 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 %ctor
 {
     @autoreleasepool {
+        (void)unlink(MRSceneRoutingTracePath);
+        MRSceneRoutingTrace(@"start version=0.5.3.8~beta8 process=%@",
+                            NSProcessInfo.processInfo.processName);
         dispatch_async(dispatch_get_main_queue(), ^{
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
