@@ -6,6 +6,7 @@
 #import <math.h>
 
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
+static NSString *const MRControllerCloseSelector = @"MT_llIIIlllIIIllIllllIl:";
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
 static __strong NSString *MRUnderlyingMainBundleID = nil;
 static __strong NSString *MRMyrtleFullscreenIntentBundleID = nil;
@@ -37,6 +38,8 @@ typedef void (*MRSetContentOffsetAnimatedIMP)(id, SEL, CGPoint, BOOL);
 static MRSetContentOffsetAnimatedIMP MROriginalSetContentOffsetAnimated = NULL;
 typedef void (*MRSetContentOffsetIMP)(id, SEL, CGPoint);
 static MRSetContentOffsetIMP MROriginalSetContentOffset = NULL;
+typedef UIView *(*MRMyrtleWindowHitTestIMP)(id, SEL, CGPoint, UIEvent *);
+static MRMyrtleWindowHitTestIMP MROriginalMyrtleWindowHitTest = NULL;
 
 // Production builds discard the complete diagnostic expression at preprocessing
 // time: no arguments or diagnostic strings reach SpringBoard.
@@ -156,18 +159,22 @@ static CGRect MRProtectedMyrtleHostRectInScreen(void)
 
 - (void)mr_closeMyrtleWindowFromOutsideTap:(__unused id)sender
 {
+    id controller = self.myrtleController;
     id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
     NSString *bundleID = MRSafeValue(manager, @"currentBundleID");
-    SEL closeSelector = NSSelectorFromString(MRCloseSelector);
-    Method closeMethod = manager == nil ? NULL :
-        class_getInstanceMethod([manager class], closeSelector);
+    SEL closeSelector = NSSelectorFromString(MRControllerCloseSelector);
+    Method closeMethod = controller == nil ? NULL :
+        class_getInstanceMethod([controller class], closeSelector);
     if (bundleID.length == 0 || closeMethod == NULL ||
-        method_getNumberOfArguments(closeMethod) != 4) return;
+        method_getNumberOfArguments(closeMethod) != 3) return;
 
     // Disable first so the same physical tap cannot fall through and launch a
-    // Home Screen icon while Myrtle performs its close animation.
+    // Home Screen icon while Myrtle performs its close animation.  Then use
+    // MyrtleViewController's own close-notification handler: unlike calling
+    // MyrtleHostManager directly, it also clears isWindowOpen/current bundle,
+    // resets snap status and refreshes the handle/selector center icon.
     MRDeactivateOutsideKeyboardTapCatcher();
-    ((void (*)(id, SEL, BOOL, id))objc_msgSend)(manager, closeSelector, YES, nil);
+    ((void (*)(id, SEL, id))objc_msgSend)(controller, closeSelector, nil);
 }
 
 @end
@@ -223,6 +230,28 @@ static void MRDeactivateOutsideKeyboardTapCatcher(void)
     catcher.hidden = YES;
     catcher.myrtleController = nil;
     [catcher removeFromSuperview];
+}
+
+static UIView *MRHookMyrtleWindowHitTest(id self, SEL selector,
+                                         CGPoint point, UIEvent *event)
+{
+    UIView *originalResult = MROriginalMyrtleWindowHitTest(self, selector, point, event);
+    if (originalResult != nil) return originalResult;
+
+    // MyrtleWindow normally passes every unclaimed point through to the layer
+    // below it.  On the Home Screen the inserted control is reached during the
+    // ordinary hierarchy walk, but with a full-screen foreground application
+    // Myrtle's routing path can return nil before that control is considered.
+    // Preserve every native hit; only recover an otherwise-unclaimed point.
+    MROutsideKeyboardTapControl *catcher =
+        [MROutsideKeyboardTapCatcher isKindOfClass:MROutsideKeyboardTapControl.class]
+            ? (MROutsideKeyboardTapControl *)MROutsideKeyboardTapCatcher
+            : nil;
+    if (catcher == nil || catcher.superview == nil || catcher.window != self)
+        return nil;
+
+    CGPoint catcherPoint = [catcher convertPoint:point fromView:(UIView *)self];
+    return [catcher pointInside:catcherPoint withEvent:event] ? catcher : nil;
 }
 
 static id MRMainSwitcher(void)
@@ -1384,6 +1413,29 @@ static BOOL MRInstallMyrtleKeyboardAvoidanceHook(void)
     return MROriginalKeyboardWillShow != NULL && MROriginalKeyboardWillHide != NULL;
 }
 
+static BOOL MRInstallMyrtleWindowHitTestHook(void)
+{
+    if (MROriginalMyrtleWindowHitTest != NULL) return YES;
+    Class cls = NSClassFromString(@"MyrtleWindow");
+    SEL selector = @selector(hitTest:withEvent:);
+    Method method = class_getInstanceMethod(cls, selector);
+    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 4)
+        return NO;
+
+    char returnType[16] = {};
+    char pointType[16] = {};
+    char eventType[16] = {};
+    method_getReturnType(method, returnType, sizeof(returnType));
+    method_getArgumentType(method, 2, pointType, sizeof(pointType));
+    method_getArgumentType(method, 3, eventType, sizeof(eventType));
+    if (returnType[0] != '@' || pointType[0] != '{' || eventType[0] != '@')
+        return NO;
+
+    MSHookMessageEx(cls, selector, (IMP)MRHookMyrtleWindowHitTest,
+                    (IMP *)&MROriginalMyrtleWindowHitTest);
+    return MROriginalMyrtleWindowHitTest != NULL;
+}
+
 static BOOL MRInstallMyrtleHandleBoundaryHooks(void)
 {
     Class cls = NSClassFromString(@"MyrtleViewController");
@@ -1540,16 +1592,18 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL fullscreenInstalled = MRInstallMyrtleFullscreenHook();
     BOOL hostCoreLaunchInstalled = MRInstallMyrtleHostCoreLaunchHook();
     BOOL keyboardAvoidanceInstalled = MRInstallMyrtleKeyboardAvoidanceHook();
+    BOOL windowHitTestInstalled = MRInstallMyrtleWindowHitTestHook();
     BOOL handleBoundaryInstalled = MRInstallMyrtleHandleBoundaryHooks();
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
     BOOL actionDispatcherInstalled = MRInstallMyrtleActionDispatcherHook();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
-        keyboardAvoidanceInstalled && handleBoundaryInstalled && selectorCenterInstalled &&
-        actionDispatcherInstalled) return;
+        keyboardAvoidanceInstalled && windowHitTestInstalled && handleBoundaryInstalled &&
+        selectorCenterInstalled && actionDispatcherInstalled) return;
     if (attempt >= 60) {
-        MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d boundary=%d selectorCenter=%d",
+        MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d windowHitTest=%d boundary=%d selectorCenter=%d",
               managerInstalled, fullscreenInstalled, hostCoreLaunchInstalled,
-              keyboardAvoidanceInstalled, handleBoundaryInstalled, selectorCenterInstalled);
+              keyboardAvoidanceInstalled, windowHitTestInstalled,
+              handleBoundaryInstalled, selectorCenterInstalled);
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
