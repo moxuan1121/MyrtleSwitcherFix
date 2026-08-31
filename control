@@ -1,8 +1,8 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.5.3.8~beta10
+Version: 0.5.3.8~beta11
 Architecture: iphoneos-arm64e
-Description: iOS 15 RootHide beta excluding only MyrtleHostWindow's SpringBoard parent context from hit testing while retaining its independently hosted app scene context.
+Description: iOS 15 RootHide beta constraining MyrtleHostWindow's WindowServer hit region to the visible hosted card without a keyboard, while restoring Myrtle's full-screen outside-close route with a keyboard.
 Maintainer: Local
 Author: Local
 Section: Tweaks
