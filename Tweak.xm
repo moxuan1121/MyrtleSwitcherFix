@@ -1969,10 +1969,17 @@ static void MRHookSetAlphaLauncherOpen(id self, SEL selector, BOOL open)
 static void MRHookActionDispatcher(id self, SEL selector, id argument1,
                                    id argument2, id argument3)
 {
-    BOOL isReloadAction = [argument1 isKindOfClass:NSString.class] &&
-        [(NSString *)argument1 isEqualToString:@"reloadApp"];
-    BOOL isAlphaLauncherAction = [argument1 isKindOfClass:NSString.class] &&
-        [(NSString *)argument1 isEqualToString:@"alphaApplauncher"];
+    NSString *normalizedAction = [argument1 isKindOfClass:NSString.class]
+        ? [[(NSString *)argument1 stringByTrimmingCharactersInSet:
+             NSCharacterSet.whitespaceAndNewlineCharacterSet] lowercaseString] : nil;
+    BOOL isReloadAction = [normalizedAction isEqualToString:@"reloadapp"];
+    BOOL isAlphaLauncherAction =
+        [normalizedAction isEqualToString:@"alphaapplauncher"];
+    if (isAlphaLauncherAction) {
+        MRAlphaLauncherDiagnostic([NSString stringWithFormat:
+            @"action matched raw=%@ normalized=%@ parent=%@",
+            argument1, normalizedAction, NSStringFromClass([self class])]);
+    }
     BOOL isWindowOpen = [MRSafeValue(self, @"isWindowOpen") boolValue];
     if (isReloadAction && !isWindowOpen) MRReloadForegroundApplication();
     MROriginalActionDispatcher(self, selector, argument1, argument2, argument3);
@@ -2798,7 +2805,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
         [[NSFileManager defaultManager] removeItemAtPath:
             @"/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.alpha-launcher.log"
                                                    error:nil];
-        MRAlphaLauncherDiagnostic(@"0.5.5 beta6 containment diagnostic start");
+        MRAlphaLauncherDiagnostic(@"0.5.5 beta7 normalized-action diagnostic start");
         dispatch_async(dispatch_get_main_queue(), ^{
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
