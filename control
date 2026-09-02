@@ -1,8 +1,8 @@
 Package: com.moxuan.myrtleswitcherfix
 Name: Myrtle Switcher Fix
-Version: 0.5.4.5
+Version: 0.5.4.5~nokeyboard1
 Architecture: iphoneos-arm64e
-Description: Source-cleaned iOS 15 RootHide integration for Myrtle 1.4.1, keeping hosted split scenes portrait with orientation-correct touch routing over landscape apps.
+Description: iOS 15 RootHide Myrtle integration without the keyboard outside-tap window-closing hooks.
 Maintainer: Local
 Author: Local
 Section: Tweaks

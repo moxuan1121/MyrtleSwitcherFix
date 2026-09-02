@@ -3,13 +3,8 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <substrate.h>
-#import <dlfcn.h>
 #import <math.h>
-#import <stdlib.h>
 #import <string.h>
-#if __has_include(<ptrauth.h>)
-#import <ptrauth.h>
-#endif
 
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
@@ -33,19 +28,12 @@ static long long MRHomePageGuardMinimumIndex = 0;
 static BOOL MRHomePageGuardClosing = NO;
 static __strong NSString *MRHomePageGuardBundleID = nil;
 static __weak UIScrollView *MRHomePageGuardScrollView = nil;
-static BOOL MRMyrtleHostedKeyboardVisible = NO;
-static __weak id MRMyrtleKeyboardOwnerController = nil;
-static __strong NSString *MRMyrtleKeyboardOwnerBundleID = nil;
 static NSString *MRCurrentMainApplicationBundleID(void);
 
 typedef void (*MRSetContentOffsetAnimatedIMP)(id, SEL, CGPoint, BOOL);
 static MRSetContentOffsetAnimatedIMP MROriginalSetContentOffsetAnimated = NULL;
 typedef void (*MRSetContentOffsetIMP)(id, SEL, CGPoint);
 static MRSetContentOffsetIMP MROriginalSetContentOffset = NULL;
-typedef void (*MRMyrtleOutsideActionIMP)(id, SEL);
-static MRMyrtleOutsideActionIMP MROriginalMyrtleOutsideAction = NULL;
-typedef UIView *(*MRMyrtleHostWindowHitTestIMP)(id, SEL, CGPoint, UIEvent *);
-static MRMyrtleHostWindowHitTestIMP MROriginalMyrtleHostWindowHitTest = NULL;
 typedef void (*MRWindowLayoutSubviewsIMP)(id, SEL);
 static MRWindowLayoutSubviewsIMP MROriginalMyrtleHostWindowLayoutSubviews = NULL;
 typedef void (*MRMyrtleSceneOrientationIMP)(id, SEL, NSString *, NSInteger);
@@ -72,108 +60,9 @@ static BOOL MRMyrtleHostWindowGeometryFollowupScheduled = NO;
 static CGRect MRMyrtleHostWindowCandidateRect = {{0.0, 0.0}, {0.0, 0.0}};
 static NSUInteger MRMyrtleHostWindowCandidateCount = 0;
 static CGRect MRMyrtleHostWindowActiveCropRect = {{0.0, 0.0}, {0.0, 0.0}};
-typedef NSInteger (*MRIntegerValueIMP)(id, SEL);
-static MRIntegerValueIMP MROriginalMyrtleTapOutsideValueIntegerValue = NULL;
-static uintptr_t MRMyrtleTapOutsideIntegerValueReturnAddress = 0;
-static BOOL MRMyrtleTapOutsidePreferenceOverrideInstalled = NO;
 static void MRScheduleMyrtleHostWindowGeometrySync(void);
 static void MRScheduleMyrtleHostWindowGeometryFollowup(void);
 static void MRRestoreMyrtleHostWindowGeometry(void);
-
-static uintptr_t MRStripCodePointer(const void *pointer)
-{
-#if __has_feature(ptrauth_calls) && __has_include(<ptrauth.h>)
-    return (uintptr_t)ptrauth_strip((void *)pointer, ptrauth_key_function_pointer);
-#else
-    return (uintptr_t)pointer;
-#endif
-}
-
-static NSInteger MRHookMyrtleTapOutsideValueIntegerValue(id self, SEL selector)
-{
-    uintptr_t caller = MRStripCodePointer(__builtin_return_address(0));
-    if (!MRMyrtleHostedKeyboardVisible &&
-        MRMyrtleTapOutsideIntegerValueReturnAddress != 0 &&
-        caller == MRMyrtleTapOutsideIntegerValueReturnAddress) {
-        return 0;
-    }
-
-    return MROriginalMyrtleTapOutsideValueIntegerValue(self, selector);
-}
-
-static Class MRClassOwningInstanceSelector(Class cls, SEL selector)
-{
-    for (Class candidate = cls; candidate != Nil; candidate = class_getSuperclass(candidate)) {
-        unsigned int methodCount = 0;
-        Method *methods = class_copyMethodList(candidate, &methodCount);
-        BOOL ownsMethod = NO;
-        for (unsigned int index = 0; index < methodCount; index++) {
-            if (method_getName(methods[index]) == selector) {
-                ownsMethod = YES;
-                break;
-            }
-        }
-        free(methods);
-        if (ownsMethod) return candidate;
-    }
-    return Nil;
-}
-
-static BOOL MRConfigureMyrtleTapOutsidePreferenceOverride(IMP hostWindowHitTestIMP)
-{
-    if (MRMyrtleTapOutsidePreferenceOverrideInstalled) return YES;
-
-    uintptr_t methodAddress = MRStripCodePointer((const void *)hostWindowHitTestIMP);
-    Dl_info imageInfo = {};
-    if (methodAddress == 0 || dladdr((const void *)methodAddress, &imageInfo) == 0 ||
-        imageInfo.dli_fbase == NULL)
-        return NO;
-
-    uintptr_t imageBase = (uintptr_t)imageInfo.dli_fbase;
-    uintptr_t methodOffset = methodAddress - imageBase;
-    uintptr_t callerOffset = 0;
-    uintptr_t preferencesSlotOffset = 0;
-    // Myrtle 1.4.1 contains arm64 and arm64e slices. Whitelist both exact
-    // hitTest implementations, their preference globals, and the single return
-    // address immediately after the TapOutsideAction integerValue call.
-    if (methodOffset == 0x198fbc) {
-        callerOffset = 0x19afa8;
-        preferencesSlotOffset = 0x331400;
-    } else if (methodOffset == 0x1a49c0) {
-        callerOffset = 0x1aab5c;
-        preferencesSlotOffset = 0x341420;
-    }
-    else return NO;
-
-    // OneWindow.plist declares TapOutsideAction's default and all valid values
-    // as strings ("0" through "4"). Do not guess or enumerate NSNumber
-    // subclasses: read Myrtle's own verified preference dictionary slot and
-    // hook only the concrete class that actually supplies integerValue here.
-    void **preferencesSlot = (void **)(imageBase + preferencesSlotOffset);
-    id preferences = (__bridge id)(*preferencesSlot);
-    SEL keyedSubscriptSelector = @selector(objectForKeyedSubscript:);
-    if (preferences == nil || ![preferences respondsToSelector:keyedSubscriptSelector])
-        return NO;
-    id tapOutsideValue = ((id (*)(id, SEL, id))objc_msgSend)(
-        preferences, keyedSubscriptSelector, @"TapOutsideAction");
-    if (tapOutsideValue == nil || ![tapOutsideValue respondsToSelector:@selector(integerValue)])
-        return NO;
-
-    Class ownerClass = MRClassOwningInstanceSelector(object_getClass(tapOutsideValue),
-                                                     @selector(integerValue));
-    if (ownerClass == Nil) return NO;
-
-    MRMyrtleTapOutsideIntegerValueReturnAddress = imageBase + callerOffset;
-    MSHookMessageEx(ownerClass, @selector(integerValue),
-                    (IMP)MRHookMyrtleTapOutsideValueIntegerValue,
-                    (IMP *)&MROriginalMyrtleTapOutsideValueIntegerValue);
-    if (MROriginalMyrtleTapOutsideValueIntegerValue == NULL) {
-        MRMyrtleTapOutsideIntegerValueReturnAddress = 0;
-        return NO;
-    }
-    MRMyrtleTapOutsidePreferenceOverrideInstalled = YES;
-    return YES;
-}
 
 static id MRSafeValue(id object, NSString *key)
 {
@@ -188,62 +77,6 @@ static id MRSendClassNoArgs(NSString *className, NSString *selectorName)
     SEL selector = NSSelectorFromString(selectorName);
     if (cls == Nil || ![cls respondsToSelector:selector]) return nil;
     return ((id (*)(id, SEL))objc_msgSend)(cls, selector);
-}
-
-static void MRClearMyrtleHostedKeyboardState(void)
-{
-    MRMyrtleHostedKeyboardVisible = NO;
-    MRMyrtleKeyboardOwnerController = nil;
-    MRMyrtleKeyboardOwnerBundleID = nil;
-    MRScheduleMyrtleHostWindowGeometrySync();
-}
-
-static void MRUpdateMyrtleHostedKeyboardState(id controller, CGRect keyboardFrame)
-{
-    CGRect screenBounds = UIScreen.mainScreen.bounds;
-    CGRect visibleKeyboard = CGRectIntersection(screenBounds, keyboardFrame);
-    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
-    NSString *managerBundleID = MRSafeValue(manager, @"currentBundleID");
-    NSString *controllerBundleID = MRSafeValue(controller, @"currentWindowBundleID");
-    BOOL validGeometry = !CGRectIsNull(visibleKeyboard) &&
-        !CGRectIsEmpty(visibleKeyboard) &&
-        CGRectGetWidth(visibleKeyboard) > 1.0 &&
-        CGRectGetHeight(visibleKeyboard) > 20.0;
-    BOOL validHost = controller != nil &&
-        [MRSafeValue(controller, @"isWindowOpen") boolValue] &&
-        [managerBundleID isKindOfClass:NSString.class] &&
-        managerBundleID.length != 0 &&
-        [controllerBundleID isKindOfClass:NSString.class] &&
-        [controllerBundleID isEqualToString:managerBundleID];
-    if (!validGeometry || !validHost) {
-        MRClearMyrtleHostedKeyboardState();
-        return;
-    }
-
-    MRMyrtleKeyboardOwnerController = controller;
-    MRMyrtleKeyboardOwnerBundleID = [managerBundleID copy];
-    MRMyrtleHostedKeyboardVisible = YES;
-    MRScheduleMyrtleHostWindowGeometrySync();
-}
-
-static BOOL MRShouldAllowMyrtleOutsideAction(id controller)
-{
-    if (!MRMyrtleHostedKeyboardVisible || controller == nil ||
-        MRMyrtleKeyboardOwnerController != controller ||
-        ![MRSafeValue(controller, @"isWindowOpen") boolValue]) return NO;
-
-    NSString *controllerBundleID = MRSafeValue(controller, @"currentWindowBundleID");
-    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
-    NSString *managerBundleID = MRSafeValue(manager, @"currentBundleID");
-    return MRMyrtleKeyboardOwnerBundleID.length != 0 &&
-        [controllerBundleID isEqualToString:MRMyrtleKeyboardOwnerBundleID] &&
-        [managerBundleID isEqualToString:MRMyrtleKeyboardOwnerBundleID];
-}
-
-static void MRHookMyrtleOutsideAction(id self, SEL selector)
-{
-    if (!MRShouldAllowMyrtleOutsideAction(self)) return;
-    MROriginalMyrtleOutsideAction(self, selector);
 }
 
 static BOOL MRUsableMyrtleHostRect(CGRect rect, CGRect screenBounds)
@@ -382,7 +215,7 @@ static void MRApplyMyrtleHostWindowGeometry(void)
     UIView *splashContainer = MRSafeValue(manager, @"splashContainer");
     BOOL isOperating = [MRSafeValue(manager, @"isOperating") boolValue];
 
-    if (MRMyrtleHostedKeyboardVisible || bundleID.length == 0 ||
+    if (bundleID.length == 0 ||
         ![hostView isKindOfClass:UIView.class] || hostView.window != window) {
         MRRestoreMyrtleHostWindowGeometry();
         MRResetMyrtleHostWindowGeometryCandidate();
@@ -598,35 +431,6 @@ static void MRHookMyrtleSnapTransition(id self, SEL selector, BOOL upward)
         MRScheduleMyrtleHostWindowGeometrySync();
         MRScheduleMyrtleHostWindowGeometryFollowup();
     });
-}
-
-static UIView *MRHookMyrtleHostWindowHitTest(id self, SEL selector,
-                                             CGPoint point, UIEvent *event)
-{
-    UIView *result = MROriginalMyrtleHostWindowHitTest(self, selector, point, event);
-    // While the hosted keyboard is visible, retain Myrtle's complete native
-    // outside-touch route.  It consumes the touch and invokes the gated close
-    // action without activating the application underneath.
-    if (MRMyrtleHostedKeyboardVisible) return result;
-
-    // On the verified Myrtle 1.4.1 implementation, its own hitTest method has
-    // already observed TapOutsideAction=0 at the exact preference branch. Use
-    // its native result unchanged so the touch can reach either SpringBoard or
-    // a full-screen application behind the split window.
-    if (MRMyrtleTapOutsidePreferenceOverrideInstalled) return result;
-
-    id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
-    UIView *hostView = MRSafeValue(manager, @"hostView");
-    CGRect hostRect = MRVisibleMyrtleHostRectInScreen(hostView);
-    CGPoint screenPoint = [(UIView *)self convertPoint:point
-                                    toCoordinateSpace:UIScreen.mainScreen.coordinateSpace];
-
-    // With no hosted keyboard, only the visible hosted card may keep the hit.
-    // The hosted scene can retain full-screen logical bounds while a parent
-    // container scales/clips it into the card, so pointInside: on hostView is
-    // insufficient.  Derive the live visible card from Myrtle's own view tree.
-    if (CGRectIsNull(hostRect)) return result;
-    return CGRectContainsPoint(hostRect, screenPoint) ? result : nil;
 }
 
 static id MRMainSwitcher(void)
@@ -1183,13 +987,6 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
     BOOL hostSessionChanged = !((previousBundleID == bundleID) ||
         [previousBundleID isEqualToString:bundleID]);
     if (hostSessionChanged) MRInvalidateMyrtleSnapTransition();
-    // Keyboard visibility belongs to one concrete Myrtle host session.  Drop
-    // it synchronously when that host closes or switches applications so a
-    // delayed/native outside tap can never act on the next window.
-    if (MRMyrtleKeyboardOwnerBundleID.length != 0 &&
-        ![MRMyrtleKeyboardOwnerBundleID isEqualToString:bundleID]) {
-        MRClearMyrtleHostedKeyboardState();
-    }
     BOOL openingFirstMyrtleWindow = bundleID.length != 0 && previousBundleID.length == 0;
     long long preservedHomePage = 0;
     BOOL hasPreservedHomePage = NO;
@@ -1584,12 +1381,10 @@ static void MRHookKeyboardWillShow(id self, SEL selector, NSNotification *notifi
     if (CGRectGetWidth(keyboardFrame) <= 0.0 || CGRectGetHeight(keyboardFrame) <= 0.0) return;
     MRInstallPinnedHandleCenterGuard(self);
     MRApplyFixedKeyboardHandlePosition(self, userInfo);
-    MRUpdateMyrtleHostedKeyboardState(self, keyboardFrame);
 }
 
 static void MRHookKeyboardWillHide(id self, SEL selector, NSNotification *notification)
 {
-    MRClearMyrtleHostedKeyboardState();
     UIView *movementView = MRSafeValue(self, @"handleHitView");
     BOOL guarded = [movementView isKindOfClass:UIView.class] &&
         [objc_getAssociatedObject(movementView, MRPinnedHandleInstalledKey) boolValue];
@@ -1718,53 +1513,6 @@ static BOOL MRInstallMyrtleKeyboardAvoidanceHook(void)
     }
 
     return MROriginalKeyboardWillShow != NULL && MROriginalKeyboardWillHide != NULL;
-}
-
-static BOOL MRInstallMyrtleOutsideActionGateHook(void)
-{
-    if (MROriginalMyrtleOutsideAction != NULL) return YES;
-
-    Class cls = NSClassFromString(@"MyrtleViewController");
-    SEL selector = NSSelectorFromString(@"MT_IlllIIIIlIlIIIIIlIll");
-    Method method = class_getInstanceMethod(cls, selector);
-    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 2)
-        return NO;
-
-    char returnType[16] = {};
-    method_getReturnType(method, returnType, sizeof(returnType));
-    if (returnType[0] != 'v') return NO;
-
-    MSHookMessageEx(cls, selector, (IMP)MRHookMyrtleOutsideAction,
-                    (IMP *)&MROriginalMyrtleOutsideAction);
-    return MROriginalMyrtleOutsideAction != NULL;
-}
-
-static BOOL MRInstallMyrtleHostWindowPassThroughHook(void)
-{
-    if (MROriginalMyrtleHostWindowHitTest != NULL)
-        return MRMyrtleTapOutsidePreferenceOverrideInstalled;
-
-    Class cls = NSClassFromString(@"MyrtleHostWindow");
-    SEL selector = @selector(hitTest:withEvent:);
-    Method method = class_getInstanceMethod(cls, selector);
-    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 4)
-        return NO;
-
-    char returnType[16] = {};
-    char pointType[16] = {};
-    char eventType[16] = {};
-    method_getReturnType(method, returnType, sizeof(returnType));
-    method_getArgumentType(method, 2, pointType, sizeof(pointType));
-    method_getArgumentType(method, 3, eventType, sizeof(eventType));
-    if (returnType[0] != '@' || pointType[0] != '{' || eventType[0] != '@')
-        return NO;
-
-    IMP nativeImplementation = method_getImplementation(method);
-    if (!MRConfigureMyrtleTapOutsidePreferenceOverride(nativeImplementation))
-        return NO;
-    MSHookMessageEx(cls, selector, (IMP)MRHookMyrtleHostWindowHitTest,
-                    (IMP *)&MROriginalMyrtleHostWindowHitTest);
-    return MROriginalMyrtleHostWindowHitTest != NULL;
 }
 
 static BOOL MRInstallMyrtleHostWindowGeometryHook(void)
@@ -1977,8 +1725,6 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL fullscreenInstalled = MRInstallMyrtleFullscreenHook();
     BOOL hostCoreLaunchInstalled = MRInstallMyrtleHostCoreLaunchHook();
     BOOL keyboardAvoidanceInstalled = MRInstallMyrtleKeyboardAvoidanceHook();
-    BOOL outsideActionGateInstalled = MRInstallMyrtleOutsideActionGateHook();
-    BOOL hostPassThroughInstalled = MRInstallMyrtleHostWindowPassThroughHook();
     BOOL hostGeometryInstalled = MRInstallMyrtleHostWindowGeometryHook();
     BOOL sceneOrientationInstalled = MRInstallMyrtleSceneOrientationHook();
     BOOL hostGestureInstalled = MRInstallMyrtleHostGestureHook();
@@ -1986,8 +1732,8 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
     BOOL actionDispatcherInstalled = MRInstallMyrtleActionDispatcherHook();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
-        keyboardAvoidanceInstalled && outsideActionGateInstalled && hostPassThroughInstalled &&
-        hostGeometryInstalled && sceneOrientationInstalled && hostGestureInstalled && hostSnapInstalled &&
+        keyboardAvoidanceInstalled && hostGeometryInstalled && sceneOrientationInstalled &&
+        hostGestureInstalled && hostSnapInstalled &&
         selectorCenterInstalled && actionDispatcherInstalled) {
         return;
     }
