@@ -527,12 +527,25 @@ static void MRHookMyrtleSceneOrientation(id self, SEL selector,
 {
     // This Myrtle 1.4.1 method only updates the hosted app scene. Keep that
     // scene portrait while the application behind it follows device rotation.
-    MRRestoreMyrtleHostWindowGeometry();
-    MRResetMyrtleHostWindowGeometryCandidate();
+    BOOL onMainThread = NSThread.isMainThread;
+    if (onMainThread) {
+        MRRestoreMyrtleHostWindowGeometry();
+        MRResetMyrtleHostWindowGeometryCandidate();
+    }
     MROriginalMyrtleSceneOrientation(self, selector, bundleID,
                                      UIInterfaceOrientationPortrait);
-    MRScheduleMyrtleHostWindowGeometrySync();
-    MRScheduleMyrtleHostWindowGeometryFollowup();
+    dispatch_block_t updateGeometry = ^{
+        if (!onMainThread) {
+            MRRestoreMyrtleHostWindowGeometry();
+            MRResetMyrtleHostWindowGeometryCandidate();
+        }
+        MRScheduleMyrtleHostWindowGeometrySync();
+        MRScheduleMyrtleHostWindowGeometryFollowup();
+    };
+    if (onMainThread)
+        updateGeometry();
+    else
+        dispatch_async(dispatch_get_main_queue(), updateGeometry);
 }
 
 static void MRHookMyrtleHostGesture(id self, SEL selector,
