@@ -523,7 +523,7 @@ static void MRHookMyrtleHostWindowLayoutSubviews(id self, SEL selector)
 }
 
 static void MRHookMyrtleSceneOrientation(id self, SEL selector,
-                                         NSString *bundleID, NSInteger orientation)
+                                         NSString *bundleID, NSInteger)
 {
     // This Myrtle 1.4.1 method only updates the hosted app scene. Keep that
     // scene portrait while the application behind it follows device rotation.
