@@ -337,26 +337,32 @@ static void MRInvalidateMyrtleSnapTransition(void)
 static void MRRestoreMyrtleHostWindowGeometry(void)
 {
     UIWindow *window = MRScopedMyrtleHostWindow ?: MRMyrtleHostWindow();
-    if (window == nil || !MRNativeMyrtleHostWindowGeometrySaved ||
-        !MRMyrtleHostWindowCropApplied) return;
-
-    MRMyrtleHostWindowGeometrySyncing = YES;
-    @try {
-        [UIView performWithoutAnimation:^{
-            window.bounds = MRNativeMyrtleHostWindowBounds;
-            window.frame = MRNativeMyrtleHostWindowFrame;
-            window.clipsToBounds = MRNativeMyrtleHostWindowClipsToBounds;
-            UIView *rootView = MRScopedMyrtleHostRootView ?: window.rootViewController.view;
-            if ([rootView isKindOfClass:UIView.class]) {
-                rootView.autoresizingMask = MRNativeMyrtleHostRootViewAutoresizingMask;
-                rootView.bounds = MRNativeMyrtleHostRootViewBounds;
-                rootView.frame = MRNativeMyrtleHostRootViewFrame;
-            }
-        }];
-    } @finally {
-        MRMyrtleHostWindowGeometrySyncing = NO;
+    if (window != nil && MRNativeMyrtleHostWindowGeometrySaved &&
+        MRMyrtleHostWindowCropApplied) {
+        MRMyrtleHostWindowGeometrySyncing = YES;
+        @try {
+            [UIView performWithoutAnimation:^{
+                window.bounds = MRNativeMyrtleHostWindowBounds;
+                window.frame = MRNativeMyrtleHostWindowFrame;
+                window.clipsToBounds = MRNativeMyrtleHostWindowClipsToBounds;
+                UIView *rootView = MRScopedMyrtleHostRootView ?: window.rootViewController.view;
+                if ([rootView isKindOfClass:UIView.class]) {
+                    rootView.autoresizingMask = MRNativeMyrtleHostRootViewAutoresizingMask;
+                    rootView.bounds = MRNativeMyrtleHostRootViewBounds;
+                    rootView.frame = MRNativeMyrtleHostRootViewFrame;
+                }
+            }];
+        } @finally {
+            MRMyrtleHostWindowGeometrySyncing = NO;
+        }
     }
+
+    // Snapshots are tied to the screen geometry on which they were captured.
+    // Always take a fresh one after Myrtle returns to its native layout.
     MRMyrtleHostWindowCropApplied = NO;
+    MRNativeMyrtleHostWindowGeometrySaved = NO;
+    MRScopedMyrtleHostWindow = nil;
+    MRScopedMyrtleHostRootView = nil;
 }
 
 static void MRApplyMyrtleHostWindowGeometry(void)
@@ -366,6 +372,14 @@ static void MRApplyMyrtleHostWindowGeometry(void)
     // path. Never crop an intermediate animation frame, because that preserves
     // the old visible intersection and cuts away content moving on screen.
     if (MRMyrtleSnapTransitionInFlight) return;
+    CGRect screenBounds = UIScreen.mainScreen.bounds;
+    if (CGRectGetWidth(screenBounds) >= CGRectGetHeight(screenBounds)) {
+        // Our WindowServer crop is calculated in portrait coordinates.
+        // Landscape stays entirely on Myrtle's native geometry.
+        MRRestoreMyrtleHostWindowGeometry();
+        MRResetMyrtleHostWindowGeometryCandidate();
+        return;
+    }
     UIWindow *window = MRMyrtleHostWindow();
     id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
     NSString *bundleID = MRSafeValue(manager, @"currentBundleID");
@@ -392,7 +406,6 @@ static void MRApplyMyrtleHostWindowGeometry(void)
         return;
     }
 
-    CGRect screenBounds = UIScreen.mainScreen.bounds;
     CGRect hostRect = CGRectNull;
     CGRect cropRect = CGRectNull;
     if (MRMyrtleHostWindowCropApplied &&
@@ -502,8 +515,17 @@ static void MRScheduleMyrtleHostWindowGeometryFollowup(void)
 
 static void MRHookMyrtleHostWindowLayoutSubviews(id self, SEL selector)
 {
+    CGRect screenBounds = UIScreen.mainScreen.bounds;
+    if (CGRectGetWidth(screenBounds) >= CGRectGetHeight(screenBounds) &&
+        MRMyrtleHostWindowCropApplied) {
+        // Remove the portrait crop before Myrtle lays the same window out in
+        // landscape, so its native layout is the final geometry written.
+        MRRestoreMyrtleHostWindowGeometry();
+        MRResetMyrtleHostWindowGeometryCandidate();
+    }
     MROriginalMyrtleHostWindowLayoutSubviews(self, selector);
     if (MRMyrtleHostWindowGeometrySyncing) return;
+    if (CGRectGetWidth(screenBounds) >= CGRectGetHeight(screenBounds)) return;
     // UIWindow may reset its controller view to bounds during layout. When a
     // crop is already active, repair the root compensation before this layout
     // is committed on screen; the asynchronous path is only for discovering a
