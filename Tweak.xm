@@ -32,10 +32,6 @@ static MRSetContentOffsetAnimatedIMP MROriginalSetContentOffsetAnimated = NULL;
 typedef void (*MRSetContentOffsetIMP)(id, SEL, CGPoint);
 static MRSetContentOffsetIMP MROriginalSetContentOffset = NULL;
 
-// Production builds discard the complete diagnostic expression at preprocessing
-// time: no arguments or diagnostic strings reach SpringBoard.
-#define MRLog(...) do {} while (0)
-
 static id MRSafeValue(id object, NSString *key)
 {
     if (object == nil || key.length == 0) return nil;
@@ -136,8 +132,6 @@ static NSUInteger MREnqueueDesiredFront(NSString *bundleID)
     [MRDesiredFrontOrder addObject:bundleID];
     while (MRDesiredFrontOrder.count > 32) [MRDesiredFrontOrder removeObjectAtIndex:0];
     MRDesiredFrontGeneration++;
-    MRLog(@"desired front generation=%lu oldest-to-newest=%@",
-          (unsigned long)MRDesiredFrontGeneration, MRDesiredFrontOrder);
     return MRDesiredFrontGeneration;
 }
 
@@ -145,7 +139,6 @@ static void MRRemoveDesiredFront(NSString *bundleID)
 {
     if (bundleID.length == 0) return;
     [MRDesiredFrontOrder removeObject:bundleID];
-    MRLog(@"removed %@ from desired order remaining=%@", bundleID, MRDesiredFrontOrder);
 }
 
 static BOOL MRReconcilePendingFront(void)
@@ -245,39 +238,23 @@ static NSString *MRSceneIdentifier(id application)
 static BOOL MRAddProductionDisplayItem(id switcher, id application, NSString *bundleID)
 {
     NSString *sceneIdentifier = MRSceneIdentifier(application);
-    if (sceneIdentifier.length == 0) {
-        MRLog(@"refusing production add %@ because no real scene identifier was found; scene=%@",
-              bundleID, scene);
-        return NO;
-    }
+    if (sceneIdentifier.length == 0) return NO;
     Class displayItemClass = NSClassFromString(@"SBDisplayItem");
     SEL factory = NSSelectorFromString(@"applicationDisplayItemWithBundleIdentifier:sceneIdentifier:");
     Method factoryMethod = class_getClassMethod(displayItemClass, factory);
     if (displayItemClass == Nil || factoryMethod == NULL ||
-        method_getNumberOfArguments(factoryMethod) != 4) {
-        MRLog(@"cannot create production display item for %@: factory unavailable", bundleID);
-        return NO;
-    }
+        method_getNumberOfArguments(factoryMethod) != 4) return NO;
     id displayItem = ((id (*)(id, SEL, id, id))objc_msgSend)(displayItemClass, factory,
                                                              bundleID, sceneIdentifier);
     SEL addSelector = NSSelectorFromString(@"addAppLayoutForDisplayItem:completion:");
     if (displayItem == nil || ![switcher respondsToSelector:addSelector] ||
-        !MRHasInstanceMethod([switcher class], @"addAppLayoutForDisplayItem:completion:", 4)) {
-        MRLog(@"cannot add production display item %@: scene=%@ sceneID=%@ item=%@",
-              bundleID, scene, sceneIdentifier, displayItem);
+        !MRHasInstanceMethod([switcher class], @"addAppLayoutForDisplayItem:completion:", 4))
         return NO;
-    }
 
     dispatch_block_t completion = ^{
-        dispatch_async(dispatch_get_main_queue(), ^{
-            MRLog(@"production add completion %@ sceneID=%@", bundleID, sceneIdentifier);
-            MRReconcilePendingFront();
-        });
+        dispatch_async(dispatch_get_main_queue(), ^{ MRReconcilePendingFront(); });
     };
     ((void (*)(id, SEL, id, id))objc_msgSend)(switcher, addSelector, displayItem, completion);
-    MRLog(@"sent production add %@ sceneClass=%@ sceneID=%@ item=%@",
-          bundleID, scene == nil ? @"(null)" : NSStringFromClass([scene class]),
-          sceneIdentifier, displayItem);
     return YES;
 }
 
@@ -469,17 +446,11 @@ static void MRPromoteExistingCard(NSString *bundleID)
     NSArray *layouts = MRRecentAppLayouts(switcher);
     NSUInteger index = NSNotFound;
     id layout = MRLayoutForBundleIdentifier(layouts, bundleID, &index);
-    if (layout == nil) {
-        MRLog(@"return-to-main %@ trigger=%@ layout-not-found count=%lu",
-              bundleID, trigger, (unsigned long)layouts.count);
-        return;
-    }
+    if (layout == nil) return;
     if (index != 0) {
         SEL selector = NSSelectorFromString(@"_addAppLayoutToFront:");
         if (![switcher respondsToSelector:selector]) return;
         ((void (*)(id, SEL, id))objc_msgSend)(switcher, selector, layout);
-        MRLog(@"return-to-main promoted %@ trigger=%@ oldIndex=%lu",
-              bundleID, trigger, (unsigned long)index);
     }
 }
 
@@ -495,18 +466,10 @@ static void MRScheduleReturnToMainPromotion(NSString *bundleID, NSUInteger gener
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                      (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            if (generation != MRReturnToMainGeneration) {
-                MRLog(@"skip stale return-to-main %@ generation=%lu current=%lu",
-                      trigger, (unsigned long)generation,
-                      (unsigned long)MRReturnToMainGeneration);
-                return;
-            }
+            if (generation != MRReturnToMainGeneration) return;
             id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
             NSString *current = MRSafeValue(manager, @"currentBundleID");
-            if (current.length != 0) {
-                MRLog(@"skip return-to-main %@ because Myrtle now hosts %@", trigger, current);
-                return;
-            }
+            if (current.length != 0) return;
             MRPromoteExistingCard(bundleID);
         });
     }
@@ -520,19 +483,10 @@ static void MRScheduleFullscreenPromotion(NSString *bundleID, NSUInteger generat
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                      (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            if (generation != MRReturnToMainGeneration) {
-                MRLog(@"skip stale fullscreen promotion %@ generation=%lu current=%lu",
-                      trigger, (unsigned long)generation,
-                      (unsigned long)MRReturnToMainGeneration);
-                return;
-            }
+            if (generation != MRReturnToMainGeneration) return;
             id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
             NSString *current = MRSafeValue(manager, @"currentBundleID");
-            if (current.length != 0) {
-                MRLog(@"skip fullscreen promotion %@ because Myrtle now hosts %@",
-                      trigger, current);
-                return;
-            }
+            if (current.length != 0) return;
             MRPromoteExistingCard(bundleID);
         });
     }
@@ -549,10 +503,7 @@ static BOOL MRPromoteOrInsertSwitcherCard(NSString *bundleID)
     if (appController != nil && [appController respondsToSelector:appSelector])
         application = ((id (*)(id, SEL, id))objc_msgSend)(appController, appSelector, bundleID);
 
-    if (switcher == nil || application == nil) {
-        MRLog(@"cannot handle %@: switcher=%@ application=%@", bundleID, switcher, application);
-        return NO;
-    }
+    if (switcher == nil || application == nil) return NO;
 
     NSArray *layouts = MRRecentAppLayouts(switcher);
     id existing = MRLayoutForBundleIdentifier(layouts, bundleID, NULL);
@@ -563,13 +514,10 @@ static BOOL MRPromoteOrInsertSwitcherCard(NSString *bundleID)
         SEL promoteSelector = NSSelectorFromString(@"_addAppLayoutToFront:");
         if (![switcher respondsToSelector:promoteSelector] ||
             !MRHasInstanceMethod([switcher class], @"_addAppLayoutToFront:", 3)) {
-            MRLog(@"cannot promote %@: _addAppLayoutToFront: unavailable", bundleID);
             MRRemoveDesiredFront(bundleID);
             return NO;
         }
         ((void (*)(id, SEL, id))objc_msgSend)(switcher, promoteSelector, existing);
-        MRLog(@"sent promote %@ oldIndex=%lu layoutClass=%@", bundleID,
-              (unsigned long)oldIndex, NSStringFromClass([existing class]));
     } else {
         if (!MRAddProductionDisplayItem(switcher, application, bundleID)) {
             MRRemoveDesiredFront(bundleID);
@@ -587,7 +535,6 @@ static BOOL MREnsureSwitcherCardAfterMyrtleClosed(NSString *bundleID,
     NSArray *layouts = MRRecentAppLayouts(switcher);
     id existing = MRLayoutForBundleIdentifier(layouts, bundleID, NULL);
     if (existing != nil) {
-        MRLog(@"quick-close card already materialized %@", bundleID);
         MRScheduleReturnToMainPromotion(underlyingBundleID,
                                         MRReturnToMainGeneration);
         return YES;
@@ -599,19 +546,13 @@ static BOOL MREnsureSwitcherCardAfterMyrtleClosed(NSString *bundleID,
     if (appController != nil && [appController respondsToSelector:appSelector])
         application = ((id (*)(id, SEL, id))objc_msgSend)(appController,
                                                           appSelector, bundleID);
-    if (switcher == nil || application == nil) {
-        MRLog(@"quick-close cannot ensure %@ switcher=%@ application=%@",
-              bundleID, switcher, application);
-        return NO;
-    }
+    if (switcher == nil || application == nil) return NO;
     if (!MRAddProductionDisplayItem(switcher, application, bundleID)) return NO;
 
     // addAppLayoutForDisplayItem: may place the newly materialized B at the
     // front. The window is already closed, so re-promote its underlying A
     // after the asynchronous model insertion settles. No desired-front entry
     // is added for B on this path.
-    MRLog(@"quick-close sent card add %@; restoring underlying=%@",
-          bundleID, underlyingBundleID);
     MRScheduleReturnToMainPromotion(underlyingBundleID,
                                     MRReturnToMainGeneration);
     return YES;
@@ -672,8 +613,6 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
         MRRecentlyClosedMyrtleBundleID = nil;
         MRRecentlyClosedMyrtleTime = 0;
     }
-    MRLog(@"Myrtle committed currentBundleID=%@ previous=%@ underlyingMain=%@",
-          stableBundleID, previousBundleID, MRUnderlyingMainBundleID);
     if (stableBundleID.length == 0) {
         if (fullscreenTransition) {
             NSString *fullscreenBundleID = [previousBundleID copy];
@@ -682,8 +621,6 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
             MRUnderlyingMainBundleID = nil;
             [MRDesiredFrontOrder removeAllObjects];
             MRDesiredFrontGeneration++;
-            MRLog(@"Myrtle fullscreen transition %@; preserving target recency",
-                  fullscreenBundleID);
             MRScheduleFullscreenPromotion(fullscreenBundleID, transitionGeneration);
             return;
         }
@@ -693,8 +630,6 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
         MRUnderlyingMainBundleID = nil;
         [MRDesiredFrontOrder removeAllObjects];
         MRDesiredFrontGeneration++;
-        MRLog(@"Myrtle closed %@; returning immediately to main=%@",
-              previousBundleID, returnBundleID);
         MRScheduleReturnToMainPromotion(returnBundleID, transitionGeneration);
         return;
     }
@@ -711,13 +646,9 @@ static void MRHookSetCurrentBundle(id self, SEL selector, NSString *bundleID)
             NSString *current = MRSafeValue(manager, @"currentBundleID");
             if ([current isEqualToString:stableBundleID]) {
                 cardHandled = MRPromoteOrInsertSwitcherCard(stableBundleID);
-                MRLog(@"open card attempt %@ delay=%.2f active=1 handled=%d",
-                      stableBundleID, delay.doubleValue, cardHandled);
             } else {
                 cardHandled = MREnsureSwitcherCardAfterMyrtleClosed(stableBundleID,
                                                                     underlyingForOpen);
-                MRLog(@"open card attempt %@ delay=%.2f active=0 current=%@ handled=%d",
-                      stableBundleID, delay.doubleValue, current, cardHandled);
             }
         });
     }
@@ -734,17 +665,12 @@ static void MRRecordMyrtleFullscreenIntent(NSString *bundleID)
     if (bundleID.length == 0) return;
     NSUInteger intentGeneration = ++MRMyrtleFullscreenIntentGeneration;
     MRMyrtleFullscreenIntentBundleID = [bundleID copy];
-    MRLog(@"Myrtle fullscreen intent bundle=%@ generation=%lu source=%@",
-          bundleID, (unsigned long)intentGeneration, source);
-
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (intentGeneration == MRMyrtleFullscreenIntentGeneration &&
             [MRMyrtleFullscreenIntentBundleID isEqualToString:bundleID]) {
             MRMyrtleFullscreenIntentBundleID = nil;
             MRMyrtleFullscreenIntentGeneration++;
-            MRLog(@"expired unconsumed Myrtle fullscreen intent bundle=%@ source=%@",
-                  bundleID, source);
         }
     });
 }
@@ -785,12 +711,7 @@ static void MRHookMyrtleHostCoreLaunch(id self, SEL selector, NSString *bundleID
         MRRecentlyClosedMyrtleTime = 0;
         MRMyrtleFullscreenIntentBundleID = nil;
         MRMyrtleFullscreenIntentGeneration++;
-        MRLog(@"Myrtle late fullscreen launch bundle=%@ sinceClose=%.3f; cancelling return-to-main",
-              stableBundleID, sinceClose);
         MRScheduleFullscreenPromotion(stableBundleID, generation);
-    } else {
-        MRLog(@"Myrtle HostCore launch observed bundle=%@ current=%@ recentClosed=%@ age=%.3f",
-              stableBundleID, currentBundleID, MRRecentlyClosedMyrtleBundleID, sinceClose);
     }
 
     MROriginalMyrtleHostCoreLaunch(self, selector, stableBundleID);
@@ -805,10 +726,7 @@ static void MRCloseMyrtleWindowForBundleID(NSString *bundleID)
     Method method = class_getInstanceMethod([manager class], selector);
     if (manager != nil && [manager respondsToSelector:selector] &&
         method != NULL && method_getNumberOfArguments(method) == 4) {
-        MRLog(@"closing Myrtle host after switcher removed %@", bundleID);
         ((void (*)(id, SEL, BOOL, id))objc_msgSend)(manager, selector, YES, nil);
-    } else {
-        MRLog(@"Myrtle close selector unavailable for %@", bundleID);
     }
 }
 
@@ -827,8 +745,6 @@ static MRDeletedDisplayItemIMP MROriginalDeletedDisplayItem = NULL;
 static void MRHookRemoveLayout(id self, SEL selector, id layout, long long reason)
 {
     NSString *bundleID = [MRBundleIdentifierFromLayout(layout) copy];
-    MRLog(@"switcher removing %@ reason=%lld layoutClass=%@", bundleID, reason,
-          layout == nil ? @"(null)" : NSStringFromClass([layout class]));
     MROriginalRemoveLayout(self, selector, layout, reason);
     MRRemoveDesiredFront(bundleID);
     MRCloseMyrtleWindowForBundleID(bundleID);
@@ -839,9 +755,6 @@ static void MRHookDeletedDisplayItem(id self, SEL selector, id controller,
 {
     NSString *bundleID = [MRDirectBundleIdentifier(displayItem) copy];
     if (bundleID.length == 0) bundleID = [MRBundleIdentifierFromLayout(layout) copy];
-    MRLog(@"user deleted display item %@ reason=%lld item=%@ layoutClass=%@",
-          bundleID, reason, displayItem,
-          layout == nil ? @"(null)" : NSStringFromClass([layout class]));
     MROriginalDeletedDisplayItem(self, selector, controller, displayItem, layout, reason);
     MRRemoveDesiredFront(bundleID);
     MRCloseMyrtleWindowForBundleID(bundleID);
@@ -854,8 +767,6 @@ static void MRHookModelChanged(id self, SEL selector, id model)
     NSString *myrtleBundleID = [MRSafeValue(manager, @"currentBundleID") copy];
     if (myrtleBundleID.length != 0) {
         NSString *systemCurrentBundleID = [MRCurrentMainApplicationBundleID() copy];
-        MRLog(@"model changed while Myrtle hosts=%@ systemCurrent=%@ underlyingMain=%@",
-              myrtleBundleID, systemCurrentBundleID, MRUnderlyingMainBundleID);
         if ([systemCurrentBundleID isEqualToString:myrtleBundleID] &&
             ![MRUnderlyingMainBundleID isEqualToString:myrtleBundleID]) {
             // Myrtle's fullscreen action may activate the already-hosted scene
@@ -1096,7 +1007,6 @@ static BOOL MRInstallMyrtleHook(void)
     if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 3) return NO;
     MSHookMessageEx(cls, selector, (IMP)MRHookSetCurrentBundle,
                     (IMP *)&MROriginalSetCurrentBundle);
-    MRLog(@"installed direct MyrtleHostManager hook");
     return MROriginalSetCurrentBundle != NULL;
 }
 
@@ -1109,7 +1019,6 @@ static BOOL MRInstallMyrtleFullscreenHook(void)
     if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 2) return NO;
     MSHookMessageEx(cls, selector, (IMP)MRHookMyrtleFullscreen,
                     (IMP *)&MROriginalMyrtleFullscreen);
-    MRLog(@"installed direct Myrtle fullscreen-launch hook");
     return MROriginalMyrtleFullscreen != NULL;
 }
 
@@ -1122,7 +1031,6 @@ static BOOL MRInstallMyrtleHostCoreLaunchHook(void)
     if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 3) return NO;
     MSHookMessageEx(object_getClass(cls), selector, (IMP)MRHookMyrtleHostCoreLaunch,
                     (IMP *)&MROriginalMyrtleHostCoreLaunch);
-    MRLog(@"installed direct Myrtle HostCore launch hook");
     return MROriginalMyrtleHostCoreLaunch != NULL;
 }
 
@@ -1237,9 +1145,6 @@ static void MRInstallSwitcherRemoveHook(void)
     if (cls != Nil && method != NULL && method_getNumberOfArguments(method) == 4) {
         MSHookMessageEx(cls, selector, (IMP)MRHookRemoveLayout,
                         (IMP *)&MROriginalRemoveLayout);
-        MRLog(@"installed SBMainSwitcherViewController removal hook");
-    } else {
-        MRLog(@"SBMainSwitcherViewController removal method unavailable");
     }
 }
 
@@ -1251,9 +1156,6 @@ static void MRInstallSwitcherReconciliationHooks(void)
     if (cls != Nil && changedMethod != NULL && method_getNumberOfArguments(changedMethod) == 3) {
         MSHookMessageEx(cls, changedSelector, (IMP)MRHookModelChanged,
                         (IMP *)&MROriginalModelChanged);
-        MRLog(@"installed switcher model-change reconciliation hook");
-    } else {
-        MRLog(@"switcher model-change reconciliation method unavailable");
     }
 
     SEL appearSelector = @selector(viewWillAppear:);
@@ -1261,9 +1163,6 @@ static void MRInstallSwitcherReconciliationHooks(void)
     if (cls != Nil && appearMethod != NULL && method_getNumberOfArguments(appearMethod) == 3) {
         MSHookMessageEx(cls, appearSelector, (IMP)MRHookViewWillAppear,
                         (IMP *)&MROriginalViewWillAppear);
-        MRLog(@"installed switcher appearance reconciliation hook");
-    } else {
-        MRLog(@"switcher appearance reconciliation method unavailable");
     }
 }
 
@@ -1275,9 +1174,6 @@ static void MRInstallUserDeletionHook(void)
     if (cls != Nil && method != NULL && method_getNumberOfArguments(method) == 6) {
         MSHookMessageEx(cls, selector, (IMP)MRHookDeletedDisplayItem,
                         (IMP *)&MROriginalDeletedDisplayItem);
-        MRLog(@"installed direct user-card deletion hook");
-    } else {
-        MRLog(@"direct user-card deletion method unavailable");
     }
 }
 
@@ -1292,12 +1188,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
         keyboardAvoidanceInstalled && selectorCenterInstalled &&
         actionDispatcherInstalled) return;
-    if (attempt >= 60) {
-        MRLog(@"Myrtle hooks unavailable after 60 seconds manager=%d fullscreen=%d hostCoreLaunch=%d keyboard=%d selectorCenter=%d",
-              managerInstalled, fullscreenInstalled, hostCoreLaunchInstalled,
-              keyboardAvoidanceInstalled, selectorCenterInstalled);
-        return;
-    }
+    if (attempt >= 60) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{ MRInstallMyrtleWhenReady(attempt + 1); });
 }
