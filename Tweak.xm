@@ -48,6 +48,8 @@ typedef UIView *(*MRMyrtleHostWindowHitTestIMP)(id, SEL, CGPoint, UIEvent *);
 static MRMyrtleHostWindowHitTestIMP MROriginalMyrtleHostWindowHitTest = NULL;
 typedef void (*MRWindowLayoutSubviewsIMP)(id, SEL);
 static MRWindowLayoutSubviewsIMP MROriginalMyrtleHostWindowLayoutSubviews = NULL;
+typedef void (*MRMyrtleSceneOrientationIMP)(id, SEL, NSString *, NSInteger);
+static MRMyrtleSceneOrientationIMP MROriginalMyrtleSceneOrientation = NULL;
 typedef void (*MRMyrtleHostGestureIMP)(id, SEL, UIGestureRecognizer *);
 static MRMyrtleHostGestureIMP MROriginalMyrtleHostGesture = NULL;
 typedef void (*MRMyrtleSnapTransitionIMP)(id, SEL, BOOL);
@@ -265,8 +267,8 @@ static CGRect MRVisibleMyrtleHostRectInScreen(UIView *hostView)
     if (![hostView isKindOfClass:UIView.class] || hostView.window == nil)
         return CGRectNull;
 
-    CGRect screenBounds = UIScreen.mainScreen.bounds;
-    id<UICoordinateSpace> screenSpace = UIScreen.mainScreen.fixedCoordinateSpace;
+    id<UICoordinateSpace> screenSpace = UIScreen.mainScreen.coordinateSpace;
+    CGRect screenBounds = screenSpace.bounds;
     CGRect bestRect = CGRectNull;
     CGFloat bestArea = 0.0;
     // Myrtle scales/clips the hosted scene through one or more containers.
@@ -372,14 +374,7 @@ static void MRApplyMyrtleHostWindowGeometry(void)
     // path. Never crop an intermediate animation frame, because that preserves
     // the old visible intersection and cuts away content moving on screen.
     if (MRMyrtleSnapTransitionInFlight) return;
-    CGRect screenBounds = UIScreen.mainScreen.bounds;
-    if (CGRectGetWidth(screenBounds) >= CGRectGetHeight(screenBounds)) {
-        // Our WindowServer crop is calculated in portrait coordinates.
-        // Landscape stays entirely on Myrtle's native geometry.
-        MRRestoreMyrtleHostWindowGeometry();
-        MRResetMyrtleHostWindowGeometryCandidate();
-        return;
-    }
+    CGRect screenBounds = UIScreen.mainScreen.coordinateSpace.bounds;
     UIWindow *window = MRMyrtleHostWindow();
     id manager = MRSendClassNoArgs(@"MyrtleHostManager", @"sharedManager");
     NSString *bundleID = MRSafeValue(manager, @"currentBundleID");
@@ -515,17 +510,8 @@ static void MRScheduleMyrtleHostWindowGeometryFollowup(void)
 
 static void MRHookMyrtleHostWindowLayoutSubviews(id self, SEL selector)
 {
-    CGRect screenBounds = UIScreen.mainScreen.bounds;
-    if (CGRectGetWidth(screenBounds) >= CGRectGetHeight(screenBounds) &&
-        MRMyrtleHostWindowCropApplied) {
-        // Remove the portrait crop before Myrtle lays the same window out in
-        // landscape, so its native layout is the final geometry written.
-        MRRestoreMyrtleHostWindowGeometry();
-        MRResetMyrtleHostWindowGeometryCandidate();
-    }
     MROriginalMyrtleHostWindowLayoutSubviews(self, selector);
     if (MRMyrtleHostWindowGeometrySyncing) return;
-    if (CGRectGetWidth(screenBounds) >= CGRectGetHeight(screenBounds)) return;
     // UIWindow may reset its controller view to bounds during layout. When a
     // crop is already active, repair the root compensation before this layout
     // is committed on screen; the asynchronous path is only for discovering a
@@ -534,6 +520,19 @@ static void MRHookMyrtleHostWindowLayoutSubviews(id self, SEL selector)
         MRApplyMyrtleHostWindowGeometry();
     else
         MRScheduleMyrtleHostWindowGeometrySync();
+}
+
+static void MRHookMyrtleSceneOrientation(id self, SEL selector,
+                                         NSString *bundleID, NSInteger orientation)
+{
+    // This Myrtle 1.4.1 method only updates the hosted app scene. Keep that
+    // scene portrait while the application behind it follows device rotation.
+    MRRestoreMyrtleHostWindowGeometry();
+    MRResetMyrtleHostWindowGeometryCandidate();
+    MROriginalMyrtleSceneOrientation(self, selector, bundleID,
+                                     UIInterfaceOrientationPortrait);
+    MRScheduleMyrtleHostWindowGeometrySync();
+    MRScheduleMyrtleHostWindowGeometryFollowup();
 }
 
 static void MRHookMyrtleHostGesture(id self, SEL selector,
@@ -607,7 +606,7 @@ static UIView *MRHookMyrtleHostWindowHitTest(id self, SEL selector,
     UIView *hostView = MRSafeValue(manager, @"hostView");
     CGRect hostRect = MRVisibleMyrtleHostRectInScreen(hostView);
     CGPoint screenPoint = [(UIView *)self convertPoint:point
-                                    toCoordinateSpace:UIScreen.mainScreen.fixedCoordinateSpace];
+                                    toCoordinateSpace:UIScreen.mainScreen.coordinateSpace];
 
     // With no hosted keyboard, only the visible hosted card may keep the hit.
     // The hosted scene can retain full-screen logical bounds while a parent
@@ -1784,6 +1783,30 @@ static BOOL MRInstallMyrtleHostWindowGeometryHook(void)
     return installed;
 }
 
+static BOOL MRInstallMyrtleSceneOrientationHook(void)
+{
+    if (MROriginalMyrtleSceneOrientation != NULL) return YES;
+
+    Class cls = NSClassFromString(@"MyrtleViewController");
+    SEL selector = NSSelectorFromString(@"MT_IIllIIIIllIIIlIllIIl::");
+    Method method = class_getInstanceMethod(cls, selector);
+    if (cls == Nil || method == NULL || method_getNumberOfArguments(method) != 4)
+        return NO;
+
+    char returnType[16] = {};
+    char bundleType[16] = {};
+    char orientationType[16] = {};
+    method_getReturnType(method, returnType, sizeof(returnType));
+    method_getArgumentType(method, 2, bundleType, sizeof(bundleType));
+    method_getArgumentType(method, 3, orientationType, sizeof(orientationType));
+    if (returnType[0] != 'v' || bundleType[0] != '@' || orientationType[0] != 'q')
+        return NO;
+
+    MSHookMessageEx(cls, selector, (IMP)MRHookMyrtleSceneOrientation,
+                    (IMP *)&MROriginalMyrtleSceneOrientation);
+    return MROriginalMyrtleSceneOrientation != NULL;
+}
+
 static BOOL MRInstallMyrtleHostGestureHook(void)
 {
     if (MROriginalMyrtleHostGesture != NULL) return YES;
@@ -1944,13 +1967,14 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL outsideActionGateInstalled = MRInstallMyrtleOutsideActionGateHook();
     BOOL hostPassThroughInstalled = MRInstallMyrtleHostWindowPassThroughHook();
     BOOL hostGeometryInstalled = MRInstallMyrtleHostWindowGeometryHook();
+    BOOL sceneOrientationInstalled = MRInstallMyrtleSceneOrientationHook();
     BOOL hostGestureInstalled = MRInstallMyrtleHostGestureHook();
     BOOL hostSnapInstalled = MRInstallMyrtleSnapTransitionHook();
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
     BOOL actionDispatcherInstalled = MRInstallMyrtleActionDispatcherHook();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
         keyboardAvoidanceInstalled && outsideActionGateInstalled && hostPassThroughInstalled &&
-        hostGeometryInstalled && hostGestureInstalled && hostSnapInstalled &&
+        hostGeometryInstalled && sceneOrientationInstalled && hostGestureInstalled && hostSnapInstalled &&
         selectorCenterInstalled && actionDispatcherInstalled) {
         return;
     }
