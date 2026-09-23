@@ -798,17 +798,28 @@ typedef void (*MRActionDispatcherIMP)(id, SEL, id, id, id);
 static MRActionDispatcherIMP MROriginalActionDispatcher = NULL;
 typedef void (*MRSetWindowOpenIMP)(id, SEL, BOOL);
 static MRSetWindowOpenIMP MROriginalSetWindowOpen = NULL;
+static MRSetWindowOpenIMP MROriginalSetWillWindowOpen = NULL;
 static const void *MRDirectSnapPendingKey = &MRDirectSnapPendingKey;
 
 static void MRHookSetWindowOpen(id self, SEL selector, BOOL open)
 {
     MROriginalSetWindowOpen(self, selector, open);
-    if (!open || ![objc_getAssociatedObject(self, MRDirectSnapPendingKey) boolValue]) return;
+    if (!open)
+        objc_setAssociatedObject(self, MRDirectSnapPendingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void MRHookSetWillWindowOpen(id self, SEL selector, BOOL opening)
+{
+    MROriginalSetWillWindowOpen(self, selector, opening);
+    if (opening || ![objc_getAssociatedObject(self, MRDirectSnapPendingKey) boolValue]) return;
     objc_setAssociatedObject(self, MRDirectSnapPendingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     dispatch_async(dispatch_get_main_queue(), ^{
-        SEL snap = NSSelectorFromString(@"MT_IlIllIIlIIlllIIIIlIl:");
-        if ([MRSafeValue(self, @"isWindowOpen") boolValue] && [self respondsToSelector:snap])
-            ((void (*)(id, SEL, BOOL))objc_msgSend)(self, snap, YES);
+        SEL edge = NSSelectorFromString(@"MT_llIIIIlllllllllIIIll:");
+        if ([MRSafeValue(self, @"isWindowOpen") boolValue] &&
+            [MRSafeValue(self, @"currentWindowBundleID") length] != 0 &&
+            [MRSafeValue(self, @"currentSnapStatus") integerValue] == 0 &&
+            [self respondsToSelector:edge])
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(self, edge, YES);
     });
 }
 
@@ -820,8 +831,7 @@ static void MRHookActionDispatcher(id self, SEL selector, id argument1,
     BOOL isWindowOpen = [MRSafeValue(self, @"isWindowOpen") boolValue];
     if (isReloadAction && !isWindowOpen) MRReloadForegroundApplication();
     if (!isWindowOpen && [argument1 isKindOfClass:NSString.class] &&
-        [(NSString *)argument1 isEqualToString:@"switchFullscreenWindow"] &&
-        MRCurrentMainApplicationBundleID().length != 0) {
+        [(NSString *)argument1 isEqualToString:@"switchFullscreenWindow"]) {
         objc_setAssociatedObject(self, MRDirectSnapPendingKey, @YES,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
@@ -1125,7 +1135,13 @@ static BOOL MRInstallMyrtleActionDispatcherHook(void)
     if (openMethod != NULL && method_getNumberOfArguments(openMethod) == 3)
         MSHookMessageEx(cls, openSelector, (IMP)MRHookSetWindowOpen,
                         (IMP *)&MROriginalSetWindowOpen);
-    return MROriginalActionDispatcher != NULL && MROriginalSetWindowOpen != NULL;
+    SEL willSelector = NSSelectorFromString(@"setWillWindowOpen:");
+    Method willMethod = class_getInstanceMethod(cls, willSelector);
+    if (willMethod != NULL && method_getNumberOfArguments(willMethod) == 3)
+        MSHookMessageEx(cls, willSelector, (IMP)MRHookSetWillWindowOpen,
+                        (IMP *)&MROriginalSetWillWindowOpen);
+    return MROriginalActionDispatcher != NULL && MROriginalSetWindowOpen != NULL &&
+        MROriginalSetWillWindowOpen != NULL;
 }
 
 static BOOL MRInstallRootIconScrollHooks(void)
