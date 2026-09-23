@@ -799,7 +799,20 @@ static MRActionDispatcherIMP MROriginalActionDispatcher = NULL;
 typedef void (*MRSetWindowOpenIMP)(id, SEL, BOOL);
 static MRSetWindowOpenIMP MROriginalSetWindowOpen = NULL;
 static MRSetWindowOpenIMP MROriginalSetWillWindowOpen = NULL;
+typedef void (*MRSetWindowBundleIMP)(id, SEL, NSString *);
+static MRSetWindowBundleIMP MROriginalSetWindowBundle = NULL;
 static const void *MRDirectSnapPendingKey = &MRDirectSnapPendingKey;
+
+static void MRHookSetWindowBundle(id self, SEL selector, NSString *bundleID)
+{
+    if ([bundleID isKindOfClass:NSString.class] && bundleID.length != 0 &&
+        [objc_getAssociatedObject(self, MRDirectSnapPendingKey) boolValue]) {
+        SEL queue = NSSelectorFromString(@"MT_llIllllIIIlIlIlIIllI:");
+        if ([self respondsToSelector:queue])
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(self, queue, YES);
+    }
+    MROriginalSetWindowBundle(self, selector, bundleID);
+}
 
 static void MRHookSetWindowOpen(id self, SEL selector, BOOL open)
 {
@@ -1140,8 +1153,13 @@ static BOOL MRInstallMyrtleActionDispatcherHook(void)
     if (willMethod != NULL && method_getNumberOfArguments(willMethod) == 3)
         MSHookMessageEx(cls, willSelector, (IMP)MRHookSetWillWindowOpen,
                         (IMP *)&MROriginalSetWillWindowOpen);
+    SEL bundleSelector = NSSelectorFromString(@"setCurrentWindowBundleID:");
+    Method bundleMethod = class_getInstanceMethod(cls, bundleSelector);
+    if (bundleMethod != NULL && method_getNumberOfArguments(bundleMethod) == 3)
+        MSHookMessageEx(cls, bundleSelector, (IMP)MRHookSetWindowBundle,
+                        (IMP *)&MROriginalSetWindowBundle);
     return MROriginalActionDispatcher != NULL && MROriginalSetWindowOpen != NULL &&
-        MROriginalSetWillWindowOpen != NULL;
+        MROriginalSetWillWindowOpen != NULL && MROriginalSetWindowBundle != NULL;
 }
 
 static BOOL MRInstallRootIconScrollHooks(void)
