@@ -3,6 +3,20 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <substrate.h>
+#include <stdio.h>
+#include <stdarg.h>
+
+static void MRGeometryProbe(NSString *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments];
+    va_end(arguments);
+    FILE *file = fopen("/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.snap-geometry.log", "a");
+    if (file == NULL) return;
+    fprintf(file, "%.3f %s\n", NSDate.date.timeIntervalSince1970, message.UTF8String);
+    fclose(file);
+}
 
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
@@ -1237,6 +1251,46 @@ static void MRInstallUserDeletionHook(void)
     }
 }
 
+typedef void (*MRHostOpenIMP)(id, SEL, id, CGRect, double, int, id);
+static MRHostOpenIMP MROriginalHostOpen = NULL;
+typedef void (*MRHostRelayoutIMP)(id, SEL, CGRect, double, int, id);
+static MRHostRelayoutIMP MROriginalHostRelayout = NULL;
+
+static void MRHookHostOpen(id self, SEL selector, id bundleID, CGRect frame,
+                           double scale, int snap, id completion)
+{
+    MRGeometryProbe(@"open bundle=%@ frame=%@ scale=%.4f snap=%d", bundleID,
+                    NSStringFromCGRect(frame), scale, snap);
+    MROriginalHostOpen(self, selector, bundleID, frame, scale, snap, completion);
+}
+
+static void MRHookHostRelayout(id self, SEL selector, CGRect frame, double scale,
+                               int snap, id completion)
+{
+    MRGeometryProbe(@"relayout frame=%@ scale=%.4f snap=%d", NSStringFromCGRect(frame),
+                    scale, snap);
+    MROriginalHostRelayout(self, selector, frame, scale, snap, completion);
+}
+
+static void MRInstallGeometryProbe(void)
+{
+    Class cls = NSClassFromString(@"MyrtleHostManager");
+    if (cls == Nil) return;
+    SEL open = NSSelectorFromString(@"MT_lIlIIIIlllIlllIIIIlI:::::");
+    SEL relayout = NSSelectorFromString(@"MT_IlllllllIlIIIIIIlIll::::");
+    Method openMethod = class_getInstanceMethod(cls, open);
+    Method relayoutMethod = class_getInstanceMethod(cls, relayout);
+    if (MROriginalHostOpen == NULL && openMethod != NULL &&
+        method_getNumberOfArguments(openMethod) == 7)
+        MSHookMessageEx(cls, open, (IMP)MRHookHostOpen, (IMP *)&MROriginalHostOpen);
+    if (MROriginalHostRelayout == NULL && relayoutMethod != NULL &&
+        method_getNumberOfArguments(relayoutMethod) == 6)
+        MSHookMessageEx(cls, relayout, (IMP)MRHookHostRelayout,
+                        (IMP *)&MROriginalHostRelayout);
+    MRGeometryProbe(@"installed open=%d relayout=%d", MROriginalHostOpen != NULL,
+                    MROriginalHostRelayout != NULL);
+}
+
 static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 {
     BOOL managerInstalled = MRInstallMyrtleHook();
@@ -1245,9 +1299,12 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL keyboardAvoidanceInstalled = MRInstallMyrtleKeyboardAvoidanceHook();
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
     BOOL actionDispatcherInstalled = MRInstallMyrtleActionDispatcherHook();
+    if (attempt == 0 || MROriginalHostOpen == NULL || MROriginalHostRelayout == NULL)
+        MRInstallGeometryProbe();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
         keyboardAvoidanceInstalled && selectorCenterInstalled &&
-        actionDispatcherInstalled) return;
+        actionDispatcherInstalled && MROriginalHostOpen != NULL &&
+        MROriginalHostRelayout != NULL) return;
     if (attempt >= 60) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{ MRInstallMyrtleWhenReady(attempt + 1); });
@@ -1256,6 +1313,9 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 %ctor
 {
     @autoreleasepool {
+        FILE *probeFile = fopen("/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.snap-geometry.log", "w");
+        if (probeFile != NULL) fclose(probeFile);
+        MRGeometryProbe(@"probe beta6 started");
         dispatch_async(dispatch_get_main_queue(), ^{
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
