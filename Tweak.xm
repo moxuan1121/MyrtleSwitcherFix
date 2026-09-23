@@ -3,6 +3,23 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <substrate.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+
+static const char *MRProbePath = "/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.direct-snap-probe.log";
+
+static void MRProbe(NSString *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments];
+    va_end(arguments);
+    FILE *file = fopen(MRProbePath, "a");
+    if (file == NULL) return;
+    fprintf(file, "%.3f %s\n", NSDate.date.timeIntervalSince1970, message.UTF8String);
+    fclose(file);
+}
 
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
@@ -677,6 +694,7 @@ static void MRRecordMyrtleFullscreenIntent(NSString *bundleID)
 
 static void MRHookMyrtleFullscreen(id self, SEL selector)
 {
+    MRProbe(@"fullscreenAction open=%d snap=%@", [MRSafeValue(self, @"isWindowOpen") boolValue], MRSafeValue(self, @"currentSnapStatus"));
     NSString *bundleID = [MRSafeValue(self, @"currentWindowBundleID") copy];
     if (bundleID.length == 0)
         bundleID = [MRSafeValue(self, @"lastWindowBundleID") copy];
@@ -797,14 +815,72 @@ static MROpenSelectorAtPointIMP MROriginalOpenSelectorAtPoint = NULL;
 typedef void (*MRActionDispatcherIMP)(id, SEL, id, id, id);
 static MRActionDispatcherIMP MROriginalActionDispatcher = NULL;
 
+static void MRProbeWindowState(id controller, NSString *event)
+{
+    MRProbe(@"%@ open=%d will=%d snap=%@ bundle=%@", event,
+            [MRSafeValue(controller, @"isWindowOpen") boolValue],
+            [MRSafeValue(controller, @"willWindowOpen") boolValue],
+            MRSafeValue(controller, @"currentSnapStatus"),
+            MRSafeValue(controller, @"currentWindowBundleID"));
+}
+
+typedef void (*MRProbeBoolIMP)(id, SEL, BOOL);
+static MRProbeBoolIMP MROriginalProbeSetWindowOpen = NULL;
+static MRProbeBoolIMP MROriginalProbeSnapRequest = NULL;
+static MRProbeBoolIMP MROriginalProbeEdgeTransition = NULL;
+typedef void (*MRProbeVoidIMP)(id, SEL);
+static MRProbeVoidIMP MROriginalProbeSnapAttempt = NULL;
+typedef void (*MRProbeHandleActionIMP)(id, SEL, NSInteger, BOOL);
+static MRProbeHandleActionIMP MROriginalProbeHandleAction = NULL;
+
+static void MRHookProbeHandleAction(id self, SEL selector, NSInteger action, BOOL alternate)
+{
+    MRProbe(@"handleAction action=%ld alternate=%d", (long)action, alternate);
+    MROriginalProbeHandleAction(self, selector, action, alternate);
+    MRProbeWindowState(self, @"handleActionDone");
+}
+
+static void MRHookProbeSetWindowOpen(id self, SEL selector, BOOL open)
+{
+    MRProbe(@"setIsWindowOpen:%d", open);
+    MROriginalProbeSetWindowOpen(self, selector, open);
+    MRProbeWindowState(self, @"windowState");
+}
+
+static void MRHookProbeSnapRequest(id self, SEL selector, BOOL up)
+{
+    MRProbe(@"snapRequest up=%d", up);
+    MROriginalProbeSnapRequest(self, selector, up);
+    MRProbeWindowState(self, @"snapRequestDone");
+}
+
+static void MRHookProbeSnapAttempt(id self, SEL selector)
+{
+    MRProbeWindowState(self, @"snapAttempt");
+    MROriginalProbeSnapAttempt(self, selector);
+    MRProbeWindowState(self, @"snapAttemptDone");
+}
+
+static void MRHookProbeEdgeTransition(id self, SEL selector, BOOL up)
+{
+    MRProbe(@"edgeTransition up=%d", up);
+    MROriginalProbeEdgeTransition(self, selector, up);
+    MRProbeWindowState(self, @"edgeTransitionDone");
+}
+
 static void MRHookActionDispatcher(id self, SEL selector, id argument1,
                                    id argument2, id argument3)
 {
+    MRProbe(@"action id=%@ arg2=%@ arg3=%@", argument1,
+            argument2 ? NSStringFromClass([argument2 class]) : @"nil",
+            argument3 ? NSStringFromClass([argument3 class]) : @"nil");
+    MRProbeWindowState(self, @"actionBefore");
     BOOL isReloadAction = [argument1 isKindOfClass:NSString.class] &&
         [(NSString *)argument1 isEqualToString:@"reloadApp"];
     BOOL isWindowOpen = [MRSafeValue(self, @"isWindowOpen") boolValue];
     if (isReloadAction && !isWindowOpen) MRReloadForegroundApplication();
     MROriginalActionDispatcher(self, selector, argument1, argument2, argument3);
+    MRProbeWindowState(self, @"actionAfter");
     MRForegroundReloadCandidateBundleID = nil;
     MRForegroundReloadCandidateGeneration++;
 }
@@ -974,6 +1050,7 @@ static void MRHookKeyboardWillHide(id self, SEL selector, NSNotification *notifi
 
 static void MRHookOpenSelectorAtPoint(id self, SEL selector, CGPoint centerPoint)
 {
+    MRProbeWindowState(self, @"selectorOpened");
     // This is Myrtle's selector-construction method.  Its CGPoint becomes the
     // radial menu's center before `setIsOverlayOpen:YES`.  Correct both the
     // live handle model and the incoming center before Myrtle creates/layouts
@@ -1102,6 +1179,51 @@ static BOOL MRInstallMyrtleActionDispatcherHook(void)
     return MROriginalActionDispatcher != NULL;
 }
 
+static void MRInstallSnapProbeHooks(void)
+{
+    Class cls = NSClassFromString(@"MyrtleViewController");
+    if (cls == Nil || MROriginalProbeSetWindowOpen != NULL) return;
+    struct {
+        const char *name;
+        IMP replacement;
+        IMP *original;
+        char returnType;
+        char argumentType;
+    } hooks[] = {
+        {"setIsWindowOpen:", (IMP)MRHookProbeSetWindowOpen, (IMP *)&MROriginalProbeSetWindowOpen, 'v', 'B'},
+        {"MT_IlIllIIlIIlllIIIIlIl:", (IMP)MRHookProbeSnapRequest, (IMP *)&MROriginalProbeSnapRequest, 'v', 'B'},
+        {"MT_IllllIIlllIlllllllII", (IMP)MRHookProbeSnapAttempt, (IMP *)&MROriginalProbeSnapAttempt, 'v', 0},
+        {"MT_llIIIIlllllllllIIIll:", (IMP)MRHookProbeEdgeTransition, (IMP *)&MROriginalProbeEdgeTransition, 'v', 'B'},
+    };
+    for (NSUInteger index = 0; index < sizeof(hooks) / sizeof(hooks[0]); index++) {
+        SEL selector = sel_registerName(hooks[index].name);
+        Method method = class_getInstanceMethod(cls, selector);
+        BOOL valid = method != NULL && method_getNumberOfArguments(method) == (hooks[index].argumentType ? 3 : 2);
+        if (valid) {
+            char type[16] = {};
+            method_getReturnType(method, type, sizeof(type));
+            valid = type[0] == hooks[index].returnType;
+            if (valid && hooks[index].argumentType) {
+                method_getArgumentType(method, 2, type, sizeof(type));
+                valid = type[0] == hooks[index].argumentType;
+            }
+        }
+        if (valid && *hooks[index].original == NULL)
+            MSHookMessageEx(cls, selector, hooks[index].replacement, hooks[index].original);
+        MRProbe(@"install %s valid=%d hooked=%d", hooks[index].name, valid,
+                *hooks[index].original != NULL);
+    }
+    SEL handleSelector = NSSelectorFromString(@"MT_llIllllIlIlIIIlIlIll::");
+    Method handleMethod = class_getInstanceMethod(cls, handleSelector);
+    BOOL handleValid = handleMethod != NULL &&
+        strcmp(method_getTypeEncoding(handleMethod), "v28@0:8q16B24") == 0;
+    if (handleValid && MROriginalProbeHandleAction == NULL)
+        MSHookMessageEx(cls, handleSelector, (IMP)MRHookProbeHandleAction,
+                        (IMP *)&MROriginalProbeHandleAction);
+    MRProbe(@"install handleAction valid=%d hooked=%d", handleValid,
+            MROriginalProbeHandleAction != NULL);
+}
+
 static BOOL MRInstallRootIconScrollHooks(void)
 {
     Class cls = NSClassFromString(@"SBIconScrollView");
@@ -1185,6 +1307,10 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL keyboardAvoidanceInstalled = MRInstallMyrtleKeyboardAvoidanceHook();
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
     BOOL actionDispatcherInstalled = MRInstallMyrtleActionDispatcherHook();
+    MRInstallSnapProbeHooks();
+    if (attempt == 0 || (managerInstalled && fullscreenInstalled && actionDispatcherInstalled))
+        MRProbe(@"coreInstall manager=%d fullscreen=%d action=%d", managerInstalled,
+                fullscreenInstalled, actionDispatcherInstalled);
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
         keyboardAvoidanceInstalled && selectorCenterInstalled &&
         actionDispatcherInstalled) return;
@@ -1196,6 +1322,9 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
 %ctor
 {
     @autoreleasepool {
+        FILE *file = fopen(MRProbePath, "w");
+        if (file != NULL) fclose(file);
+        MRProbe(@"probe 0.5.3.2~probe1 started");
         dispatch_async(dispatch_get_main_queue(), ^{
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
