@@ -5,6 +5,7 @@
 #import <substrate.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <string.h>
 
 static void MRGeometryProbe(NSString *format, ...)
 {
@@ -1255,6 +1256,18 @@ typedef void (*MRHostOpenIMP)(id, SEL, id, CGRect, double, int, id);
 static MRHostOpenIMP MROriginalHostOpen = NULL;
 typedef void (*MRHostRelayoutIMP)(id, SEL, CGRect, double, int, id);
 static MRHostRelayoutIMP MROriginalHostRelayout = NULL;
+typedef id (*MRHostGeometryIMP)(id, SEL, id, double, NSInteger);
+static MRHostGeometryIMP MROriginalHostGeometry = NULL;
+
+static id MRHookHostGeometry(id self, SEL selector, id context, double ratio,
+                             NSInteger snap)
+{
+    id result = MROriginalHostGeometry(self, selector, context, ratio, snap);
+    MRGeometryProbe(@"geometry context=%@ ratio=%.4f snap=%ld result=%@",
+                    context ? NSStringFromClass([context class]) : @"nil", ratio,
+                    (long)snap, [result isKindOfClass:NSArray.class] ? result : @"non-array");
+    return result;
+}
 
 static void MRHookHostOpen(id self, SEL selector, id bundleID, CGRect frame,
                            double scale, int snap, id completion)
@@ -1289,6 +1302,14 @@ static void MRInstallGeometryProbe(void)
                         (IMP *)&MROriginalHostRelayout);
     MRGeometryProbe(@"installed open=%d relayout=%d", MROriginalHostOpen != NULL,
                     MROriginalHostRelayout != NULL);
+    Class controller = NSClassFromString(@"MyrtleViewController");
+    SEL geometry = NSSelectorFromString(@"MT_IllIlllIIIlIIlllIlll:::");
+    Method geometryMethod = class_getInstanceMethod(controller, geometry);
+    if (MROriginalHostGeometry == NULL && geometryMethod != NULL &&
+        strcmp(method_getTypeEncoding(geometryMethod), "@40@0:8@16d24q32") == 0)
+        MSHookMessageEx(controller, geometry, (IMP)MRHookHostGeometry,
+                        (IMP *)&MROriginalHostGeometry);
+    MRGeometryProbe(@"installed geometry=%d", MROriginalHostGeometry != NULL);
 }
 
 static void MRInstallMyrtleWhenReady(NSUInteger attempt)
@@ -1299,12 +1320,13 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL keyboardAvoidanceInstalled = MRInstallMyrtleKeyboardAvoidanceHook();
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
     BOOL actionDispatcherInstalled = MRInstallMyrtleActionDispatcherHook();
-    if (attempt == 0 || MROriginalHostOpen == NULL || MROriginalHostRelayout == NULL)
+    if (attempt == 0 || MROriginalHostOpen == NULL || MROriginalHostRelayout == NULL ||
+        MROriginalHostGeometry == NULL)
         MRInstallGeometryProbe();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
         keyboardAvoidanceInstalled && selectorCenterInstalled &&
         actionDispatcherInstalled && MROriginalHostOpen != NULL &&
-        MROriginalHostRelayout != NULL) return;
+        MROriginalHostRelayout != NULL && MROriginalHostGeometry != NULL) return;
     if (attempt >= 60) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{ MRInstallMyrtleWhenReady(attempt + 1); });
@@ -1315,7 +1337,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     @autoreleasepool {
         FILE *probeFile = fopen("/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.snap-geometry.log", "w");
         if (probeFile != NULL) fclose(probeFile);
-        MRGeometryProbe(@"probe beta6 started");
+        MRGeometryProbe(@"probe beta7 started");
         dispatch_async(dispatch_get_main_queue(), ^{
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
