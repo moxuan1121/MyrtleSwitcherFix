@@ -1324,7 +1324,7 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     @autoreleasepool {
         FILE *file = fopen(MRProbePath, "w");
         if (file != NULL) fclose(file);
-        MRProbe(@"probe 0.5.3.2~probe1 started");
+        MRProbe(@"probe 0.5.3.2~beta3probe1 started");
         dispatch_async(dispatch_get_main_queue(), ^{
             MRInstallSwitcherRemoveHook();
             MRInstallSwitcherReconciliationHooks();
