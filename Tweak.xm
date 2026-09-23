@@ -3,24 +3,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <substrate.h>
-#include <stdarg.h>
-#include <stdio.h>
 #include <string.h>
-
-static NSTimeInterval MRTransitionProbeUntil = 0;
-static void MRTransitionProbe(NSString *format, ...)
-{
-    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
-    if (now > MRTransitionProbeUntil) return;
-    va_list arguments;
-    va_start(arguments, format);
-    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments];
-    va_end(arguments);
-    FILE *file = fopen("/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.snap-transition.log", "a");
-    if (file == NULL) return;
-    fprintf(file, "%.3f %s\n", now, message.UTF8String);
-    fclose(file);
-}
 
 static NSString *const MRCloseSelector = @"MT_IlllIIIlIIIlIlllIIIl::";
 static __strong NSMutableArray<NSString *> *MRDesiredFrontOrder = nil;
@@ -827,7 +810,6 @@ static MRWindowGeometryIMP MROriginalWindowGeometry = NULL;
 static id MRHookWindowGeometry(id self, SEL selector, id context, double ratio,
                                NSInteger snap)
 {
-    double originalRatio = ratio;
     BOOL promoted = NO;
     if ([objc_getAssociatedObject(self, MRDirectSnapPendingKey) boolValue] &&
         ratio > 0.5 && snap == 0) {
@@ -855,9 +837,6 @@ static id MRHookWindowGeometry(id self, SEL selector, id context, double ratio,
             ((void (*)(id, SEL, int))objc_msgSend)(self,
                 NSSelectorFromString(@"setCurrentSnapStatus:"), 0);
     }
-    MRTransitionProbe(@"geometry ratio=%.4f->%.4f arg=%ld state=%@ result=%@",
-                      originalRatio, ratio, (long)snap,
-                      MRSafeValue(self, @"currentSnapStatus"), result);
     return result;
 }
 
@@ -874,7 +853,6 @@ static void MRHookSetWindowBundle(id self, SEL selector, NSString *bundleID)
 
 static void MRHookSetWindowOpen(id self, SEL selector, BOOL open)
 {
-    MRTransitionProbe(@"isWindowOpen=%d", open);
     MROriginalSetWindowOpen(self, selector, open);
     if (!open)
         objc_setAssociatedObject(self, MRDirectSnapPendingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -883,7 +861,6 @@ static void MRHookSetWindowOpen(id self, SEL selector, BOOL open)
 
 static void MRHookSetWillWindowOpen(id self, SEL selector, BOOL opening)
 {
-    MRTransitionProbe(@"willWindowOpen=%d", opening);
     MROriginalSetWillWindowOpen(self, selector, opening);
     if (opening || ![objc_getAssociatedObject(self, MRDirectSnapPendingKey) boolValue]) return;
     MRDirectSnapInitialGeometryReady = NO;
@@ -907,16 +884,11 @@ static void MRHookActionDispatcher(id self, SEL selector, id argument1,
     if (isReloadAction && !isWindowOpen) MRReloadForegroundApplication();
     if (!isWindowOpen && [argument1 isKindOfClass:NSString.class] &&
         [(NSString *)argument1 isEqualToString:@"switchFullscreenWindow"]) {
-        MRTransitionProbeUntil = NSDate.date.timeIntervalSince1970 + 5;
-        FILE *file = fopen("/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.snap-transition.log", "w");
-        if (file != NULL) fclose(file);
-        MRTransitionProbe(@"action begin");
         MRDirectSnapInitialGeometryReady = NO;
         objc_setAssociatedObject(self, MRDirectSnapPendingKey, @YES,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     MROriginalActionDispatcher(self, selector, argument1, argument2, argument3);
-    MRTransitionProbe(@"action returned");
     MRForegroundReloadCandidateBundleID = nil;
     MRForegroundReloadCandidateGeneration++;
 }
@@ -1312,45 +1284,27 @@ static void MRInstallUserDeletionHook(void)
     }
 }
 
-typedef void (*MRProbeHostOpenIMP)(id, SEL, id, CGRect, double, int, id);
-typedef void (*MRProbeHostRelayoutIMP)(id, SEL, CGRect, double, int, id);
-static MRProbeHostOpenIMP MROriginalProbeHostOpen = NULL;
-static MRProbeHostRelayoutIMP MROriginalProbeHostRelayout = NULL;
+typedef void (*MRHostOpenIMP)(id, SEL, id, CGRect, double, int, id);
+static MRHostOpenIMP MROriginalHostOpen = NULL;
 
-static void MRProbeHostOpen(id self, SEL selector, id bundleID, CGRect frame,
-                            double scale, int snap, id completion)
+static void MRHookHostOpen(id self, SEL selector, id bundleID, CGRect frame,
+                           double scale, int snap, id completion)
 {
     if (MRDirectSnapInitialGeometryReady && snap == 0 && scale <= 0.5)
         snap = 1;
-    MRTransitionProbe(@"host open bundle=%@ frame=%@ scale=%.4f snap=%d",
-                      bundleID, NSStringFromCGRect(frame), scale, snap);
-    MROriginalProbeHostOpen(self, selector, bundleID, frame, scale, snap, completion);
+    MROriginalHostOpen(self, selector, bundleID, frame, scale, snap, completion);
 }
 
-static void MRProbeHostRelayout(id self, SEL selector, CGRect frame, double scale,
-                                int snap, id completion)
-{
-    MRTransitionProbe(@"host relayout frame=%@ scale=%.4f snap=%d",
-                      NSStringFromCGRect(frame), scale, snap);
-    MROriginalProbeHostRelayout(self, selector, frame, scale, snap, completion);
-}
-
-static BOOL MRInstallTransitionProbe(void)
+static BOOL MRInstallHostOpenHook(void)
 {
     Class cls = NSClassFromString(@"MyrtleHostManager");
     SEL open = NSSelectorFromString(@"MT_lIlIIIIlllIlllIIIIlI:::::");
-    SEL relayout = NSSelectorFromString(@"MT_IlllllllIlIIIIIIlIll::::");
     Method openMethod = class_getInstanceMethod(cls, open);
-    Method relayoutMethod = class_getInstanceMethod(cls, relayout);
-    if (MROriginalProbeHostOpen == NULL && openMethod != NULL &&
+    if (MROriginalHostOpen == NULL && openMethod != NULL &&
         method_getNumberOfArguments(openMethod) == 7)
-        MSHookMessageEx(cls, open, (IMP)MRProbeHostOpen,
-                        (IMP *)&MROriginalProbeHostOpen);
-    if (MROriginalProbeHostRelayout == NULL && relayoutMethod != NULL &&
-        method_getNumberOfArguments(relayoutMethod) == 6)
-        MSHookMessageEx(cls, relayout, (IMP)MRProbeHostRelayout,
-                        (IMP *)&MROriginalProbeHostRelayout);
-    return MROriginalProbeHostOpen != NULL && MROriginalProbeHostRelayout != NULL;
+        MSHookMessageEx(cls, open, (IMP)MRHookHostOpen,
+                        (IMP *)&MROriginalHostOpen);
+    return MROriginalHostOpen != NULL;
 }
 
 static void MRInstallMyrtleWhenReady(NSUInteger attempt)
@@ -1361,10 +1315,10 @@ static void MRInstallMyrtleWhenReady(NSUInteger attempt)
     BOOL keyboardAvoidanceInstalled = MRInstallMyrtleKeyboardAvoidanceHook();
     BOOL selectorCenterInstalled = MRInstallMyrtleSelectorCenterHook();
     BOOL actionDispatcherInstalled = MRInstallMyrtleActionDispatcherHook();
-    BOOL probeInstalled = MRInstallTransitionProbe();
+    BOOL hostOpenInstalled = MRInstallHostOpenHook();
     if (managerInstalled && fullscreenInstalled && hostCoreLaunchInstalled &&
         keyboardAvoidanceInstalled && selectorCenterInstalled &&
-        actionDispatcherInstalled && probeInstalled) return;
+        actionDispatcherInstalled && hostOpenInstalled) return;
     if (attempt >= 60) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{ MRInstallMyrtleWhenReady(attempt + 1); });
