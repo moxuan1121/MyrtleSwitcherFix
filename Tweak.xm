@@ -804,6 +804,13 @@ static void MRHookActionDispatcher(id self, SEL selector, id argument1,
         [(NSString *)argument1 isEqualToString:@"reloadApp"];
     BOOL isWindowOpen = [MRSafeValue(self, @"isWindowOpen") boolValue];
     if (isReloadAction && !isWindowOpen) MRReloadForegroundApplication();
+    if (!isWindowOpen && [argument1 isKindOfClass:NSString.class] &&
+        [(NSString *)argument1 isEqualToString:@"switchFullscreenWindow"] &&
+        MRCurrentMainApplicationBundleID().length != 0) {
+        SEL queueSnap = NSSelectorFromString(@"MT_llIllllIIIlIlIlIIllI:");
+        if ([self respondsToSelector:queueSnap])
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(self, queueSnap, YES);
+    }
     MROriginalActionDispatcher(self, selector, argument1, argument2, argument3);
     MRForegroundReloadCandidateBundleID = nil;
     MRForegroundReloadCandidateGeneration++;
