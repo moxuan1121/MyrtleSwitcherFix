@@ -802,6 +802,23 @@ static MRSetWindowOpenIMP MROriginalSetWillWindowOpen = NULL;
 typedef void (*MRSetWindowBundleIMP)(id, SEL, NSString *);
 static MRSetWindowBundleIMP MROriginalSetWindowBundle = NULL;
 static const void *MRDirectSnapPendingKey = &MRDirectSnapPendingKey;
+typedef id (*MRWindowGeometryIMP)(id, SEL, id, double, NSInteger);
+static MRWindowGeometryIMP MROriginalWindowGeometry = NULL;
+
+static id MRHookWindowGeometry(id self, SEL selector, id context, double ratio,
+                               NSInteger snap)
+{
+    if ([objc_getAssociatedObject(self, MRDirectSnapPendingKey) boolValue] &&
+        ratio > 0.5 && snap == 0) {
+        NSUserDefaults *prefs = [[NSUserDefaults alloc]
+            initWithSuiteName:@"com.m4fn3.myrtle.prefs"];
+        id value = [prefs objectForKey:@"windowSnapRatio"];
+        if ([value isKindOfClass:NSNumber.class] &&
+            [value doubleValue] >= 0.1 && [value doubleValue] <= 0.5)
+            ratio = [value doubleValue];
+    }
+    return MROriginalWindowGeometry(self, selector, context, ratio, snap);
+}
 
 static void MRHookSetWindowBundle(id self, SEL selector, NSString *bundleID)
 {
@@ -1158,8 +1175,15 @@ static BOOL MRInstallMyrtleActionDispatcherHook(void)
     if (bundleMethod != NULL && method_getNumberOfArguments(bundleMethod) == 3)
         MSHookMessageEx(cls, bundleSelector, (IMP)MRHookSetWindowBundle,
                         (IMP *)&MROriginalSetWindowBundle);
+    SEL geometrySelector = NSSelectorFromString(@"MT_IllIlllIIIlIIlllIlll:::");
+    Method geometryMethod = class_getInstanceMethod(cls, geometrySelector);
+    if (geometryMethod != NULL &&
+        strcmp(method_getTypeEncoding(geometryMethod), "@40@0:8@16d24q32") == 0)
+        MSHookMessageEx(cls, geometrySelector, (IMP)MRHookWindowGeometry,
+                        (IMP *)&MROriginalWindowGeometry);
     return MROriginalActionDispatcher != NULL && MROriginalSetWindowOpen != NULL &&
-        MROriginalSetWillWindowOpen != NULL && MROriginalSetWindowBundle != NULL;
+        MROriginalSetWillWindowOpen != NULL && MROriginalSetWindowBundle != NULL &&
+        MROriginalWindowGeometry != NULL;
 }
 
 static BOOL MRInstallRootIconScrollHooks(void)
