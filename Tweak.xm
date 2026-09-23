@@ -820,6 +820,7 @@ static MRSetWindowOpenIMP MROriginalSetWillWindowOpen = NULL;
 typedef void (*MRSetWindowBundleIMP)(id, SEL, NSString *);
 static MRSetWindowBundleIMP MROriginalSetWindowBundle = NULL;
 static const void *MRDirectSnapPendingKey = &MRDirectSnapPendingKey;
+static BOOL MRDirectSnapInitialGeometryReady = NO;
 typedef id (*MRWindowGeometryIMP)(id, SEL, id, double, NSInteger);
 static MRWindowGeometryIMP MROriginalWindowGeometry = NULL;
 
@@ -827,18 +828,36 @@ static id MRHookWindowGeometry(id self, SEL selector, id context, double ratio,
                                NSInteger snap)
 {
     double originalRatio = ratio;
+    BOOL promoted = NO;
     if ([objc_getAssociatedObject(self, MRDirectSnapPendingKey) boolValue] &&
         ratio > 0.5 && snap == 0) {
         NSUserDefaults *prefs = [[NSUserDefaults alloc]
             initWithSuiteName:@"com.m4fn3.myrtle.prefs"];
         id value = [prefs objectForKey:@"windowSnapRatio"];
         if ([value isKindOfClass:NSNumber.class] &&
-            [value doubleValue] >= 0.1 && [value doubleValue] <= 0.5)
+            [value doubleValue] >= 0.1 && [value doubleValue] <= 0.5) {
             ratio = [value doubleValue];
+            SEL setSnap = NSSelectorFromString(@"setCurrentSnapStatus:");
+            CGRect screen = UIScreen.mainScreen.bounds;
+            if (screen.size.height > screen.size.width && [self respondsToSelector:setSnap]) {
+                ((void (*)(id, SEL, int))objc_msgSend)(self, setSnap, 1);
+                promoted = YES;
+            }
+        }
     }
     id result = MROriginalWindowGeometry(self, selector, context, ratio, snap);
-    MRTransitionProbe(@"geometry ratio=%.4f->%.4f snap=%ld result=%@",
-                      originalRatio, ratio, (long)snap, result);
+    if (promoted) {
+        BOOL atTop = [result isKindOfClass:NSArray.class] && [result count] >= 1 &&
+            [result[0] isKindOfClass:NSValue.class] &&
+            CGRectGetMinY([result[0] CGRectValue]) < CGRectGetHeight(UIScreen.mainScreen.bounds) * 0.25;
+        MRDirectSnapInitialGeometryReady = atTop;
+        if (!atTop)
+            ((void (*)(id, SEL, int))objc_msgSend)(self,
+                NSSelectorFromString(@"setCurrentSnapStatus:"), 0);
+    }
+    MRTransitionProbe(@"geometry ratio=%.4f->%.4f arg=%ld state=%@ result=%@",
+                      originalRatio, ratio, (long)snap,
+                      MRSafeValue(self, @"currentSnapStatus"), result);
     return result;
 }
 
@@ -859,6 +878,7 @@ static void MRHookSetWindowOpen(id self, SEL selector, BOOL open)
     MROriginalSetWindowOpen(self, selector, open);
     if (!open)
         objc_setAssociatedObject(self, MRDirectSnapPendingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!open) MRDirectSnapInitialGeometryReady = NO;
 }
 
 static void MRHookSetWillWindowOpen(id self, SEL selector, BOOL opening)
@@ -866,6 +886,7 @@ static void MRHookSetWillWindowOpen(id self, SEL selector, BOOL opening)
     MRTransitionProbe(@"willWindowOpen=%d", opening);
     MROriginalSetWillWindowOpen(self, selector, opening);
     if (opening || ![objc_getAssociatedObject(self, MRDirectSnapPendingKey) boolValue]) return;
+    MRDirectSnapInitialGeometryReady = NO;
     objc_setAssociatedObject(self, MRDirectSnapPendingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     dispatch_async(dispatch_get_main_queue(), ^{
         SEL edge = NSSelectorFromString(@"MT_llIIIIlllllllllIIIll:");
@@ -890,6 +911,7 @@ static void MRHookActionDispatcher(id self, SEL selector, id argument1,
         FILE *file = fopen("/var/mobile/Library/Preferences/com.moxuan.myrtleswitcherfix.snap-transition.log", "w");
         if (file != NULL) fclose(file);
         MRTransitionProbe(@"action begin");
+        MRDirectSnapInitialGeometryReady = NO;
         objc_setAssociatedObject(self, MRDirectSnapPendingKey, @YES,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
@@ -1298,6 +1320,8 @@ static MRProbeHostRelayoutIMP MROriginalProbeHostRelayout = NULL;
 static void MRProbeHostOpen(id self, SEL selector, id bundleID, CGRect frame,
                             double scale, int snap, id completion)
 {
+    if (MRDirectSnapInitialGeometryReady && snap == 0 && scale <= 0.5)
+        snap = 1;
     MRTransitionProbe(@"host open bundle=%@ frame=%@ scale=%.4f snap=%d",
                       bundleID, NSStringFromCGRect(frame), scale, snap);
     MROriginalProbeHostOpen(self, selector, bundleID, frame, scale, snap, completion);
